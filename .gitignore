@@ -1,0 +1,9 @@
+# Build artifacts
+/myne-server
+/myne-server-linux-*
+/cmd/myne-server/myne-server
+*.test
+*.out
+
+# OS
+.DS_Store

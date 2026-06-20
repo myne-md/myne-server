@@ -1,0 +1,13 @@
+# Keep the build context minimal + deterministic (MYND-437).
+# Only go.mod + cmd/ + internal/ are needed to build the binary.
+.git
+.gitignore
+.dockerignore
+the CI configuration
+.DS_Store
+Dockerfile
+CLAUDE.md
+README.md
+LICENSE
+lefthook.yml
+**/*_test.go
