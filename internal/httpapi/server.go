@@ -30,6 +30,31 @@ import (
 // reclamation is not latency-sensitive; the marker is a day bucket.
 const gcInterval = time.Hour
 
+// Connection-level timeouts (defense-in-depth). TB5 self-hosters may front the server
+// with an untuned reverse proxy, so the server hardens itself rather than relying on
+// the edge. ReadHeaderTimeout is the load-bearing slowloris defense (gosec G112): it
+// bounds the time to receive request headers WITHOUT limiting body transfer, so a
+// legitimate large opaque-blob push (up to syncapi.MaxBlobSize, 64 MiB) on a slow
+// link is not truncated. IdleTimeout bounds kept-alive idle connections. ReadTimeout
+// and WriteTimeout are deliberately left unset: a wall-clock cap on the whole request
+// or response would cut off a slow but legitimate 64 MiB blob transfer — body-size
+// abuse is bounded by http.MaxBytesReader in the handlers, not by a connection clock.
+const (
+	readHeaderTimeout = 15 * time.Second
+	idleTimeout       = 120 * time.Second
+)
+
+// newHTTPServer builds an http.Server with the hardened connection timeouts applied.
+// Both the public edge and the internal metrics listener route through it so neither
+// is left with Go's unlimited defaults.
+func newHTTPServer(h http.Handler) *http.Server {
+	return &http.Server{
+		Handler:           h,
+		ReadHeaderTimeout: readHeaderTimeout,
+		IdleTimeout:       idleTimeout,
+	}
+}
+
 // boundPort returns the resolved TCP port a listener is bound to (0 if the
 // listener is not TCP). With addr ":0" the OS assigns an ephemeral port; this is
 // how the E2E harness (MYND-428) reads back the actual port race-free.
@@ -121,15 +146,14 @@ func runListener(ctx context.Context, ln net.Listener) error {
 
 	ready := NewReadiness()
 	metrics := NewMetrics()
-	srv := &http.Server{
-		Handler: NewServer(blobStore, reg, tokens, rl, qg, ready, metrics),
-	}
+	srv := newHTTPServer(NewServer(blobStore, reg, tokens, rl, qg, ready, metrics))
 
 	// Aggregate-only metrics on a SEPARATE listener (SYNC-24) — never the public edge.
 	// Disabled unless MYNE_METRICS_ADDR is set; bind it to localhost/internal only.
 	var metricsSrv *http.Server
 	if cfg.MetricsAddr != "" {
-		metricsSrv = &http.Server{Addr: cfg.MetricsAddr, Handler: metrics.MetricsHandler()}
+		metricsSrv = newHTTPServer(metrics.MetricsHandler())
+		metricsSrv.Addr = cfg.MetricsAddr
 		go func() {
 			if err := metricsSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				log.Printf("myne-server: metrics listener: %v", err)
