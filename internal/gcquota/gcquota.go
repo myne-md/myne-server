@@ -82,9 +82,18 @@ func (g *HorizonGC) Run(account ids.AccountNumberHash, currentMarker uint64) (re
 		if d.Retired {
 			continue
 		}
-		if d.LastActivity < cutoff {
+		if d.LastActivity != 0 && d.LastActivity < cutoff {
 			// Past horizon → soft-retire (reuses AS16 retirement; on return the
 			// device re-enrolls → forced full-reconcile, never silent resurrection).
+			//
+			// LastActivity == 0 means "never seen" (a freshly enrolled or a
+			// persistence-restored device), NOT "infinitely stale". Phase 1 has no
+			// production writer for LastActivity (TouchActivity is unwired), so every
+			// device sits at 0; treating 0 as past-horizon would soft-retire the entire
+			// fleet on the first hourly sweep (mass-401, undermining auth persistence).
+			// Excluding 0 keeps the sweep a no-op until TouchActivity lands, and stays
+			// forward-compatible: a device with any nonzero activity that falls behind
+			// the horizon still retires as designed.
 			_ = g.reg.Retire(account, d.DeviceID)
 			retired++
 			continue

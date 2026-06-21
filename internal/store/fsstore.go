@@ -248,6 +248,19 @@ func atomicWrite(path string, data []byte) error {
 	return nil
 }
 
+// AtomicWrite durably writes data to path (temp + fsync + rename + parent-dir fsync) —
+// the same audited primitive index.json / head / blob bodies use. Exposed so the auth
+// persistence layer shares ONE write path instead of forking a second copy. The file
+// lands at 0600 (os.CreateTemp's temp mode survives the rename); the explicit Chmod
+// pins that guarantee independent of the process umask, because this file holds bearer
+// tokens + SCRAM verifiers.
+func AtomicWrite(path string, data []byte) error {
+	if err := atomicWrite(path, data); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0o600)
+}
+
 // persist writes the vault's metadata index atomically. Callers hold mu.
 func (s *FSStore) persist(a ids.AccountNumberHash, v *fsVault) error {
 	raw, err := json.Marshal(v.toIndex())

@@ -13,12 +13,14 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"time"
 
 	"github.com/myne-md/myne-server/internal/attachments"
 	"github.com/myne-md/myne-server/internal/auth"
 	"github.com/myne-md/myne-server/internal/authapi"
+	"github.com/myne-md/myne-server/internal/authpersist"
 	"github.com/myne-md/myne-server/internal/gcquota"
 	"github.com/myne-md/myne-server/internal/ids"
 	"github.com/myne-md/myne-server/internal/poke"
@@ -122,6 +124,19 @@ func runListener(ctx context.Context, ln net.Listener) error {
 
 	reg := auth.NewRegistry()
 	tokens := auth.NewTokenStore(reg)
+	authHandler := authapi.New(reg, tokens)
+
+	// Persist device-auth state (registry + per-device tokens + per-account SCRAM
+	// verifiers) so a restart does not de-enroll every device (clients would otherwise
+	// 401 after every deploy/reboot/crash). fs-backend only — the mem backend stays
+	// pure in-RAM. Load happens BEFORE listen: a corrupt/too-new auth.json fails closed
+	// (refuses to start) rather than silently de-enrolling the fleet; an ABSENT file is
+	// the legitimate first-boot path (start empty → one re-enroll → persists thereafter).
+	if cfg.StorageBackend == "fs" {
+		if _, err := authpersist.Wire(reg, tokens, authHandler, filepath.Join(cfg.StoragePath, "auth.json")); err != nil {
+			return err
+		}
+	}
 
 	// Rate-limit keyed on account_number_hash, never IP (C4). Quota ceiling
 	// 0 = unlimited until set (SYNC-23; hosted value lands with MYND-430). The
@@ -146,7 +161,7 @@ func runListener(ctx context.Context, ln net.Listener) error {
 
 	ready := NewReadiness()
 	metrics := NewMetrics()
-	srv := newHTTPServer(NewServer(blobStore, reg, tokens, rl, qg, ready, metrics))
+	srv := newHTTPServer(NewServer(blobStore, tokens, authHandler, rl, qg, ready, metrics))
 
 	// Aggregate-only metrics on a SEPARATE listener (SYNC-24) — never the public edge.
 	// Disabled unless MYNE_METRICS_ADDR is set; bind it to localhost/internal only.
@@ -215,14 +230,14 @@ func NewRouter(a auth.Authenticator) http.Handler {
 // behind the no-IP middleware. Every sync route is session-bound via the token
 // store (MYND-420); the health probe is the only open endpoint. rl/qg may be nil
 // (policy disabled).
-func NewServer(s store.BlobStore, reg *auth.Registry, tokens *auth.TokenStore, rl syncapi.RateLimiter, qg syncapi.QuotaGuard, ready *Readiness, metrics *Metrics) http.Handler {
+func NewServer(s store.BlobStore, tokens *auth.TokenStore, authHandler *authapi.Handler, rl syncapi.RateLimiter, qg syncapi.QuotaGuard, ready *Readiness, metrics *Metrics) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", healthz)
 	if ready != nil {
 		mux.HandleFunc("/readyz", ready.handler) // readiness probe (MYND-440)
 	}
 
-	authapi.New(reg, tokens).Register(mux) // device auth + management (MYND-420/425)
+	authHandler.Register(mux) // device auth + management (MYND-420/425); persistence-wired upstream
 	notifier := poke.NewNotifier()
 	syncMux := syncapi.New(s, tokens).WithPolicy(rl, qg).WithNotifier(notifier)
 	if metrics != nil {

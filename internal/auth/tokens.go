@@ -76,8 +76,13 @@ func (s *TokenStore) AuthenticateSession(token ids.DeviceToken) (Session, error)
 	if !ok {
 		return Session{}, ErrUnauthenticated
 	}
-	// A retired device's token is no longer valid (availability-only revocation).
-	if rec, found := s.registry.Get(b.account, b.device); found && rec.Retired {
+	// The token's device must still be a known, non-retired registry row. Before
+	// auth state was persisted, the byToken + registry maps were built together in
+	// RAM and could not drift; once they round-trip through disk independently, a
+	// token whose device record is absent (a torn/partial load) must NOT authenticate
+	// — reject when the device is missing OR retired (fail-closed, not fail-open).
+	rec, found := s.registry.Get(b.account, b.device)
+	if !found || rec.Retired {
 		return Session{}, ErrUnauthenticated
 	}
 	return Session{Account: b.account, Device: b.device}, nil
@@ -106,6 +111,38 @@ func (s *TokenStore) RevokeDevice(account ids.AccountNumberHash, dev ids.DeviceI
 
 func subtleEqualDevice(a, b ids.DeviceID) bool {
 	return subtle.ConstantTimeCompare(a[:], b[:]) == 1
+}
+
+// --- Persistence snapshot/restore (MYND auth-persistence) ---
+
+// PersistedToken is the serializable form of one token binding. TokenHex is the raw
+// map key (the hex of the 256-bit token) — it is a bearer credential; never log it.
+type PersistedToken struct {
+	TokenHex string
+	Account  ids.AccountNumberHash
+	Device   ids.DeviceID
+}
+
+// TokenSnapshot returns a copy of every live token binding.
+func (s *TokenStore) TokenSnapshot() []PersistedToken {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]PersistedToken, 0, len(s.byToken))
+	for tok, b := range s.byToken {
+		out = append(out, PersistedToken{TokenHex: tok, Account: b.account, Device: b.device})
+	}
+	return out
+}
+
+// LoadTokens REPLACES the token map from a snapshot by direct assignment (never
+// through Issue, so no new tokens are minted). Idempotent. Boot-only.
+func (s *TokenStore) LoadTokens(snap []PersistedToken) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.byToken = make(map[string]tokenBinding, len(snap))
+	for _, t := range snap {
+		s.byToken[t.TokenHex] = tokenBinding{account: t.Account, device: t.Device}
+	}
 }
 
 var _ Authenticator = (*TokenStore)(nil)

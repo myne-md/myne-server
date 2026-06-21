@@ -93,6 +93,8 @@ func (r *Registry) hasAnyDevice(account ids.AccountNumberHash) bool {
 // hasApprovedActiveDevice reports whether the account has at least one approved,
 // non-retired device (the approver for a password-path enrollment).
 func (r *Registry) hasApprovedActiveDevice(account ids.AccountNumberHash) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	for _, rec := range r.accounts[account] {
 		if rec.Approved && !rec.Retired {
 			return true
@@ -141,4 +143,55 @@ func (r *Registry) TouchActivity(account ids.AccountNumberHash, dev ids.DeviceID
 		rec.LastActivity = marker
 	}
 	return nil
+}
+
+// --- Persistence snapshot/restore (MYND auth-persistence) ---
+//
+// The registry holds NO key material (only device identity + approval state), so a
+// PersistedDevice is safe to serialize. LastActivity is deliberately NOT persisted: it
+// is a loss-tolerant coarse GC marker, and a restored device's LastActivity resets to
+// 0 ("unseen"), which the horizon-GC treats as not-a-retire-candidate.
+
+// PersistedDevice is the serializable form of one registry row, carrying the account
+// (which the in-RAM DeviceRecord does not) so a flat snapshot round-trips.
+type PersistedDevice struct {
+	Account  ids.AccountNumberHash
+	DeviceID ids.DeviceID
+	Approved bool
+	Retired  bool
+}
+
+// DeviceSnapshot returns a flat copy of every device row across all accounts.
+func (r *Registry) DeviceSnapshot() []PersistedDevice {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var out []PersistedDevice
+	for acct, devs := range r.accounts {
+		for _, rec := range devs {
+			out = append(out, PersistedDevice{
+				Account:  acct,
+				DeviceID: rec.DeviceID,
+				Approved: rec.Approved,
+				Retired:  rec.Retired,
+			})
+		}
+	}
+	return out
+}
+
+// LoadDevices REPLACES the registry contents from a snapshot by direct assignment
+// (never through the gated register/Approve path). Idempotent: a second load yields
+// the same state. Used only at boot, before serving.
+func (r *Registry) LoadDevices(snap []PersistedDevice) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.accounts = make(map[ids.AccountNumberHash]map[ids.DeviceID]*DeviceRecord)
+	for _, d := range snap {
+		m := r.accounts[d.Account]
+		if m == nil {
+			m = make(map[ids.DeviceID]*DeviceRecord)
+			r.accounts[d.Account] = m
+		}
+		m[d.DeviceID] = &DeviceRecord{DeviceID: d.DeviceID, Approved: d.Approved, Retired: d.Retired}
+	}
 }

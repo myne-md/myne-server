@@ -68,6 +68,24 @@ type Handler struct {
 	// serverCbind is the channel-binding data the server expects in client-final
 	// (the TLS exporter in production; empty over loopback http — R3 wiring).
 	serverCbind []byte
+
+	// onAuthChange, when set (fs-backend persistence wired), is invoked AFTER a
+	// handler that mutated auth state has released h.mu — never from inside a locked
+	// region (it re-reads creds under h.mu, so a held lock would self-deadlock). nil
+	// for the mem backend (no persistence).
+	onAuthChange func()
+}
+
+// SetOnChange installs the persistence save hook (the authpersist coordinator's Save).
+func (h *Handler) SetOnChange(fn func()) { h.onAuthChange = fn }
+
+// maybeSave fires the persistence hook iff a mutation occurred. It is the body of a
+// `defer h.maybeSave(&doSave)` that MUST be registered BEFORE `defer h.mu.Unlock()` so
+// LIFO order runs the unlock first — guaranteeing h.mu is free when Save re-reads it.
+func (h *Handler) maybeSave(do *bool) {
+	if *do && h.onAuthChange != nil {
+		h.onAuthChange()
+	}
 }
 
 // New wires the auth primitives onto the HTTP surface.
@@ -161,6 +179,8 @@ func (h *Handler) handleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var doSave bool
+	defer h.maybeSave(&doSave) // registered BEFORE the unlock defer → runs after it
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if _, exists := h.creds[account]; exists {
@@ -177,6 +197,7 @@ func (h *Handler) handleRegister(w http.ResponseWriter, r *http.Request) {
 			ServerKey:  serverKey,
 		},
 	}
+	doSave = true
 	writeJSON(w, map[string]bool{"ok": true})
 }
 
@@ -285,6 +306,8 @@ func (h *Handler) handleScramFinal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var doSave bool
+	defer h.maybeSave(&doSave) // registered BEFORE the unlock defer → runs after it
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	hs, exists := h.hs[req.HandshakeID]
@@ -317,12 +340,14 @@ func (h *Handler) handleScramFinal(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			token = t
+			doSave = true // a token was minted
 		} else {
 			writeJSON(w, scramFinalResp{Approved: false, ServerSignatureB64: base64.StdEncoding.EncodeToString(serverSig)})
 			return
 		}
 	} else {
 		res, eerr := h.enroll.Enroll(hs.account, device, path)
+		doSave = true // Enroll registered the device (even when it lands pending)
 		if errors.Is(eerr, auth.ErrPendingApproval) {
 			writeJSON(w, scramFinalResp{Approved: false, ServerSignatureB64: base64.StdEncoding.EncodeToString(serverSig)})
 			return
@@ -412,10 +437,13 @@ func (h *Handler) handleApprove(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "bad_request")
 		return
 	}
+	var doSave bool
+	defer h.maybeSave(&doSave)
 	if err := h.reg.Approve(sess.Account, device); err != nil {
 		writeErr(w, http.StatusNotFound, "device_not_found")
 		return
 	}
+	doSave = true
 	writeJSON(w, map[string]bool{"ok": true})
 }
 
@@ -442,7 +470,67 @@ func (h *Handler) handleRevoke(w http.ResponseWriter, r *http.Request) {
 	// Revoke the token (availability — sync stops to that device) + retire the
 	// registry record. device_id is NOT destroyed (SYNC-2: revoking the token
 	// never touches device_id).
+	var doSave bool
+	defer h.maybeSave(&doSave)
 	h.tokens.RevokeDevice(sess.Account, device)
 	_ = h.reg.Retire(sess.Account, device)
+	doSave = true
 	writeJSON(w, map[string]bool{"ok": true})
+}
+
+// --- Persistence snapshot/restore for the per-account SCRAM verifiers (creds) ---
+//
+// The handshake map (h.hs) is transient (in-flight SCRAM sessions) and is NOT
+// persisted. The creds map IS — it is the per-account SCRAM verifier (a password-hash
+// equivalent: StoredKey/ServerKey/Salt, never the password) the server needs to
+// authenticate any future enrollment.
+
+// PersistedCred is the serializable form of one account's SCRAM verifier. The byte
+// fields are SCRAM verifier material (StoredKey/ServerKey/Salt) — treat as secret;
+// never log them.
+type PersistedCred struct {
+	Account    ids.AccountNumberHash
+	Username   string
+	Salt       []byte
+	Iterations int
+	StoredKey  []byte
+	ServerKey  []byte
+}
+
+// CredSnapshot returns a copy of every account's stored SCRAM verifier.
+func (h *Handler) CredSnapshot() []PersistedCred {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := make([]PersistedCred, 0, len(h.creds))
+	for acct, sc := range h.creds {
+		out = append(out, PersistedCred{
+			Account:    acct,
+			Username:   sc.username,
+			Salt:       sc.cred.Salt,
+			Iterations: sc.cred.Iterations,
+			StoredKey:  sc.cred.StoredKey,
+			ServerKey:  sc.cred.ServerKey,
+		})
+	}
+	return out
+}
+
+// LoadCreds REPLACES the creds map from a snapshot by direct assignment (never through
+// handleRegister, so the first-write-only guard is not re-triggered). Idempotent.
+// Boot-only. h.hs is left empty (handshakes never persist).
+func (h *Handler) LoadCreds(snap []PersistedCred) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.creds = make(map[ids.AccountNumberHash]storedCredential, len(snap))
+	for _, c := range snap {
+		h.creds[c.Account] = storedCredential{
+			username: c.Username,
+			cred: scram.Credential{
+				Salt:       c.Salt,
+				Iterations: c.Iterations,
+				StoredKey:  c.StoredKey,
+				ServerKey:  c.ServerKey,
+			},
+		}
+	}
 }
