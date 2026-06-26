@@ -4,9 +4,18 @@
 
 ## Status
 
-**Phase 2 — not yet started.** This repository is an empty scaffold; no application logic has shipped.
+**Phase 2 — in progress (MYND-419–423).** The blind blob store is implemented: 11 Go packages, all
+tests green. Bootstrap (Go module + AGPL + CI + blind store + per-note version counter), auth
+(SCRAM-SHA-256-PLUS + per-device tokens + device-approval gate), push/pull (`/sync/push`, `/sync/pull`,
+`/sync/blob` — CAS + cursor + error codes), GC/quota (horizon-GC + per-account quota + rate-limit, never
+IP), and attachments (resumable range + poke) have landed. Run `go test ./...` from this directory.
 
-Phase 1 (current) is desktop-only with local vault storage; Phase 2 introduces this Go-based zero-knowledge sync server. Until Phase 1's recovery drill closes (see main repo `the agent tooling repository/features/phase-1-plan/shared.md` pre-ship gate), do not start work here.
+The `:0` ephemeral-port surfacing (`MYNE_SERVER_ADDR=:0` + `MYNE_SERVER_PORTFILE`, MYND-428 task 1) lets
+the desktop E2E harness spawn an isolated server per test file and read the bound port back race-free.
+
+Phase 1 is desktop-only with local vault storage; this Go-based zero-knowledge sync server is the
+Phase 2 server side. The client side (engine, device-mgmt, deletion, fork-conflict) lives in the main
+`myne` repo (MYND-424–428).
 
 ## Stack target
 

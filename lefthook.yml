@@ -2,8 +2,7 @@
 # Install once per clone:  brew install lefthook && lefthook install
 # Skip ad-hoc:             LEFTHOOK=0 git commit ...   (or  git commit --no-verify)
 #
-# Baseline (text hygiene + secret guard). Extend with language-specific
-# checks (cargo fmt, etc.) once the codebase grows.
+# Baseline (text hygiene + secret guard) + Go checks (gofmt, go vet).
 
 pre-commit:
   parallel: true
@@ -11,6 +10,20 @@ pre-commit:
 
     whitespace:
       run: git diff --cached --check
+
+    gofmt:
+      glob: "*.go"
+      run: |
+        unformatted="$(gofmt -l {staged_files})"
+        if [ -n "$unformatted" ]; then
+          echo "gofmt needed:"
+          echo "$unformatted"
+          exit 1
+        fi
+
+    go-vet:
+      glob: "*.go"
+      run: go vet ./...
 
     eof-newline:
       run: |
