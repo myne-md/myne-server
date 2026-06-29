@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0
 
 // Package headid computes the vault-head identifier the blind server uses as the
 // current-head pointer. head_id = SHA-256 over the opaque head record

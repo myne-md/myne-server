@@ -1,5 +1,5 @@
 #!/usr/bin/env sh
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: AGPL-3.0
 #
 # Reproducibility gate (MYND-437, SYNC-28): build the server image twice with no
 # cache and assert identical OCI image digests. The SHIPPED artefact is the image,

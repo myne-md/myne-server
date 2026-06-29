@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0
 
 // Package attachments stores opaque attachment ciphertext (MYA1 blobs) per vault
 // and serves it over resumable byte-range transport (MYND-423). The AEAD is NEVER

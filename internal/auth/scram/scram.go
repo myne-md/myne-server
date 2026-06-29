@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0
 
 // Package scram implements SCRAM-SHA-256-PLUS (RFC 7677 / RFC 5802) with
 // tls-exporter channel binding (RFC 9266), hand-wired from the closed primitive

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0
 
 // Package authpersist makes device-auth state survive a server restart. Without it,
 // the device registry, per-device bearer tokens, and per-account SCRAM verifiers live

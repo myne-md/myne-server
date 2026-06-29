@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0
 
 // Package httpapi is the bootstrap HTTP surface: a health endpoint behind the
 // no-IP middleware, wired with the deny-by-default Authenticator seam. The

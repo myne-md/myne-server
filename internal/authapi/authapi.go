@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0
 
 // Package authapi is the HTTP surface for device authentication + management
 // (MYND-420 HTTP exposure / MYND-425 client enrollment): SCRAM-SHA-256-PLUS

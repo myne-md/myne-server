@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0
 
 package syncapi
 
@@ -74,5 +74,25 @@ func TestPolicy_CursorExpired410(t *testing.T) {
 	resp, _ := do(t, srv, http.MethodGet, "/sync/pull?cursor=1", token, "")
 	if resp.StatusCode != http.StatusGone {
 		t.Fatalf("stale-cursor pull status %d, want 410", resp.StatusCode)
+	}
+}
+
+// A reconcile-mode pull is the client walking the whole manifest, so a sub-floor
+// cursor must be SERVED (not 410'd) — otherwise a vault whose reclaim floor sits
+// beyond the first pull page wedges any re-paginating device on page 2 forever.
+func TestPolicy_ReconcileBypassesFloor(t *testing.T) {
+	srv, token, st, a := setupPolicy(t, nil, nil)
+	defer srv.Close()
+	_, _ = st.PushBlob(a, ids.BlobID{0x01}, 0, [store.ContentNonceLen]byte{}, []byte("a"))
+	_, _ = st.PushBlob(a, ids.BlobID{0x02}, 0, [store.ContentNonceLen]byte{}, []byte("b"))
+	_ = st.SetTombstone(a, ids.BlobID{0x02}, 1)
+	_ = st.ReclaimTombstone(a, ids.BlobID{0x02}) // floor → 2
+	if st.GCFloor(a) != 2 {
+		t.Fatalf("GCFloor = %d, want 2", st.GCFloor(a))
+	}
+	// Same sub-floor cursor, but reconcile=1 → served, not rejected.
+	resp, _ := do(t, srv, http.MethodGet, "/sync/pull?cursor=1&reconcile=1", token, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("reconcile sub-floor pull status %d, want 200", resp.StatusCode)
 	}
 }

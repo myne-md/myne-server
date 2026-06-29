@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0
 
 // Package gcquota is the tombstone horizon-GC + quota + rate-limit policy layer
 // (MYND-422). It sits on the MYND-419 substrate (dedup-byte counter + tombstone

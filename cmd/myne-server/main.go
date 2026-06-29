@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0
 
 // Command myne-server is the Phase 2 zero-knowledge sync server: a blind blob
 // store that persists opaque ciphertext per vault and never reads, merges, or

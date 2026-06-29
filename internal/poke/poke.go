@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0
 
 // Package poke is the change-notification layer (MYND-423). Polling (the pull
 // endpoint) is the privacy-default baseline — the server sees a device only at poll

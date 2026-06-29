@@ -1,6 +1,6 @@
 # myne-server — Phase 2 sync server (placeholder)
 
-> Companion repository to [`myne`](https://github.com/myne-md/myne). License: AGPL-3.0-or-later (matches main repo).
+> Companion repository to [`myne`](https://github.com/myne-md/myne). License: AGPL-3.0 (matches main repo).
 
 ## Status
 

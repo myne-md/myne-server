@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0
 
 // Package syncapi is the core sync loop: the authenticated push and pull endpoints
 // (MYND-421). push uploads changed blobs each under a CAS base-version, then
@@ -313,10 +313,20 @@ func (h *Handler) handlePull(w http.ResponseWriter, r *http.Request) {
 	if l, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && l > 0 {
 		limit = l
 	}
+	// A reconcile-mode pull (`?reconcile=1`) is the client walking the WHOLE
+	// manifest from cursor 0 and diffing it against local state (§11.2). That walk
+	// reconstructs deletions from manifest-absence, so it needs no replayable
+	// tombstone history and is exempt from the cursor-expired floor below.
+	reconcile := r.URL.Query().Get("reconcile") == "1"
 
 	// Cursor-expired: a non-zero cursor below the GC reclaim floor missed reclaimed
-	// history → force §11.2 full-reconcile (ledger SYNC-6).
-	if cursor > 0 && cursor < h.store.GCFloor(sess.Account) {
+	// history → force §11.2 full-reconcile (ledger SYNC-6). Skipped for a reconcile
+	// pull, which is ALREADY doing that full walk: without this exemption a vault
+	// with more than one page (DefaultPullLimit) of live blobs whose reclaim floor
+	// sits beyond the first page boundary wedges any re-paginating device — page 1
+	// hands back a next_cursor below the floor, and the page-2 pull at that cursor
+	// is rejected as cursor_expired, so the reconcile can never drain past the floor.
+	if !reconcile && cursor > 0 && cursor < h.store.GCFloor(sess.Account) {
 		writeErr(w, http.StatusGone, "cursor_expired")
 		return
 	}

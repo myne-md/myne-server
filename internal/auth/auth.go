@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0
 
 // Package auth is the authentication seam. The bootstrap skeleton ships ONLY a
 // deny-by-default authenticator: every request is rejected until a real mechanism

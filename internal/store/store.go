@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0
 
 // Package store defines the blind blob store: opaque per-vault ciphertext storage
 // with an opaque per-note version counter, an opaque vault-head pointer (CAS), and

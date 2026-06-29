@@ -14,7 +14,7 @@ Myne is a multi-repo project under [github.com/myne-md](https://github.com/myne-
 
 What exists today:
 
-- `LICENSE` — AGPL-3.0-or-later
+- `LICENSE` — AGPL-3.0
 - `CLAUDE.md` — architectural notes and the non-negotiable commitments below
 - `lefthook.yml` — the baseline commit hooks (whitespace, EOF newline, secret-pattern guard)
 
@@ -58,4 +58,4 @@ The hooks run on commit: whitespace check, EOF-newline check, and a secret-patte
 
 ## License
 
-AGPL-3.0-or-later — see [`LICENSE`](LICENSE). This matches the application-code license of the wider Myne project; the specification documents in the main repo are published under a permissive content license so independent implementations can reuse the protocol.
+AGPL-3.0 — see [`LICENSE`](LICENSE). This matches the application-code license of the wider Myne project; the specification documents in the main repo are published under a permissive content license so independent implementations can reuse the protocol.
