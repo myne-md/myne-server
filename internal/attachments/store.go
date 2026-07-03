@@ -29,11 +29,12 @@ type AttachmentID [AttachmentIDLen]byte
 
 // Errors.
 var (
-	ErrNotFound    = errors.New("attachments: not found")
-	ErrTooLarge    = errors.New("attachments: exceeds MYA1 cap")
-	ErrBadOffset   = errors.New("attachments: offset beyond current length")
-	ErrRangeOOB    = errors.New("attachments: range out of bounds")
-	ErrDeclaredLen = errors.New("attachments: declared total length mismatch")
+	ErrNotFound           = errors.New("attachments: not found")
+	ErrTooLarge           = errors.New("attachments: exceeds MYA1 cap")
+	ErrBadOffset          = errors.New("attachments: offset beyond current length")
+	ErrRangeOOB           = errors.New("attachments: range out of bounds")
+	ErrDeclaredLen        = errors.New("attachments: declared total length mismatch")
+	ErrTooManyAttachments = errors.New("attachments: too many attachment ids for this vault")
 )
 
 type entry struct {
@@ -45,13 +46,35 @@ type entry struct {
 // Store is the in-memory per-vault attachment store (reference impl; a production
 // backend implements the same surface later, MYND-438).
 type Store struct {
-	mu     sync.RWMutex
-	vaults map[ids.AccountNumberHash]map[AttachmentID]*entry
+	mu sync.RWMutex
+	// accountBytes is the live per-account total (completed + in-progress uploads) so
+	// attachment storage folds into the same per-account AS17 ceiling as blob storage.
+	accountBytes   map[ids.AccountNumberHash]uint64
+	maxIDsPerVault int // 0 = unlimited; caps distinct attachment ids per vault (OOM bound)
+	vaults         map[ids.AccountNumberHash]map[AttachmentID]*entry
 }
 
-// NewStore returns an empty attachment store.
+// NewStore returns an empty attachment store (unlimited id count until WithMaxIDs).
 func NewStore() *Store {
-	return &Store{vaults: make(map[ids.AccountNumberHash]map[AttachmentID]*entry)}
+	return &Store{
+		vaults:       make(map[ids.AccountNumberHash]map[AttachmentID]*entry),
+		accountBytes: make(map[ids.AccountNumberHash]uint64),
+	}
+}
+
+// WithMaxIDs caps the number of distinct attachment ids a single vault may hold
+// (0 = unlimited). The cap counts BOTH completed and in-progress ids — the real
+// OOM vector is thousands of half-finished uploads, each holding up to 64 MiB.
+func (s *Store) WithMaxIDs(n int) *Store {
+	s.maxIDsPerVault = n
+	return s
+}
+
+// AccountBytes returns the account's live attachment byte total.
+func (s *Store) AccountBytes(a ids.AccountNumberHash) uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.accountBytes[a]
 }
 
 func (s *Store) vault(a ids.AccountNumberHash) map[AttachmentID]*entry {
@@ -97,6 +120,11 @@ func (s *Store) WriteAt(a ids.AccountNumberHash, id AttachmentID, offset, total 
 	v := s.vault(a)
 	e := v[id]
 	if e == nil {
+		// A new id: refuse once the per-vault id cap is hit (bounds the number of
+		// concurrent half-finished uploads, the real memory-exhaustion vector).
+		if s.maxIDsPerVault > 0 && len(v) >= s.maxIDsPerVault {
+			return ErrTooManyAttachments
+		}
 		e = &entry{total: total}
 		v[id] = e
 	}
@@ -110,6 +138,7 @@ func (s *Store) WriteAt(a ids.AccountNumberHash, id AttachmentID, offset, total 
 		return ErrRangeOOB
 	}
 	e.data = append(e.data, chunk...)
+	s.accountBytes[a] += uint64(len(chunk))
 	if len(e.data) == total {
 		e.complete = true
 	}
@@ -143,5 +172,13 @@ func (s *Store) ReadRange(a ids.AccountNumberHash, id AttachmentID, start, lengt
 func (s *Store) Delete(a ids.AccountNumberHash, id AttachmentID) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.vault(a), id)
+	v := s.vault(a)
+	if e := v[id]; e != nil {
+		if n := uint64(len(e.data)); s.accountBytes[a] >= n {
+			s.accountBytes[a] -= n
+		} else {
+			s.accountBytes[a] = 0
+		}
+	}
+	delete(v, id)
 }

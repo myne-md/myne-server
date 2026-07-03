@@ -93,14 +93,15 @@ func TestPersist_RegisterDeadlockFreeAndCredSurvivesReload(t *testing.T) {
 	e := newEnv(t, dir)
 	a := acct(0x42)
 
-	// The register handler holds h.mu and triggers Save() (which re-reads creds under
-	// h.mu). If the deferred-save ran inside the lock this POST would hang forever; a
-	// returned status proves the LIFO defer ordering releases h.mu before Save.
+	// The register handler holds h.mu and fires the persistence hook (now a lock-free
+	// dirty-marker, not a synchronous Save). A returned status proves it does not hang.
 	if code := e.postRegister(t, a, "user-a"); code != 200 {
 		t.Fatalf("register: status %d (a hang/deadlock would never reach here)", code)
 	}
+	// Persistence is coalesced now — flush to materialise the write, then assert it landed.
+	e.coord.Flush()
 	if _, err := os.Stat(e.path); err != nil {
-		t.Fatalf("auth.json not written after register: %v", err)
+		t.Fatalf("auth.json not written after register+flush: %v", err)
 	}
 
 	// Reload into fresh stores: the SCRAM verifier survived, so the first-write-only

@@ -31,9 +31,30 @@ const MaxBlobSize = 64*1024*1024 + 32
 // DefaultPullLimit bounds a pull page when the client does not specify one.
 const DefaultPullLimit = 256
 
+// MaxPullLimit is the hard ceiling on a client-supplied pull page size. Without
+// it a client requesting `?limit=<huge>` would materialise the whole vault's
+// metas in one response (a memory spike bounded only by the account's own blob
+// count); the clamp keeps a page bounded regardless of the requested value.
+const MaxPullLimit = 1024
+
+// MaxHeadRecordSize bounds the opaque vault-head record a push may carry. The
+// v0.1 head is a small fixed-field record (fixed fields + a per-device version
+// vector + at most two parent hashes), far below this; the cap rejects an
+// oversized opaque blob that would otherwise be stored (uncounted against quota,
+// §AS17) and re-sent on every pull's GetHead.
+const MaxHeadRecordSize = 64 * 1024
+
 // RateLimiter gates requests per account (nil = disabled).
 type RateLimiter interface {
 	Allow(account ids.AccountNumberHash) bool
+}
+
+// PreAuthLimiter gates the ONE pre-auth (session-less) route this package serves —
+// GET /vault.meta?account=<hex> — with a global, account-independent bucket
+// (nil = disabled). It must NOT key on the attacker-supplied account query value
+// or the IP (C4/AS14); see gcquota.GlobalLimiter.
+type PreAuthLimiter interface {
+	Allow() bool
 }
 
 // QuotaGuard reports whether storing addBytes would exceed the account ceiling
@@ -50,12 +71,13 @@ type Notifier interface {
 
 // Handler serves /sync/push and /sync/pull.
 type Handler struct {
-	store    store.BlobStore
-	auth     *auth.TokenStore
-	rl       RateLimiter // optional (MYND-422)
-	qg       QuotaGuard  // optional (MYND-422)
-	notifier Notifier    // optional (MYND-423 poke)
-	onStored func(int)   // optional aggregate metric hook (MYND-440); n bytes per stored blob
+	store       store.BlobStore
+	auth        *auth.TokenStore
+	rl          RateLimiter    // optional (MYND-422)
+	qg          QuotaGuard     // optional (MYND-422)
+	notifier    Notifier       // optional (MYND-423 poke)
+	onStored    func(int)      // optional aggregate metric hook (MYND-440); n bytes per stored blob
+	metaLimiter PreAuthLimiter // optional global limiter for the pre-auth vault.meta GET
 }
 
 // New returns a sync Handler over the given store + token store.
@@ -73,6 +95,13 @@ func (h *Handler) WithPolicy(rl RateLimiter, qg QuotaGuard) *Handler {
 // WithNotifier attaches the MYND-423 change-notifier (poked after a successful push).
 func (h *Handler) WithNotifier(n Notifier) *Handler {
 	h.notifier = n
+	return h
+}
+
+// WithPreAuthLimiter attaches the global pre-auth limiter guarding the vault.meta
+// GET bootstrap (nil = disabled).
+func (h *Handler) WithPreAuthLimiter(g PreAuthLimiter) *Handler {
+	h.metaLimiter = g
 	return h
 }
 
@@ -274,6 +303,10 @@ func (h *Handler) handlePush(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusBadRequest, "bad_request")
 			return
 		}
+		if len(rec) > MaxHeadRecordSize {
+			writeErr(w, http.StatusRequestEntityTooLarge, "too_large")
+			return
+		}
 		var prevArr [store.HeadIDLen]byte
 		copy(prevArr[:], prev)
 		newID, herr := h.store.AdvanceHead(sess.Account, prevArr, rec)
@@ -312,6 +345,9 @@ func (h *Handler) handlePull(w http.ResponseWriter, r *http.Request) {
 	limit := DefaultPullLimit
 	if l, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && l > 0 {
 		limit = l
+	}
+	if limit > MaxPullLimit {
+		limit = MaxPullLimit
 	}
 	// A reconcile-mode pull (`?reconcile=1`) is the client walking the WHOLE
 	// manifest from cursor 0 and diffing it against local state (§11.2). That walk
@@ -419,6 +455,13 @@ func (h *Handler) handleMeta(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]bool{"ok": true})
 
 	case http.MethodGet:
+		// Pre-auth (session-less) fetch — gate it with the global pre-auth limiter so
+		// it cannot be hammered without bound (no per-account key: the account is an
+		// attacker-supplied query value; keying on it would itself be an unbounded map).
+		if h.metaLimiter != nil && !h.metaLimiter.Allow() {
+			writeErr(w, http.StatusTooManyRequests, "rate")
+			return
+		}
 		// Pre-auth fetch by account_number_hash (the bootstrap).
 		account, ok := parseAccountHash(r.URL.Query().Get("account"))
 		if !ok {

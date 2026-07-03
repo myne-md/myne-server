@@ -25,6 +25,19 @@ type Config struct {
 	RateLimitRefill uint64
 	Policy          gcquota.Policy // QuotaCeilingBytes (0=unlimited) + HorizonMarkers (clamped) + ExtendedRetention
 	MetricsAddr     string         // MYNE_METRICS_ADDR; "" = disabled. Bind to localhost/internal only — NEVER the public edge.
+
+	// Pre-auth abuse bounds (DoS hardening). PreAuthBurst/Refill drive the single
+	// global pre-auth token bucket (account/IP-independent by construction, C4/AS14).
+	// MaxAccounts/MaxHandshakes/HandshakeTTLSeconds cap + expire the auth maps.
+	// MaxAttachmentsPerVault caps the attachment id count per vault. Unlike the quota
+	// ceiling (0=unlimited by convention), these ship as FINITE safety-net defaults so
+	// a default deployment is not defenceless; an operator raises them via env.
+	PreAuthBurst           uint64
+	PreAuthRefill          uint64
+	MaxAccounts            uint64 // 0 = unlimited (opt-out)
+	MaxHandshakes          uint64 // 0 = unlimited (opt-out)
+	HandshakeTTLSeconds    uint64 // 0 = handshakes never expire (opt-out)
+	MaxAttachmentsPerVault uint64 // 0 = unlimited (opt-out)
 }
 
 // loadConfig reads the MYNE_* env vars and fails fast on any invalid value, so a
@@ -42,6 +55,12 @@ func loadConfig() (Config, error) {
 			HorizonMarkers:    gcquota.DefaultHorizonMarkers,
 			QuotaCeilingBytes: 0, // unlimited until set (SYNC-23)
 		},
+		PreAuthBurst:           64,
+		PreAuthRefill:          8,
+		MaxAccounts:            1_000_000,
+		MaxHandshakes:          16384,
+		HandshakeTTLSeconds:    60,
+		MaxAttachmentsPerVault: 100_000,
 	}
 
 	if cfg.StorageBackend != "mem" && cfg.StorageBackend != "fs" {
@@ -68,6 +87,31 @@ func loadConfig() (Config, error) {
 		return Config{}, e
 	} else if ok {
 		cfg.Policy.ExtendedRetention = b
+	}
+
+	if cfg.PreAuthBurst, err = uintEnv("MYNE_PREAUTH_RATELIMIT_BURST", cfg.PreAuthBurst); err != nil {
+		return Config{}, err
+	}
+	if cfg.PreAuthRefill, err = uintEnv("MYNE_PREAUTH_RATELIMIT_REFILL", cfg.PreAuthRefill); err != nil {
+		return Config{}, err
+	}
+	if cfg.MaxAccounts, err = uintEnv("MYNE_MAX_ACCOUNTS", cfg.MaxAccounts); err != nil {
+		return Config{}, err
+	}
+	if cfg.MaxHandshakes, err = uintEnv("MYNE_MAX_HANDSHAKES", cfg.MaxHandshakes); err != nil {
+		return Config{}, err
+	}
+	if cfg.HandshakeTTLSeconds, err = uintEnv("MYNE_HANDSHAKE_TTL_SECONDS", cfg.HandshakeTTLSeconds); err != nil {
+		return Config{}, err
+	}
+	if cfg.MaxAttachmentsPerVault, err = uintEnv("MYNE_MAX_ATTACHMENTS_PER_VAULT", cfg.MaxAttachmentsPerVault); err != nil {
+		return Config{}, err
+	}
+
+	// A pre-auth burst of 0 would reject every registration/handshake, locking out
+	// enrollment entirely — refuse to start rather than serve a dead auth surface.
+	if cfg.PreAuthBurst == 0 {
+		return Config{}, fmt.Errorf("MYNE_PREAUTH_RATELIMIT_BURST must be > 0 (0 rejects all pre-auth requests, locking out enrollment)")
 	}
 
 	// Clamp is the SINGLE floor-enforcement point: config cannot push the horizon

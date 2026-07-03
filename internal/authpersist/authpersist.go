@@ -17,17 +17,27 @@
 package authpersist
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io/fs"
 	"log"
 	"os"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/myne-md/myne-server/internal/auth"
 	"github.com/myne-md/myne-server/internal/authapi"
 	"github.com/myne-md/myne-server/internal/store"
 )
+
+// authPersistDebounce is how long the coalescing flusher waits between writes. A
+// burst of auth mutations (e.g. a registration flood, even bounded by the caps)
+// collapses to at most one full-file rewrite per window — this kills the O(N²)
+// write amplification of a synchronous save-per-mutation. Not operator-tunable: it
+// is a durability/throughput knob, not a security one.
+const authPersistDebounce = time.Second
 
 // schemaVersion is the auth.json envelope version. A file whose version exceeds this
 // (written by a newer binary, then read after a rollback) fails closed rather than
@@ -53,7 +63,11 @@ type Coordinator struct {
 	handler *authapi.Handler
 	path    string
 
-	mu sync.Mutex // serializes saves: one consistent-cut snapshot+write at a time
+	mu    sync.Mutex  // serializes saves: one consistent-cut snapshot+write at a time
+	dirty atomic.Bool // set by trigger() on a mutation; drained by the flusher / Flush
+	// write is the durable-write primitive (default store.AtomicWrite). Injectable so a
+	// test can count how many physical writes a burst of triggers coalesced into.
+	write func(path string, data []byte) error
 }
 
 // Wire loads any existing auth.json into the three stores, then installs the save hook
@@ -66,12 +80,45 @@ type Coordinator struct {
 // documented one-time re-enroll). A PRESENT-but-unparseable / too-new file fails
 // closed: it refuses to start rather than silently de-enrolling the fleet.
 func Wire(reg *auth.Registry, tokens *auth.TokenStore, handler *authapi.Handler, path string) (*Coordinator, error) {
-	c := &Coordinator{reg: reg, tokens: tokens, handler: handler, path: path}
+	c := &Coordinator{reg: reg, tokens: tokens, handler: handler, path: path, write: store.AtomicWrite}
 	if err := c.load(); err != nil {
 		return nil, err
 	}
-	handler.SetOnChange(c.Save)
+	// The mutation hook only MARKS state dirty (a lock-free atomic store); the actual
+	// full-file write is coalesced by the background flusher (Start) or a graceful-
+	// shutdown Flush. This decouples the per-request path from the O(N) disk write.
+	handler.SetOnChange(c.trigger)
 	return c, nil
+}
+
+// trigger marks the auth state dirty. Cheap, lock-free, safe to call from a request
+// handler (it does no disk IO and takes no lock).
+func (c *Coordinator) trigger() { c.dirty.Store(true) }
+
+// Start runs the coalescing flusher until ctx is cancelled: at most one Save per
+// authPersistDebounce window, plus a final flush on shutdown so no coalesced window
+// is lost across a graceful stop. Run it in a goroutine.
+func (c *Coordinator) Start(ctx context.Context) {
+	t := time.NewTicker(authPersistDebounce)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			c.Flush() // drain any pending dirty state before exiting
+			return
+		case <-t.C:
+			c.Flush()
+		}
+	}
+}
+
+// Flush writes the current state iff a mutation is pending (dirty), consuming the
+// flag. Idempotent and safe to call from shutdown paths; the dirty.Swap makes a
+// concurrent flusher-tick and an explicit Flush collapse to a single write.
+func (c *Coordinator) Flush() {
+	if c.dirty.Swap(false) {
+		c.Save()
+	}
 }
 
 func (c *Coordinator) load() error {
@@ -102,10 +149,13 @@ func (c *Coordinator) load() error {
 }
 
 // Save snapshots all three stores under the coordinator mutex (consistent cut, one
-// writer) and atomically persists them. It MUST be called with NO auth/store locks
-// held (the authapi handlers invoke it via a deferred hook that runs after their own
-// unlock). A write failure is logged with a bounded, secret-free message and dropped:
-// the in-RAM change stands; only durability across a future restart is at risk.
+// writer) and atomically persists them. It is invoked by the coalescing flusher
+// (Start / Flush), never directly from a request handler — the handler hook only
+// marks state dirty (trigger). It MUST be called with NO auth/store locks held (it
+// re-reads the stores' snapshots under their own locks). A write failure is logged
+// with a bounded, secret-free message and dropped: the in-RAM change stands; only
+// durability across a future restart is at risk (bounded to the ≤1s debounce window
+// on a crash — at most one re-enroll, the module's existing absent-file posture).
 func (c *Coordinator) Save() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -120,7 +170,11 @@ func (c *Coordinator) Save() {
 		log.Printf("myne-server: auth persist marshal failed (state kept in RAM)")
 		return
 	}
-	if err := store.AtomicWrite(c.path, raw); err != nil {
+	write := c.write
+	if write == nil {
+		write = store.AtomicWrite
+	}
+	if err := write(c.path, raw); err != nil {
 		log.Printf("myne-server: auth persist write failed (state kept in RAM)")
 	}
 }

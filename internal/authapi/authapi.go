@@ -35,11 +35,28 @@ import (
 	"errors"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/myne-md/myne-server/internal/auth"
 	"github.com/myne-md/myne-server/internal/auth/scram"
 	"github.com/myne-md/myne-server/internal/ids"
 )
+
+// PreAuthLimiter gates the pre-auth (session-less) /auth/* surface with a single
+// account-independent token bucket (nil = disabled). It is deliberately NOT the
+// per-account RateLimiter: pre-auth requests have no session to key on, and keying
+// on IP or the attacker-supplied account hash is forbidden (C4/AS14). See
+// gcquota.GlobalLimiter.
+type PreAuthLimiter interface {
+	Allow() bool
+}
+
+// MaxAuthBodySize bounds every pre-auth /auth/* request body. SCRAM messages and
+// the register verifier are tiny (nonces + hex-encoded 32-byte keys, well under
+// 1 KiB); 8 KiB is generous but rejects an unauthenticated attacker streaming a
+// giant JSON string field to exhaust memory (the syncapi/attachments handlers
+// already gate their bodies with http.MaxBytesReader — these did not).
+const MaxAuthBodySize = 8 * 1024
 
 // storedCredential is the per-account SCRAM verifier + its username.
 type storedCredential struct {
@@ -53,6 +70,9 @@ type handshake struct {
 	username      string
 	clientNonce   string
 	combinedNonce string
+	// expiresAt bounds an init-without-final handshake so the h.hs map cannot grow
+	// unboundedly (a memory-exhaustion DoS). Zero value = non-expiring (TTL disabled).
+	expiresAt time.Time
 }
 
 // Handler serves the /auth/* routes.
@@ -64,6 +84,16 @@ type Handler struct {
 	mu    sync.Mutex
 	creds map[ids.AccountNumberHash]storedCredential
 	hs    map[string]handshake
+
+	// Pre-auth abuse bounds (0/nil = disabled — the mem/test default). preAuth is
+	// the global pre-auth rate bucket; maxCreds caps the registered-account map;
+	// maxHandshakes + hsTTL cap and expire the in-flight handshake map. now is the
+	// injectable clock (default time.Now) so the TTL is deterministically testable.
+	preAuth       PreAuthLimiter
+	maxCreds      int
+	maxHandshakes int
+	hsTTL         time.Duration
+	now           func() time.Time
 
 	// serverCbind is the channel-binding data the server expects in client-final
 	// (the TLS exporter in production; empty over loopback http — R3 wiring).
@@ -96,7 +126,34 @@ func New(reg *auth.Registry, tokens *auth.TokenStore) *Handler {
 		enroll: auth.NewEnrollment(reg, tokens),
 		creds:  make(map[ids.AccountNumberHash]storedCredential),
 		hs:     make(map[string]handshake),
+		now:    time.Now,
 	}
+}
+
+// WithPreAuthLimiter attaches the global pre-auth rate bucket (nil = disabled).
+func (h *Handler) WithPreAuthLimiter(g PreAuthLimiter) *Handler {
+	h.preAuth = g
+	return h
+}
+
+// WithLimits sets the pre-auth resource ceilings: maxCreds bounds the registered-
+// account map, maxHandshakes bounds the in-flight SCRAM handshake map, and ttl is
+// how long an init-without-final handshake survives before it is swept. A value of
+// 0 for maxCreds/maxHandshakes disables that cap; ttl <= 0 disables handshake expiry.
+func (h *Handler) WithLimits(maxCreds, maxHandshakes int, ttl time.Duration) *Handler {
+	h.maxCreds = maxCreds
+	h.maxHandshakes = maxHandshakes
+	h.hsTTL = ttl
+	return h
+}
+
+// WithClock overrides the handshake-TTL clock (tests inject a fake advancing clock;
+// production uses the default time.Now set in New).
+func (h *Handler) WithClock(now func() time.Time) *Handler {
+	if now != nil {
+		h.now = now
+	}
+	return h
 }
 
 // Register wires the auth routes onto a mux.
@@ -165,8 +222,12 @@ func (h *Handler) handleRegister(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusMethodNotAllowed, "bad_request")
 		return
 	}
+	if h.preAuth != nil && !h.preAuth.Allow() {
+		writeErr(w, http.StatusTooManyRequests, "rate")
+		return
+	}
 	var req registerReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, MaxAuthBodySize)).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, "bad_request")
 		return
 	}
@@ -186,6 +247,14 @@ func (h *Handler) handleRegister(w http.ResponseWriter, r *http.Request) {
 	if _, exists := h.creds[account]; exists {
 		// First-write only — replacing a verifier requires an authed flow (not v0.1).
 		writeErr(w, http.StatusConflict, "already_registered")
+		return
+	}
+	// Cap the registered-account map so an unauthenticated register flood cannot grow
+	// creds (and the persisted auth.json) without bound (503 = server at capacity,
+	// distinct from a 429 rate signal). LoadCreds (boot) bypasses this — it restores
+	// already-accepted state, not a new insert.
+	if h.maxCreds > 0 && len(h.creds) >= h.maxCreds {
+		writeErr(w, http.StatusServiceUnavailable, "capacity")
 		return
 	}
 	h.creds[account] = storedCredential{
@@ -221,8 +290,12 @@ func (h *Handler) handleScramInit(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusMethodNotAllowed, "bad_request")
 		return
 	}
+	if h.preAuth != nil && !h.preAuth.Allow() {
+		writeErr(w, http.StatusTooManyRequests, "rate")
+		return
+	}
 	var req scramInitReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, MaxAuthBodySize)).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, "bad_request")
 		return
 	}
@@ -251,11 +324,29 @@ func (h *Handler) handleScramInit(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "internal")
 		return
 	}
+	// Sweep expired handshakes then cap the in-flight map before inserting, so an
+	// init-without-final flood cannot grow h.hs without bound (503 = at capacity).
+	if h.hsTTL > 0 {
+		for id, s := range h.hs {
+			if !s.expiresAt.IsZero() && h.now().After(s.expiresAt) {
+				delete(h.hs, id)
+			}
+		}
+	}
+	if h.maxHandshakes > 0 && len(h.hs) >= h.maxHandshakes {
+		writeErr(w, http.StatusServiceUnavailable, "capacity")
+		return
+	}
+	var expiresAt time.Time
+	if h.hsTTL > 0 {
+		expiresAt = h.now().Add(h.hsTTL)
+	}
 	h.hs[hid] = handshake{
 		account:       account,
 		username:      req.Username,
 		clientNonce:   req.ClientNonce,
 		combinedNonce: combined,
+		expiresAt:     expiresAt,
 	}
 	writeJSON(w, scramInitResp{
 		HandshakeID:   hid,
@@ -285,8 +376,12 @@ func (h *Handler) handleScramFinal(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusMethodNotAllowed, "bad_request")
 		return
 	}
+	if h.preAuth != nil && !h.preAuth.Allow() {
+		writeErr(w, http.StatusTooManyRequests, "rate")
+		return
+	}
 	var req scramFinalReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, MaxAuthBodySize)).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, "bad_request")
 		return
 	}
@@ -311,7 +406,10 @@ func (h *Handler) handleScramFinal(w http.ResponseWriter, r *http.Request) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	hs, exists := h.hs[req.HandshakeID]
-	if !exists {
+	if !exists || (h.hsTTL > 0 && !hs.expiresAt.IsZero() && h.now().After(hs.expiresAt)) {
+		// Unknown or expired handshake (init-without-final past its TTL). Burn it and
+		// return the same 401 as any other failure (no extra enumeration signal).
+		delete(h.hs, req.HandshakeID)
 		writeErr(w, http.StatusUnauthorized, "unauthenticated")
 		return
 	}
@@ -428,7 +526,7 @@ func (h *Handler) handleApprove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req deviceActionReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, MaxAuthBodySize)).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, "bad_request")
 		return
 	}
@@ -458,7 +556,7 @@ func (h *Handler) handleRevoke(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req deviceActionReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, MaxAuthBodySize)).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, "bad_request")
 		return
 	}

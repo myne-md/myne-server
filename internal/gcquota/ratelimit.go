@@ -69,11 +69,21 @@ func NewQuotaGuard(ceilingBytes uint64) *QuotaGuard {
 	return &QuotaGuard{ceiling: ceilingBytes}
 }
 
-// WouldExceed reports whether storing addBytes more would push the account over its
-// ceiling (caller maps true → HTTP 507 "quota"). Uses the dedup'd substrate counter.
-func (q *QuotaGuard) WouldExceed(s store.BlobStore, account ids.AccountNumberHash, addBytes uint64) bool {
+// WouldExceedTotal reports whether currentBytes+addBytes would cross the ceiling
+// (0 = unlimited). It is store-agnostic so a caller holding a byte total drawn from
+// more than one source can gate on the combined figure — this is how the attachment
+// transport folds its bytes into the SAME per-account AS17 ceiling as the blob store
+// (unified total, no per-subsystem ceiling to bypass).
+func (q *QuotaGuard) WouldExceedTotal(currentBytes, addBytes uint64) bool {
 	if q.ceiling == 0 {
 		return false
 	}
-	return s.QuotaBytes(account)+addBytes > q.ceiling
+	return currentBytes+addBytes > q.ceiling
+}
+
+// WouldExceed reports whether storing addBytes more would push the account over its
+// ceiling (caller maps true → HTTP 507 "quota"). Uses the dedup'd substrate counter
+// from the blob store (the sync-push path).
+func (q *QuotaGuard) WouldExceed(s store.BlobStore, account ids.AccountNumberHash, addBytes uint64) bool {
+	return q.WouldExceedTotal(s.QuotaBytes(account), addBytes)
 }

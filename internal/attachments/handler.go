@@ -14,16 +14,45 @@ import (
 	"github.com/myne-md/myne-server/internal/ids"
 )
 
+// RateLimiter gates per-account requests (nil = disabled) — the same seam the sync
+// path uses, so an attachment flood is bounded exactly like a push flood.
+type RateLimiter interface {
+	Allow(account ids.AccountNumberHash) bool
+}
+
+// AttachQuota reports whether currentBytes+addBytes would cross the per-account
+// ceiling (nil = disabled). It is store-agnostic so attachment bytes fold into the
+// SAME AS17 total as blob bytes (see gcquota.QuotaGuard.WouldExceedTotal).
+type AttachQuota interface {
+	WouldExceedTotal(currentBytes, addBytes uint64) bool
+}
+
 // Handler serves the resumable attachment transport. Every route is session-bound
 // via the MYND-420 per-device token.
 type Handler struct {
 	store *Store
 	auth  *auth.TokenStore
+	rl    RateLimiter
+	qg    AttachQuota
+	// used reports the account's byte total held OUTSIDE this store (the blob store's
+	// QuotaBytes), so the quota check gates on the unified per-account AS17 figure.
+	used func(ids.AccountNumberHash) uint64
 }
 
 // New returns an attachment Handler.
 func New(s *Store, ts *auth.TokenStore) *Handler {
 	return &Handler{store: s, auth: ts}
+}
+
+// WithPolicy attaches the per-account rate-limiter + the unified quota guard. `used`
+// supplies the account's byte total from the blob store so attachment bytes are
+// counted against the same AS17 ceiling (never a separate, bypassable budget). Any
+// of rl/qg/used may be nil (that gate disabled).
+func (h *Handler) WithPolicy(rl RateLimiter, qg AttachQuota, used func(ids.AccountNumberHash) uint64) *Handler {
+	h.rl = rl
+	h.qg = qg
+	h.used = used
+	return h
 }
 
 // Register wires the attachment routes (Go 1.22 method+path patterns).
@@ -68,6 +97,10 @@ func (h *Handler) handleHead(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}
+	if h.rl != nil && !h.rl.Allow(sess.Account) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		return
+	}
 	id, ok := parseID(r.PathValue("id"))
 	if !ok {
 		w.WriteHeader(http.StatusBadRequest)
@@ -94,6 +127,10 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}
+	if h.rl != nil && !h.rl.Allow(sess.Account) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		return
+	}
 	id, ok := parseID(r.PathValue("id"))
 	if !ok {
 		w.WriteHeader(http.StatusBadRequest)
@@ -104,6 +141,20 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request) {
 	if err1 != nil || err2 != nil || offset < 0 || total < 0 {
 		w.WriteHeader(http.StatusBadRequest)
 		return
+	}
+	// Reserve the declared total against the UNIFIED per-account ceiling when a new
+	// upload starts (offset==0): attachment bytes + blob bytes share one AS17 ceiling,
+	// so this path cannot be used to store past the quota the sync path enforces.
+	if h.qg != nil && offset == 0 {
+		var current uint64
+		if h.used != nil {
+			current = h.used(sess.Account)
+		}
+		current += h.store.AccountBytes(sess.Account)
+		if h.qg.WouldExceedTotal(current, uint64(total)) {
+			w.WriteHeader(http.StatusInsufficientStorage)
+			return
+		}
 	}
 	chunk, err := io.ReadAll(http.MaxBytesReader(w, r.Body, MaxAttachmentSize+1))
 	if err != nil {
@@ -116,6 +167,9 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request) {
 		// ok
 	case ErrTooLarge:
 		w.WriteHeader(http.StatusRequestEntityTooLarge)
+		return
+	case ErrTooManyAttachments:
+		w.WriteHeader(http.StatusInsufficientStorage) // per-vault id cap reached
 		return
 	case ErrBadOffset, ErrRangeOOB, ErrDeclaredLen:
 		w.WriteHeader(http.StatusConflict) // resume-offset conflict — client re-probes via HEAD
@@ -136,6 +190,10 @@ func (h *Handler) handleGet(w http.ResponseWriter, r *http.Request) {
 	sess, ok := h.session(r)
 	if !ok {
 		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+	if h.rl != nil && !h.rl.Allow(sess.Account) {
+		w.WriteHeader(http.StatusTooManyRequests)
 		return
 	}
 	id, ok := parseID(r.PathValue("id"))

@@ -122,9 +122,18 @@ func runListener(ctx context.Context, ln net.Listener) error {
 		cfg.StorageBackend, cfg.RateLimitBurst, cfg.RateLimitRefill,
 		cfg.Policy.QuotaCeilingBytes, cfg.Policy.HorizonMarkers, cfg.Policy.ExtendedRetention)
 
+	// Pre-auth global limiters (DoS hardening): one for the /auth/* surface, one for
+	// the pre-auth vault.meta GET. Two independent buckets so a meta-fetch flood does
+	// not starve enrollment (and vice versa). Account/IP-independent by construction
+	// (C4/AS14) — they smooth pre-auth churn; the hard bounds are the maps' caps.
+	preAuthAuth := gcquota.NewGlobalLimiter(cfg.PreAuthBurst, cfg.PreAuthRefill)
+	preAuthMeta := gcquota.NewGlobalLimiter(cfg.PreAuthBurst, cfg.PreAuthRefill)
+
 	reg := auth.NewRegistry()
 	tokens := auth.NewTokenStore(reg)
-	authHandler := authapi.New(reg, tokens)
+	authHandler := authapi.New(reg, tokens).
+		WithPreAuthLimiter(preAuthAuth).
+		WithLimits(int(cfg.MaxAccounts), int(cfg.MaxHandshakes), time.Duration(cfg.HandshakeTTLSeconds)*time.Second)
 
 	// Persist device-auth state (registry + per-device tokens + per-account SCRAM
 	// verifiers) so a restart does not de-enroll every device (clients would otherwise
@@ -132,10 +141,16 @@ func runListener(ctx context.Context, ln net.Listener) error {
 	// pure in-RAM. Load happens BEFORE listen: a corrupt/too-new auth.json fails closed
 	// (refuses to start) rather than silently de-enrolling the fleet; an ABSENT file is
 	// the legitimate first-boot path (start empty → one re-enroll → persists thereafter).
+	var authCoord *authpersist.Coordinator
 	if cfg.StorageBackend == "fs" {
-		if _, err := authpersist.Wire(reg, tokens, authHandler, filepath.Join(cfg.StoragePath, "auth.json")); err != nil {
+		authCoord, err = authpersist.Wire(reg, tokens, authHandler, filepath.Join(cfg.StoragePath, "auth.json"))
+		if err != nil {
 			return err
 		}
+		// Coalesce auth-state writes: the handler hook marks dirty; this flusher writes
+		// at most once per debounce window (kills the O(N²) save-per-mutation), and
+		// flushes a final time on ctx cancel (below, synchronously) so nothing is lost.
+		go authCoord.Start(ctx)
 	}
 
 	// Rate-limit keyed on account_number_hash, never IP (C4). Quota ceiling
@@ -155,13 +170,15 @@ func runListener(ctx context.Context, ln net.Listener) error {
 				return
 			case <-t.C:
 				rl.Refill()
+				preAuthAuth.Refill()
+				preAuthMeta.Refill()
 			}
 		}
 	}()
 
 	ready := NewReadiness()
 	metrics := NewMetrics()
-	srv := newHTTPServer(NewServer(blobStore, tokens, authHandler, rl, qg, ready, metrics))
+	srv := newHTTPServer(NewServer(blobStore, tokens, authHandler, rl, qg, ready, metrics, preAuthMeta, int(cfg.MaxAttachmentsPerVault)))
 
 	// Aggregate-only metrics on a SEPARATE listener (SYNC-24) — never the public edge.
 	// Disabled unless MYNE_METRICS_ADDR is set; bind it to localhost/internal only.
@@ -204,6 +221,9 @@ func runListener(ctx context.Context, ln net.Listener) error {
 		ready.SetNotReady()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
+		if authCoord != nil {
+			authCoord.Flush() // synchronously persist any coalesced-but-unwritten auth state
+		}
 		if metricsSrv != nil {
 			_ = metricsSrv.Shutdown(shutdownCtx)
 		}
@@ -230,7 +250,7 @@ func NewRouter(a auth.Authenticator) http.Handler {
 // behind the no-IP middleware. Every sync route is session-bound via the token
 // store (MYND-420); the health probe is the only open endpoint. rl/qg may be nil
 // (policy disabled).
-func NewServer(s store.BlobStore, tokens *auth.TokenStore, authHandler *authapi.Handler, rl syncapi.RateLimiter, qg syncapi.QuotaGuard, ready *Readiness, metrics *Metrics) http.Handler {
+func NewServer(s store.BlobStore, tokens *auth.TokenStore, authHandler *authapi.Handler, rl syncapi.RateLimiter, qg *gcquota.QuotaGuard, ready *Readiness, metrics *Metrics, preAuthMeta syncapi.PreAuthLimiter, attachMaxIDs int) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", healthz)
 	if ready != nil {
@@ -239,13 +259,18 @@ func NewServer(s store.BlobStore, tokens *auth.TokenStore, authHandler *authapi.
 
 	authHandler.Register(mux) // device auth + management (MYND-420/425); persistence-wired upstream
 	notifier := poke.NewNotifier()
-	syncMux := syncapi.New(s, tokens).WithPolicy(rl, qg).WithNotifier(notifier)
+	syncMux := syncapi.New(s, tokens).WithPolicy(rl, qg).WithNotifier(notifier).WithPreAuthLimiter(preAuthMeta)
 	if metrics != nil {
 		syncMux = syncMux.WithMetrics(metrics.ObserveBlobStored)
 	}
 	syncMux.Register(mux)
-	poke.NewHandler(notifier, tokens).Register(mux)               // opt-in SSE (MYND-423)
-	attachments.New(attachments.NewStore(), tokens).Register(mux) // resumable transport (MYND-423)
+	poke.NewHandler(notifier, tokens).Register(mux) // opt-in SSE (MYND-423)
+	// Attachment transport: same per-account rate-limit + a UNIFIED quota — attachment
+	// bytes are added to the blob store's per-account total against one AS17 ceiling
+	// (no separate, bypassable budget), plus a per-vault id cap (OOM bound).
+	attachments.New(attachments.NewStore().WithMaxIDs(int(attachMaxIDs)), tokens).
+		WithPolicy(rl, qg, func(a ids.AccountNumberHash) uint64 { return s.QuotaBytes(a) }).
+		Register(mux) // resumable transport (MYND-423)
 
 	// noIP stays the OUTERMOST layer, blanking RemoteAddr before anything reads it.
 	// The request-count + structured access-log middleware sit INSIDE noIP, so they
