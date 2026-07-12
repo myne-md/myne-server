@@ -306,7 +306,11 @@ func NewServer(s store.BlobStore, tokens *auth.TokenStore, authHandler *authapi.
 		syncMux = syncMux.WithMetrics(metrics.ObserveBlobStored)
 	}
 	syncMux.Register(mux)
-	poke.NewHandler(notifier, tokens).Register(mux) // opt-in SSE (MYND-423)
+	// SSE poke (MYND-423): same per-account token bucket as the sync routes (one
+	// token per connection attempt), plus the notifier's per-account stream cap
+	// and a heartbeat keep-alive — the low-latency layer clients keep open while
+	// unlocked (sync-protocol §8.3 as amended).
+	poke.NewHandler(notifier, tokens).WithPolicy(rl).Register(mux)
 	// Attachment transport: same per-account rate-limit + a UNIFIED quota — attachment
 	// bytes are added to the blob store's per-account total against one AS17 ceiling
 	// (no separate, bypassable budget), plus a per-vault id cap (OOM bound).

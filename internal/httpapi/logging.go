@@ -35,3 +35,14 @@ func (s *statusWriter) WriteHeader(code int) {
 	s.status = code
 	s.ResponseWriter.WriteHeader(code)
 }
+
+// Flush forwards http.Flusher so the SSE poke stream can flush per event
+// through the access-log wrapper. Without this, the embedded-interface
+// wrapper hides the underlying Flusher from the poke handler's type
+// assertion and every /sync/poke through the full middleware chain 500s
+// (the handler fails closed on a non-flushable writer).
+func (s *statusWriter) Flush() {
+	if f, ok := s.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}

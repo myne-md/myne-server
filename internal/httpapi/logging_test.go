@@ -54,3 +54,23 @@ func TestAccessLog_NoIPField(t *testing.T) {
 		}
 	}
 }
+
+// TestAccessLog_ForwardsFlusher: the statusWriter wrapper must forward
+// http.Flusher — the SSE poke handler type-asserts the writer and fails closed
+// (500) on a non-flushable one, so a wrapper that hides Flusher silently 500s
+// every /sync/poke that passes through the full middleware chain. Regression
+// for exactly that (found by the live end-to-end poke test).
+func TestAccessLog_ForwardsFlusher(t *testing.T) {
+	var sawFlusher bool
+	h := noIP(accessLog(slog.New(slog.NewJSONHandler(&bytes.Buffer{}, nil)),
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, sawFlusher = w.(http.Flusher)
+			w.WriteHeader(http.StatusOK)
+		})))
+	// httptest.NewRecorder implements http.Flusher, mirroring the real server's
+	// ResponseWriter; the wrapper must not hide it.
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/sync/poke", nil))
+	if !sawFlusher {
+		t.Fatal("statusWriter hides http.Flusher from handlers (breaks the SSE poke stream)")
+	}
+}
