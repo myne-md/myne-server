@@ -24,10 +24,14 @@ import (
 // OTel, which would be the server's first non-stdlib dep, TB9). Bound to a SEPARATE
 // localhost/auth-gated listener, never the public Caddy edge.
 type Metrics struct {
-	requestsTotal            atomic.Uint64
-	blobsStoredTotal         atomic.Uint64
-	bytesStoredTotal         atomic.Uint64
-	tombstonesReclaimedTotal atomic.Uint64
+	requestsTotal                 atomic.Uint64
+	blobsStoredTotal              atomic.Uint64
+	bytesStoredTotal              atomic.Uint64
+	tombstonesReclaimedTotal      atomic.Uint64
+	attachmentsStoredTotal        atomic.Uint64
+	attachmentBytesStoredTotal    atomic.Uint64
+	attachmentsReclaimedTotal     atomic.Uint64
+	attachmentBytesReclaimedTotal atomic.Uint64
 }
 
 // NewMetrics returns a zeroed metrics registry.
@@ -46,6 +50,22 @@ func (m *Metrics) ObserveBlobStored(n int) {
 
 // IncTombstoneReclaimed records one L2-reclaimed tombstone (fed by the GC scheduler).
 func (m *Metrics) IncTombstoneReclaimed() { m.tombstonesReclaimedTotal.Add(1) }
+
+// ObserveAttachmentStored records one COMPLETED attachment upload of n bytes
+// (fed by the /attachments PUT completion, MYND-468).
+func (m *Metrics) ObserveAttachmentStored(n int) {
+	m.attachmentsStoredTotal.Add(1)
+	if n > 0 {
+		m.attachmentBytesStoredTotal.Add(uint64(n))
+	}
+}
+
+// ObserveAttachmentReclaimed records one reclaimed attachment body of n bytes
+// (fed by the horizon-GC attachment bridge, MYND-468).
+func (m *Metrics) ObserveAttachmentReclaimed(n uint64) {
+	m.attachmentsReclaimedTotal.Add(1)
+	m.attachmentBytesReclaimedTotal.Add(n)
+}
 
 // middleware counts requests around the next handler. It is placed INSIDE noIP so it
 // never observes a client IP (noIP has already blanked RemoteAddr / stripped headers).
@@ -76,6 +96,18 @@ func (m *Metrics) handler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "# HELP myne_tombstones_reclaimed_total Total tombstones L2-reclaimed by GC (aggregate).\n")
 	fmt.Fprintf(w, "# TYPE myne_tombstones_reclaimed_total counter\n")
 	fmt.Fprintf(w, "myne_tombstones_reclaimed_total %d\n", m.tombstonesReclaimedTotal.Load())
+	fmt.Fprintf(w, "# HELP myne_attachments_stored_total Total completed attachment uploads (aggregate).\n")
+	fmt.Fprintf(w, "# TYPE myne_attachments_stored_total counter\n")
+	fmt.Fprintf(w, "myne_attachments_stored_total %d\n", m.attachmentsStoredTotal.Load())
+	fmt.Fprintf(w, "# HELP myne_attachment_bytes_stored_total Total attachment ciphertext bytes stored (aggregate).\n")
+	fmt.Fprintf(w, "# TYPE myne_attachment_bytes_stored_total counter\n")
+	fmt.Fprintf(w, "myne_attachment_bytes_stored_total %d\n", m.attachmentBytesStoredTotal.Load())
+	fmt.Fprintf(w, "# HELP myne_attachments_reclaimed_total Total attachment bodies reclaimed by GC (aggregate).\n")
+	fmt.Fprintf(w, "# TYPE myne_attachments_reclaimed_total counter\n")
+	fmt.Fprintf(w, "myne_attachments_reclaimed_total %d\n", m.attachmentsReclaimedTotal.Load())
+	fmt.Fprintf(w, "# HELP myne_attachment_bytes_reclaimed_total Total attachment ciphertext bytes reclaimed (aggregate).\n")
+	fmt.Fprintf(w, "# TYPE myne_attachment_bytes_reclaimed_total counter\n")
+	fmt.Fprintf(w, "myne_attachment_bytes_reclaimed_total %d\n", m.attachmentBytesReclaimedTotal.Load())
 }
 
 // MetricsHandler returns the /metrics http.Handler. The CALLER binds it to a separate

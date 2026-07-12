@@ -30,18 +30,28 @@ type AttachQuota interface {
 // Handler serves the resumable attachment transport. Every route is session-bound
 // via the MYND-420 per-device token.
 type Handler struct {
-	store *Store
+	store Backend
 	auth  *auth.TokenStore
 	rl    RateLimiter
 	qg    AttachQuota
 	// used reports the account's byte total held OUTSIDE this store (the blob store's
 	// QuotaBytes), so the quota check gates on the unified per-account AS17 figure.
 	used func(ids.AccountNumberHash) uint64
+	// onStored is the aggregate-only metrics hook (SYNC-24): called with the total
+	// byte length when an upload COMPLETES. No account/IP ever crosses it.
+	onStored func(int)
 }
 
-// New returns an attachment Handler.
-func New(s *Store, ts *auth.TokenStore) *Handler {
+// New returns an attachment Handler over any Backend (in-memory or fs).
+func New(s Backend, ts *auth.TokenStore) *Handler {
 	return &Handler{store: s, auth: ts}
+}
+
+// WithMetrics attaches the aggregate-only completion hook (MYND-468; SYNC-24
+// discipline — feeds myne_attachments_stored_total / myne_attachment_bytes_stored_total).
+func (h *Handler) WithMetrics(onStored func(int)) *Handler {
+	h.onStored = onStored
+	return h
 }
 
 // WithPolicy attaches the per-account rate-limiter + the unified quota guard. `used`
@@ -79,7 +89,9 @@ func (h *Handler) session(r *http.Request) (auth.Session, bool) {
 	return sess, true
 }
 
-func parseID(s string) (AttachmentID, bool) {
+// ParseID decodes a lowercase-hex 32-byte attachment-id. Exported for the
+// composition layer (the GC reclaim bridge re-parses the id it stored as hex).
+func ParseID(s string) (AttachmentID, bool) {
 	b, err := hex.DecodeString(s)
 	if err != nil || len(b) != AttachmentIDLen {
 		return AttachmentID{}, false
@@ -101,7 +113,7 @@ func (h *Handler) handleHead(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusTooManyRequests)
 		return
 	}
-	id, ok := parseID(r.PathValue("id"))
+	id, ok := ParseID(r.PathValue("id"))
 	if !ok {
 		w.WriteHeader(http.StatusBadRequest)
 		return
@@ -131,7 +143,7 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusTooManyRequests)
 		return
 	}
-	id, ok := parseID(r.PathValue("id"))
+	id, ok := ParseID(r.PathValue("id"))
 	if !ok {
 		w.WriteHeader(http.StatusBadRequest)
 		return
@@ -179,6 +191,10 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	n, _ := h.store.UploadedLen(sess.Account, id)
+	if h.onStored != nil && n == total && offset+len(chunk) == total {
+		// The upload just completed with this chunk — one aggregate observation.
+		h.onStored(total)
+	}
 	w.Header().Set("X-Uploaded-Length", strconv.Itoa(n))
 	w.WriteHeader(http.StatusOK)
 }
@@ -196,7 +212,7 @@ func (h *Handler) handleGet(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusTooManyRequests)
 		return
 	}
-	id, ok := parseID(r.PathValue("id"))
+	id, ok := ParseID(r.PathValue("id"))
 	if !ok {
 		w.WriteHeader(http.StatusBadRequest)
 		return

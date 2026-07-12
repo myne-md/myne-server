@@ -78,6 +78,11 @@ type Handler struct {
 	notifier    Notifier       // optional (MYND-423 poke)
 	onStored    func(int)      // optional aggregate metric hook (MYND-440); n bytes per stored blob
 	metaLimiter PreAuthLimiter // optional global limiter for the pre-auth vault.meta GET
+	// attachmentDeleter marks the stored attachment BODY deleted when an
+	// attachment tombstone record lands (MYND-468, §11.4 step 2) — the bridge to
+	// the attachments store, injected as a closure so the packages stay decoupled.
+	// nil = no attachment store wired (tests that only exercise notes).
+	attachmentDeleter func(account ids.AccountNumberHash, id [32]byte)
 }
 
 // New returns a sync Handler over the given store + token store.
@@ -102,6 +107,14 @@ func (h *Handler) WithNotifier(n Notifier) *Handler {
 // GET bootstrap (nil = disabled).
 func (h *Handler) WithPreAuthLimiter(g PreAuthLimiter) *Handler {
 	h.metaLimiter = g
+	return h
+}
+
+// WithAttachmentDeleter attaches the attachments-store bridge (MYND-468): called
+// with the full attachment-id when an attachment tombstone record lands, so the
+// body reads as absent from then on (physical reclaim rides horizon-GC).
+func (h *Handler) WithAttachmentDeleter(fn func(account ids.AccountNumberHash, id [32]byte)) *Handler {
+	h.attachmentDeleter = fn
 	return h
 }
 
@@ -133,6 +146,12 @@ type pushBlob struct {
 	// records the (uuid, final_version, marker) for horizon-GC; it never learns
 	// "deleted" meaning beyond that (AS6). The ciphertext is still opaque.
 	Tombstone bool `json:"tombstone,omitempty"`
+	// AttachmentIDHex (MYND-468, sync-protocol §8.1/§11.4) marks this record as an
+	// ATTACHMENT: blob_id_hex is the id's first 16 bytes, ciphertext_b64 is empty
+	// (the bytes travelled over /attachments/{id}), and this field carries the full
+	// 32-byte id (64 hex). On a tombstone push the server additionally marks the
+	// stored attachment body deleted. Absent for notes.
+	AttachmentIDHex string `json:"attachment_id_hex,omitempty"`
 }
 
 type pushHead struct {
@@ -160,6 +179,9 @@ type syncMetaWire struct {
 	Version      uint64 `json:"version"`
 	ContentNonce string `json:"content_nonce_hex"`
 	Size         int    `json:"size"`
+	// AttachmentIDHex echoes the full attachment-id back for an attachment record
+	// (MYND-468) so a puller resolves the 16-byte prefix without the catalog.
+	AttachmentIDHex string `json:"attachment_id_hex,omitempty"`
 }
 
 type headWire struct {
@@ -267,6 +289,23 @@ func (h *Handler) handlePush(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusBadRequest, "bad_request")
 			return
 		}
+		// An attachment record (MYND-468): validate the full id and its prefix
+		// relation to the record key BEFORE storing anything.
+		var attID [32]byte
+		isAttachment := b.AttachmentIDHex != ""
+		if isAttachment {
+			ab, aerr := hex.DecodeString(b.AttachmentIDHex)
+			if aerr != nil || len(ab) != 32 {
+				writeErr(w, http.StatusBadRequest, "bad_request")
+				return
+			}
+			copy(attID[:], ab)
+			if string(attID[:ids.BlobIDLen]) != string(id[:]) {
+				// The record key MUST be the id's first 16 bytes (§4.2 pin).
+				writeErr(w, http.StatusBadRequest, "bad_request")
+				return
+			}
+		}
 		if len(ct) > MaxBlobSize {
 			writeErr(w, http.StatusRequestEntityTooLarge, "too_large")
 			return
@@ -287,9 +326,18 @@ func (h *Handler) handlePush(w http.ResponseWriter, r *http.Request) {
 		if h.onStored != nil {
 			h.onStored(len(ct)) // aggregate metric only — no account/IP (MYND-440)
 		}
+		if isAttachment {
+			// Persist the prefix→full-id association: pull echoes it, GC bridges it.
+			_ = h.store.SetBlobAttachmentID(sess.Account, id, b.AttachmentIDHex)
+		}
 		if b.Tombstone {
 			// Record the (uuid, final_version, marker) for horizon-GC (MYND-422).
 			_ = h.store.SetTombstone(sess.Account, id, ver)
+			if isAttachment && h.attachmentDeleter != nil {
+				// §11.4 step 2: the stored attachment BODY reads as absent from
+				// now on; physical reclaim rides the record's horizon-GC.
+				h.attachmentDeleter(sess.Account, attID)
+			}
 		}
 		results = append(results, pushResult{BlobIDHex: b.BlobIDHex, Version: uint64(ver)})
 	}
@@ -374,10 +422,11 @@ func (h *Handler) handlePull(w http.ResponseWriter, r *http.Request) {
 	resp := pullResp{NextCursor: next, Metas: make([]syncMetaWire, 0, len(metas))}
 	for _, m := range metas {
 		resp.Metas = append(resp.Metas, syncMetaWire{
-			UUIDHex:      hex.EncodeToString(m.BlobID[:]),
-			Version:      uint64(m.Version),
-			ContentNonce: hex.EncodeToString(m.ContentNonce[:]),
-			Size:         m.Size,
+			UUIDHex:         hex.EncodeToString(m.BlobID[:]),
+			Version:         uint64(m.Version),
+			ContentNonce:    hex.EncodeToString(m.ContentNonce[:]),
+			Size:            m.Size,
+			AttachmentIDHex: m.AttachmentIDHex,
 		})
 	}
 	if rec, headID, err := h.store.GetHead(sess.Account); err == nil {

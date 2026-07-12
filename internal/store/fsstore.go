@@ -60,6 +60,9 @@ type fsBlobMeta struct {
 	size         int
 	changeSeq    uint64
 	reclaimed    bool // L2-reclaimed → body removed from disk
+	// attachmentID is the full 32-byte attachment-id (hex) for an attachment
+	// record (MYND-468); "" for notes. Opaque; echoed in ChangedSince.
+	attachmentID string
 }
 
 // NewFSStore opens (creating if absent) a filesystem store rooted at dir and loads
@@ -94,6 +97,7 @@ type blobIndex struct {
 	Size         int     `json:"size"`
 	ChangeSeq    uint64  `json:"change_seq"`
 	Reclaimed    bool    `json:"reclaimed,omitempty"`
+	AttachmentID string  `json:"attachment_id,omitempty"` // full 32-byte id, hex (MYND-468)
 }
 
 type tombIndex struct {
@@ -155,7 +159,7 @@ func (idx vaultIndex) toVault() *fsVault {
 		if !ok {
 			continue
 		}
-		m := &fsBlobMeta{version: b.Version, size: b.Size, changeSeq: b.ChangeSeq, reclaimed: b.Reclaimed}
+		m := &fsBlobMeta{version: b.Version, size: b.Size, changeSeq: b.ChangeSeq, reclaimed: b.Reclaimed, attachmentID: b.AttachmentID}
 		if nb, err := base64.StdEncoding.DecodeString(b.ContentNonce); err == nil && len(nb) == ContentNonceLen {
 			copy(m.contentNonce[:], nb)
 		}
@@ -194,6 +198,7 @@ func (v *fsVault) toIndex() vaultIndex {
 			Size:         m.size,
 			ChangeSeq:    m.changeSeq,
 			Reclaimed:    m.reclaimed,
+			AttachmentID: m.attachmentID,
 		}
 	}
 	for d, pos := range v.cursors {
@@ -358,12 +363,14 @@ func (s *FSStore) PushBlob(account ids.AccountNumberHash, blobID ids.BlobID, bas
 		}
 		return 0, ErrBlobCASMismatch
 	}
-	if m != nil && m.version != 0 && !m.reclaimed && bytesEqual(s.readBody(account, blobID), ciphertext) {
-		m.contentNonce = contentNonce
-		if err := s.persist(account, v); err != nil {
-			return 0, err
-		}
-		return m.version, nil // idempotent re-push at current base
+	// Idempotent re-push at the current base requires identical bytes AND an
+	// identical nonce — for an attachment record (empty inline ciphertext,
+	// MYND-468) the nonce is the only discriminator between a registration and
+	// its tombstone, and absorbing the nonce change would hide the deletion
+	// from every other device's change feed.
+	if m != nil && m.version != 0 && !m.reclaimed && m.contentNonce == contentNonce &&
+		bytesEqual(s.readBody(account, blobID), ciphertext) {
+		return m.version, nil
 	}
 	// Write the body FIRST (graceful ENOSPC, SYNC-23): a failed write leaves the
 	// in-memory index + prior body untouched.
@@ -508,12 +515,47 @@ func (s *FSStore) ChangedSince(account ids.AccountNumberHash, cursor uint64, lim
 	newCursor := cursor
 	out := make([]SyncMeta, 0, len(items))
 	for _, it := range items {
-		out = append(out, SyncMeta{BlobID: it.id, Version: it.m.version, ContentNonce: it.m.contentNonce, Size: it.m.size})
+		out = append(out, SyncMeta{BlobID: it.id, Version: it.m.version, ContentNonce: it.m.contentNonce, Size: it.m.size, AttachmentIDHex: it.m.attachmentID})
 		if it.m.changeSeq > newCursor {
 			newCursor = it.m.changeSeq
 		}
 	}
 	return out, newCursor
+}
+
+// SetBlobAttachmentID associates the full attachment-id (hex) with a blob record
+// (MYND-468), persisted in the vault index. See BlobStore.SetBlobAttachmentID.
+func (s *FSStore) SetBlobAttachmentID(account ids.AccountNumberHash, blobID ids.BlobID, attachmentIDHex string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	v := s.vaults[account]
+	if v == nil {
+		return ErrNotFound
+	}
+	m := v.blobs[blobID]
+	if m == nil {
+		return ErrNotFound
+	}
+	if m.attachmentID == attachmentIDHex {
+		return nil // no index churn on an idempotent re-push
+	}
+	m.attachmentID = attachmentIDHex
+	return s.persist(account, v)
+}
+
+// BlobAttachmentID returns the associated attachment-id hex ("" if none).
+func (s *FSStore) BlobAttachmentID(account ids.AccountNumberHash, blobID ids.BlobID) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	v := s.vaults[account]
+	if v == nil {
+		return ""
+	}
+	m := v.blobs[blobID]
+	if m == nil {
+		return ""
+	}
+	return m.attachmentID
 }
 
 func (s *FSStore) AckCursor(account ids.AccountNumberHash, device ids.DeviceID, pos uint64) {

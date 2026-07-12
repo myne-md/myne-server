@@ -176,9 +176,25 @@ func runListener(ctx context.Context, ln net.Listener) error {
 		}
 	}()
 
+	// Attachment store follows the SAME backend selection as the blob store
+	// (MYND-468): fs shares the volume (one snapshot = blobs + attachments +
+	// auth), mem is the dev/E2E reference. Before this the attachment store was
+	// unconditionally in-memory — bodies vanished on restart and 64 MiB uploads
+	// lived in RSS.
+	var attachStore attachments.Backend
+	if cfg.StorageBackend == "fs" {
+		fsAttach, err := attachments.NewFSStore(cfg.StoragePath)
+		if err != nil {
+			return err
+		}
+		attachStore = fsAttach.WithMaxIDs(int(cfg.MaxAttachmentsPerVault))
+	} else {
+		attachStore = attachments.NewStore().WithMaxIDs(int(cfg.MaxAttachmentsPerVault))
+	}
+
 	ready := NewReadiness()
 	metrics := NewMetrics()
-	srv := newHTTPServer(NewServer(blobStore, tokens, authHandler, rl, qg, ready, metrics, preAuthMeta, int(cfg.MaxAttachmentsPerVault)))
+	srv := newHTTPServer(NewServer(blobStore, tokens, authHandler, rl, qg, ready, metrics, preAuthMeta, attachStore))
 
 	// Aggregate-only metrics on a SEPARATE listener (SYNC-24) — never the public edge.
 	// Disabled unless MYNE_METRICS_ADDR is set; bind it to localhost/internal only.
@@ -196,10 +212,26 @@ func runListener(ctx context.Context, ln net.Listener) error {
 	// Horizon-GC scheduler (MYND-440, SYNC-25): periodically drive the existing
 	// MYND-422 substrate across all accounts; report reclaimed count as an aggregate
 	// metric. Only when the backend can enumerate accounts (mem/fs both can).
+	// MYND-468: a reclaimed ATTACHMENT tombstone record also drops its stored body
+	// via the reclaim bridge — one horizon, one ack rule, one retention switch
+	// ("no parallel attachment-GC path", ledger SYNC-8). Enumeration stays the blob
+	// store's: attachment bodies only become reclaimable through a blob-plane
+	// tombstone record, so an account with bodies but no records has nothing to sweep.
 	if lister, ok := blobStore.(interface {
 		ListAccounts() []ids.AccountNumberHash
 	}); ok {
-		gc := gcquota.NewHorizonGC(blobStore, reg, cfg.Policy)
+		gc := gcquota.NewHorizonGC(blobStore, reg, cfg.Policy).
+			WithAttachmentReclaim(func(a ids.AccountNumberHash, attHex string) (uint64, bool) {
+				id, ok := attachments.ParseID(attHex)
+				if !ok {
+					return 0, false
+				}
+				freed, ok := attachStore.Reclaim(a, id)
+				if ok {
+					metrics.ObserveAttachmentReclaimed(freed)
+				}
+				return freed, ok
+			})
 		sched := gcquota.NewScheduler(gc, lister.ListAccounts, func(n int) {
 			for i := 0; i < n; i++ {
 				metrics.IncTombstoneReclaimed()
@@ -249,17 +281,27 @@ func NewRouter(a auth.Authenticator) http.Handler {
 // NewServer builds the full HTTP handler: health + the push/pull sync routes, all
 // behind the no-IP middleware. Every sync route is session-bound via the token
 // store (MYND-420); the health probe is the only open endpoint. rl/qg may be nil
-// (policy disabled).
-func NewServer(s store.BlobStore, tokens *auth.TokenStore, authHandler *authapi.Handler, rl syncapi.RateLimiter, qg *gcquota.QuotaGuard, ready *Readiness, metrics *Metrics, preAuthMeta syncapi.PreAuthLimiter, attachMaxIDs int) http.Handler {
+// (policy disabled). attachStore is the attachment Backend (MYND-468 — the caller
+// selects mem/fs to match the blob store; nil constructs a fresh in-memory one,
+// the pre-468 behavior tests rely on).
+func NewServer(s store.BlobStore, tokens *auth.TokenStore, authHandler *authapi.Handler, rl syncapi.RateLimiter, qg *gcquota.QuotaGuard, ready *Readiness, metrics *Metrics, preAuthMeta syncapi.PreAuthLimiter, attachStore attachments.Backend) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", healthz)
 	if ready != nil {
 		mux.HandleFunc("/readyz", ready.handler) // readiness probe (MYND-440)
 	}
+	if attachStore == nil {
+		attachStore = attachments.NewStore()
+	}
 
 	authHandler.Register(mux) // device auth + management (MYND-420/425); persistence-wired upstream
 	notifier := poke.NewNotifier()
-	syncMux := syncapi.New(s, tokens).WithPolicy(rl, qg).WithNotifier(notifier).WithPreAuthLimiter(preAuthMeta)
+	syncMux := syncapi.New(s, tokens).WithPolicy(rl, qg).WithNotifier(notifier).WithPreAuthLimiter(preAuthMeta).
+		// MYND-468 §11.4 bridge: an attachment tombstone record marks the stored
+		// body deleted (absent to HEAD/GET); physical reclaim rides horizon-GC.
+		WithAttachmentDeleter(func(a ids.AccountNumberHash, id [32]byte) {
+			attachStore.MarkDeleted(a, attachments.AttachmentID(id))
+		})
 	if metrics != nil {
 		syncMux = syncMux.WithMetrics(metrics.ObserveBlobStored)
 	}
@@ -268,9 +310,12 @@ func NewServer(s store.BlobStore, tokens *auth.TokenStore, authHandler *authapi.
 	// Attachment transport: same per-account rate-limit + a UNIFIED quota — attachment
 	// bytes are added to the blob store's per-account total against one AS17 ceiling
 	// (no separate, bypassable budget), plus a per-vault id cap (OOM bound).
-	attachments.New(attachments.NewStore().WithMaxIDs(int(attachMaxIDs)), tokens).
-		WithPolicy(rl, qg, func(a ids.AccountNumberHash) uint64 { return s.QuotaBytes(a) }).
-		Register(mux) // resumable transport (MYND-423)
+	attachMux := attachments.New(attachStore, tokens).
+		WithPolicy(rl, qg, func(a ids.AccountNumberHash) uint64 { return s.QuotaBytes(a) })
+	if metrics != nil {
+		attachMux = attachMux.WithMetrics(metrics.ObserveAttachmentStored)
+	}
+	attachMux.Register(mux) // resumable transport (MYND-423)
 
 	// noIP stays the OUTERMOST layer, blanking RemoteAddr before anything reads it.
 	// The request-count + structured access-log middleware sit INSIDE noIP, so they

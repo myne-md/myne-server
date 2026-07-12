@@ -49,16 +49,30 @@ func (p Policy) Clamp() Policy {
 	return p
 }
 
+// AttachmentReclaimer physically reclaims a tombstoned attachment BODY when its
+// blob-plane tombstone record is reclaimed (MYND-468, §11.4: "no parallel
+// attachment-GC path" — the body rides the record's unchanged ack-gated rule).
+// Injected as a closure so gcquota never imports the attachments package.
+// Returns the bytes released (aggregate metrics only).
+type AttachmentReclaimer func(account ids.AccountNumberHash, attachmentIDHex string) (bytesFreed uint64, reclaimed bool)
+
 // HorizonGC runs the hybrid horizon-GC over a vault.
 type HorizonGC struct {
-	store  store.BlobStore
-	reg    *auth.Registry
-	policy Policy
+	store       store.BlobStore
+	reg         *auth.Registry
+	policy      Policy
+	attachments AttachmentReclaimer // optional (nil = no attachment store wired)
 }
 
 // NewHorizonGC wires the store + registry + policy.
 func NewHorizonGC(s store.BlobStore, reg *auth.Registry, p Policy) *HorizonGC {
 	return &HorizonGC{store: s, reg: reg, policy: p.Clamp()}
+}
+
+// WithAttachmentReclaim attaches the attachment-body reclaim bridge (MYND-468).
+func (g *HorizonGC) WithAttachmentReclaim(fn AttachmentReclaimer) *HorizonGC {
+	g.attachments = fn
+	return g
 }
 
 // Run performs one GC pass for an account at the given coarse current marker:
@@ -115,6 +129,14 @@ func (g *HorizonGC) Run(account ids.AccountNumberHash, currentMarker uint64) (re
 		if g.allActiveAcked(account, active, changeSeq) {
 			if err := g.store.ReclaimTombstone(account, blobID); err == nil {
 				reclaimed++
+				// MYND-468: a reclaimed ATTACHMENT record also drops its stored
+				// body (one horizon, one ack rule, one retention switch — the
+				// ExtendedRetention early-return above already skipped both).
+				if g.attachments != nil {
+					if attHex := g.store.BlobAttachmentID(account, blobID); attHex != "" {
+						_, _ = g.attachments(account, attHex)
+					}
+				}
 			}
 		}
 	}

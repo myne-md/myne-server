@@ -54,6 +54,9 @@ type blobEntry struct {
 	contentNonce [ContentNonceLen]byte
 	size         int
 	changeSeq    uint64 // per-vault sequence of this blob's last mutation
+	// attachmentID is the full 32-byte attachment-id (hex) for an attachment
+	// record (MYND-468); "" for notes. Opaque; echoed in ChangedSince.
+	attachmentID string
 }
 
 // tombstoneRec is the server-side (uuid, final_version, marker) record + the
@@ -143,9 +146,13 @@ func (m *MemStore) PushBlob(account ids.AccountNumberHash, blobID ids.BlobID, ba
 		e = &blobEntry{}
 		v.blobs[blobID] = e
 	}
-	// Idempotent re-push at the current base: identical bytes → no new version.
-	if e.ciphertext != nil && bytesEqual(e.ciphertext, ciphertext) {
-		e.contentNonce = contentNonce
+	// Idempotent re-push at the current base: identical bytes AND an identical
+	// nonce → no new version. The nonce equality is load-bearing for attachment
+	// records (MYND-468): their inline ciphertext is ALWAYS empty, so the nonce
+	// is the only thing distinguishing a registration from its §11.4 tombstone —
+	// absorbing a nonce-different push would never advance the change-sequence
+	// and other devices would never see the deletion.
+	if e.ciphertext != nil && bytesEqual(e.ciphertext, ciphertext) && e.contentNonce == contentNonce {
 		return e.version, nil
 	}
 	buf := make([]byte, len(ciphertext))
@@ -189,16 +196,49 @@ func (m *MemStore) ChangedSince(account ids.AccountNumberHash, cursor uint64, li
 	out := make([]SyncMeta, 0, len(items))
 	for _, it := range items {
 		out = append(out, SyncMeta{
-			BlobID:       it.id,
-			Version:      it.e.version,
-			ContentNonce: it.e.contentNonce,
-			Size:         it.e.size,
+			BlobID:          it.id,
+			Version:         it.e.version,
+			ContentNonce:    it.e.contentNonce,
+			Size:            it.e.size,
+			AttachmentIDHex: it.e.attachmentID,
 		})
 		if it.e.changeSeq > newCursor {
 			newCursor = it.e.changeSeq
 		}
 	}
 	return out, newCursor
+}
+
+// SetBlobAttachmentID associates the full attachment-id (hex) with a blob record
+// (MYND-468). See BlobStore.SetBlobAttachmentID.
+func (m *MemStore) SetBlobAttachmentID(account ids.AccountNumberHash, blobID ids.BlobID, attachmentIDHex string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	v := m.vaults[account]
+	if v == nil {
+		return ErrNotFound
+	}
+	e := v.blobs[blobID]
+	if e == nil {
+		return ErrNotFound
+	}
+	e.attachmentID = attachmentIDHex
+	return nil
+}
+
+// BlobAttachmentID returns the associated attachment-id hex ("" if none).
+func (m *MemStore) BlobAttachmentID(account ids.AccountNumberHash, blobID ids.BlobID) string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	v := m.vaults[account]
+	if v == nil {
+		return ""
+	}
+	e := v.blobs[blobID]
+	if e == nil {
+		return ""
+	}
+	return e.attachmentID
 }
 
 // AckCursor records a device's pull cursor position (monotone).

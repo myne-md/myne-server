@@ -17,7 +17,14 @@ import (
 // changes. The version marker makes a binary-downgrade FAIL-SAFE: an OLDER binary
 // that sees a NEWER on-disk version refuses to start rather than silently
 // mis-parsing it (SYNC-30) — so going back requires a snapshot restore.
-const CurrentStoreVersion = 1
+//
+// v2 (MYND-468): FS-backed attachments — per-account `attachments/` bodies +
+// `attachments-index.json`, and the `attachment_id` field in index.json blob
+// records. The files are ADDITIVE (a v1 binary would not corrupt them), but a
+// downgraded binary would silently serve no attachments and compute the
+// per-account quota without attachment bytes — an AS17 ceiling bypass — so the
+// fail-safe fence is the correct guard. The migration itself is a no-op.
+const CurrentStoreVersion = 2
 
 const storeVersionFile = "store-version"
 
@@ -55,9 +62,14 @@ func NewMigrator(root string) *Migrator {
 	}
 }
 
-// builtinMigrations is the registered forward migration chain. Empty at v1 (the
-// baseline). Append a Migration{To: 2, Apply: ...} when the format first changes.
-var builtinMigrations []Migration
+// builtinMigrations is the registered forward migration chain. v1→v2 is a
+// deliberate NO-OP: the v2 additions (attachment bodies + per-account
+// attachments-index.json + the additive index.json field) need no transform of
+// v1 data — the bump exists purely for the downgrade fence (see
+// CurrentStoreVersion). The snapshot-verify-apply-bump discipline still runs.
+var builtinMigrations = []Migration{
+	{To: 2, Apply: func(root string) error { return nil }},
+}
 
 // Run brings the on-disk store up to CurrentStoreVersion. It is idempotent and safe
 // to call on every boot. Order per migration: snapshot → VERIFY → apply → bump the

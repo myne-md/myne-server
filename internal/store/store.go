@@ -36,15 +36,20 @@ var ErrBlobCASMismatch = errors.New("store: blob CAS mismatch")
 // supplies alongside the opaque ciphertext (so the server never parses the blob).
 const ContentNonceLen = 24
 
-// SyncMeta is the decryption-free per-blob metadata a pull returns: exactly four
-// fields (ledger SYNC-6 / sync-protocol §8.1). Nothing here exceeds the already-
-// public header — content_nonce is public, version is the opaque counter (AS6),
-// size is the quota unit (AS17).
+// SyncMeta is the decryption-free per-blob metadata a pull returns (ledger
+// SYNC-6 / sync-protocol §8.1). Nothing here exceeds the already-public header —
+// content_nonce is public, version is the opaque counter (AS6), size is the
+// quota unit (AS17). AttachmentIDHex (MYND-468) is the full 32-byte
+// attachment-id the client supplied at registration, echoed back so a puller
+// can resolve the 16-byte sync-id prefix to the byte-transport id without
+// waiting on the catalog; it is a value the server already stores for the
+// /attachments route — no new exposure. Empty for notes.
 type SyncMeta struct {
-	BlobID       ids.BlobID
-	Version      Version
-	ContentNonce [ContentNonceLen]byte
-	Size         int
+	BlobID          ids.BlobID
+	Version         Version
+	ContentNonce    [ContentNonceLen]byte
+	Size            int
+	AttachmentIDHex string
 }
 
 // BlobStore is the blind blob store. Implementations MUST isolate vaults by
@@ -131,6 +136,17 @@ type BlobStore interface {
 	// GCFloor returns the highest change-sequence whose tombstone has been reclaimed.
 	// A non-zero pull cursor below this missed reclaimed history → cursor-expired.
 	GCFloor(account ids.AccountNumberHash) uint64
+
+	// SetBlobAttachmentID associates the full 32-byte attachment-id (lowercase hex)
+	// with a blob record (MYND-468): an attachment's sync-plane record is keyed by
+	// the id's first 16 bytes, and the association lets ChangedSince echo the full
+	// id back to pullers and lets horizon-GC bridge a reclaimed tombstone record to
+	// the attachment body. Opaque to the server (it never derives or parses it).
+	SetBlobAttachmentID(account ids.AccountNumberHash, blobID ids.BlobID, attachmentIDHex string) error
+
+	// BlobAttachmentID returns the associated attachment-id hex ("" if the blob is
+	// unknown or is a note record).
+	BlobAttachmentID(account ids.AccountNumberHash, blobID ids.BlobID) string
 }
 
 // HeadIDLen is the byte length of a head_id (SHA-256).
