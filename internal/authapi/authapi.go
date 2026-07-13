@@ -19,16 +19,21 @@
 //                                     pending one (the password-path gate).
 //     POST /auth/devices/revoke     — authed: revoke a device's token (removal).
 //
-// R3 (channel binding): the `-PLUS` binding requires the TLS exporter. Over the
-// loopback-http harness there is no exporter, so the server's cbind is empty
-// (the client matches); over real TLS both sides feed the exporter. Wiring the
-// live exporter into `serverCbind` is the R3-pending step (mirrors the client
-// rustls transport). Blind relay: the server never sees plaintext.
+// R3 (channel binding): the `-PLUS` binding is WIRED (F5). When a request arrives
+// over app-terminated TLS 1.3 the server binds to the live RFC 9266 tls-exporter
+// (`requestCbind`), advertises it in the init response (`Cbind`), and rejects a
+// client-final that omits it; behind a TLS-terminating proxy or on loopback http
+// there is no exporter, so the server binds to the empty `serverCbind` and the
+// client matches (the pre-F5 behavior, unchanged). The Go↔rustls exporter is proven
+// byte-identical under TLS 1.3 (features/.../review-r3; scratchpad probe). REMAINING
+// GATES (not code): the app-terminated-TLS deploy + Caddy TCP-passthrough (the operations repository)
+// and the standing MYND-420 R3 primitive-level review. Blind relay: never sees plaintext.
 
 package authapi
 
 import (
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -283,6 +288,35 @@ type scramInitResp struct {
 	CombinedNonce string `json:"combined_nonce"`
 	SaltHex       string `json:"salt_hex"`
 	Iterations    int    `json:"iterations"`
+	// Cbind advertises the channel-binding the client-final must carry: "tls-exporter"
+	// when this request arrived over app-terminated TLS 1.3 (F5 — the client then
+	// computes the RFC 9266 exporter on its auth connection and sends it), or omitted
+	// (empty) behind a TLS-terminating proxy / loopback http, where the server also
+	// verifies against an empty cbind. This is the negotiation that keeps a mixed
+	// fleet from pairing a real-cbind end with an empty-cbind end.
+	Cbind string `json:"cbind,omitempty"`
+}
+
+// requestCbind is the channel-binding data the SCRAM handshake binds to for THIS
+// request: the RFC 9266 tls-exporter when the request arrived over app-terminated
+// TLS 1.3 (proven byte-identical to the rustls client's — F5), else h.serverCbind
+// (empty) so a proxy-terminated / loopback deployment keeps the current behavior
+// and never mismatches a client that also sends empty. TLS < 1.3 falls back to
+// empty on purpose: the exporter's absent-vs-empty-context forms only agree
+// cross-impl under TLS 1.3.
+func (h *Handler) requestCbind(r *http.Request) []byte {
+	if r.TLS != nil && r.TLS.Version >= tls.VersionTLS13 {
+		if ekm, err := r.TLS.ExportKeyingMaterial(scram.ExporterLabel, nil, scram.ExporterLen); err == nil {
+			return ekm
+		}
+	}
+	return h.serverCbind
+}
+
+// usesTLSExporter reports whether this request will bind to a real tls-exporter
+// (app-terminated TLS 1.3) — the flag the init response advertises to the client.
+func (h *Handler) usesTLSExporter(r *http.Request) bool {
+	return r.TLS != nil && r.TLS.Version >= tls.VersionTLS13
 }
 
 func (h *Handler) handleScramInit(w http.ResponseWriter, r *http.Request) {
@@ -348,11 +382,16 @@ func (h *Handler) handleScramInit(w http.ResponseWriter, r *http.Request) {
 		combinedNonce: combined,
 		expiresAt:     expiresAt,
 	}
+	cbind := ""
+	if h.usesTLSExporter(r) {
+		cbind = scram.CbindName
+	}
 	writeJSON(w, scramInitResp{
 		HandshakeID:   hid,
 		CombinedNonce: combined,
 		SaltHex:       hex.EncodeToString(sc.cred.Salt),
 		Iterations:    sc.cred.Iterations,
+		Cbind:         cbind,
 	})
 }
 
@@ -415,8 +454,11 @@ func (h *Handler) handleScramFinal(w http.ResponseWriter, r *http.Request) {
 	}
 	sc := h.creds[hs.account]
 
+	// F5: bind to THIS request's tls-exporter (app-terminated TLS 1.3) or the empty
+	// h.serverCbind fallback. The client-final's connection is the one the exporter
+	// is computed over on both ends, so init's connection is irrelevant to the bind.
 	serverSig, err := scram.VerifyClientFinal(
-		sc.cred, hs.username, hs.clientNonce, hs.combinedNonce, h.serverCbind, req.ClientFinal,
+		sc.cred, hs.username, hs.clientNonce, hs.combinedNonce, h.requestCbind(r), req.ClientFinal,
 	)
 	if err != nil {
 		// One-shot handshake: a failed proof burns it (no online guessing reuse).

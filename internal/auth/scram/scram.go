@@ -31,6 +31,16 @@ import (
 // CbindName is the RFC 9266 channel-binding type name used in the gs2 header.
 const CbindName = "tls-exporter"
 
+// ExporterLabel is the RFC 9266 TLS keying-material exporter label. FROZEN,
+// cross-implementation load-bearing: the Go server and the Rust client MUST feed
+// this exact label (and a 32-byte length) to their TLS exporter or the channel
+// binding diverges and every -PLUS handshake fails. Verified byte-identical
+// between Go crypto/tls and rustls/ring over TLS 1.3 (features/.../review-r3).
+const ExporterLabel = "EXPORTER-Channel-Binding"
+
+// ExporterLen is the frozen tls-exporter output length (RFC 9266 uses 32).
+const ExporterLen = 32
+
 // gs2Header is the fixed GS2 header for SCRAM-SHA-256-PLUS with tls-exporter
 // channel binding and no authzid.
 const gs2Header = "p=" + CbindName + ",,"
