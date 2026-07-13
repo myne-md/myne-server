@@ -101,13 +101,14 @@ func (g *HorizonGC) Run(account ids.AccountNumberHash, currentMarker uint64) (re
 			// device re-enrolls → forced full-reconcile, never silent resurrection).
 			//
 			// LastActivity == 0 means "never seen" (a freshly enrolled or a
-			// persistence-restored device), NOT "infinitely stale". Phase 1 has no
-			// production writer for LastActivity (TouchActivity is unwired), so every
-			// device sits at 0; treating 0 as past-horizon would soft-retire the entire
-			// fleet on the first hourly sweep (mass-401, undermining auth persistence).
-			// Excluding 0 keeps the sweep a no-op until TouchActivity lands, and stays
-			// forward-compatible: a device with any nonzero activity that falls behind
-			// the horizon still retires as designed.
+			// persistence-restored device), NOT "infinitely stale". `TouchActivity`
+			// is now wired on every authed pull/push (F4, `httpapi.NewServer`), so an
+			// active device stamps a nonzero marker each cycle; a device that then
+			// goes silent past the horizon soft-retires as designed. The `!= 0` guard
+			// is still load-bearing: it is the grandfather that stops the FIRST sweep
+			// after this landed from mass-retiring every device whose activity hadn't
+			// been recorded yet (and covers persistence-restored devices, whose
+			// LastActivity is deliberately not persisted — see registry.go).
 			_ = g.reg.Retire(account, d.DeviceID)
 			retired++
 			continue

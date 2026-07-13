@@ -28,7 +28,7 @@ func NewScheduler(gc *HorizonGC, accounts func() []ids.AccountNumberHash, onRecl
 		accounts:  accounts,
 		onReclaim: onReclaim,
 		interval:  interval,
-		marker:    dayBucketMarker,
+		marker:    DayBucketMarker,
 	}
 }
 
@@ -61,9 +61,13 @@ func (s *Scheduler) Start(ctx context.Context) {
 	}
 }
 
-// dayBucketMarker is the coarse monotone activity marker: a day bucket. It uses
+// DayBucketMarker is the coarse monotone activity marker: a day bucket. It uses
 // the server clock ONLY as an internal coarse counter (never an API timestamp; the
-// no-IP/no-wall-clock-exposure discipline is unaffected).
-func dayBucketMarker() uint64 {
+// no-IP/no-wall-clock-exposure discipline is unaffected). It is the SINGLE source
+// of the activity/GC marker unit: the horizon-GC sweep (via the scheduler above)
+// and the per-request activity touch (`Registry.TouchActivity`, wired in
+// `httpapi.NewServer`) MUST use this exact function, or the sweep's `cutoff`
+// arithmetic (current − horizon) compares mismatched units and mis-retires.
+func DayBucketMarker() uint64 {
 	return uint64(time.Now().Unix() / 86400)
 }

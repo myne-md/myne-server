@@ -194,7 +194,15 @@ func runListener(ctx context.Context, ln net.Listener) error {
 
 	ready := NewReadiness()
 	metrics := NewMetrics()
-	srv := newHTTPServer(NewServer(blobStore, tokens, authHandler, rl, qg, ready, metrics, preAuthMeta, attachStore))
+	// F4: the production activity recorder — every authed sync touch stamps the
+	// device's LastActivity with the shared day-bucket marker (the SAME unit the
+	// horizon-GC sweep uses), so a long-silent device soft-retires and stops
+	// blocking tombstone reclaim. Registry is in scope here; the closure keeps
+	// syncapi decoupled from auth.Registry.
+	activityTouch := func(a ids.AccountNumberHash, d ids.DeviceID) {
+		_ = reg.TouchActivity(a, d, gcquota.DayBucketMarker())
+	}
+	srv := newHTTPServer(NewServer(blobStore, tokens, authHandler, rl, qg, ready, metrics, preAuthMeta, attachStore, activityTouch))
 
 	// Aggregate-only metrics on a SEPARATE listener (SYNC-24) — never the public edge.
 	// Disabled unless MYNE_METRICS_ADDR is set; bind it to localhost/internal only.
@@ -284,7 +292,7 @@ func NewRouter(a auth.Authenticator) http.Handler {
 // (policy disabled). attachStore is the attachment Backend (MYND-468 — the caller
 // selects mem/fs to match the blob store; nil constructs a fresh in-memory one,
 // the pre-468 behavior tests rely on).
-func NewServer(s store.BlobStore, tokens *auth.TokenStore, authHandler *authapi.Handler, rl syncapi.RateLimiter, qg *gcquota.QuotaGuard, ready *Readiness, metrics *Metrics, preAuthMeta syncapi.PreAuthLimiter, attachStore attachments.Backend) http.Handler {
+func NewServer(s store.BlobStore, tokens *auth.TokenStore, authHandler *authapi.Handler, rl syncapi.RateLimiter, qg *gcquota.QuotaGuard, ready *Readiness, metrics *Metrics, preAuthMeta syncapi.PreAuthLimiter, attachStore attachments.Backend, activityTouch func(ids.AccountNumberHash, ids.DeviceID)) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", healthz)
 	if ready != nil {
@@ -301,7 +309,11 @@ func NewServer(s store.BlobStore, tokens *auth.TokenStore, authHandler *authapi.
 		// body deleted (absent to HEAD/GET); physical reclaim rides horizon-GC.
 		WithAttachmentDeleter(func(a ids.AccountNumberHash, id [32]byte) {
 			attachStore.MarkDeleted(a, attachments.AttachmentID(id))
-		})
+		}).
+		// F4: record device activity on every authed pull/push so the horizon-GC
+		// soft-retire actually fires (a long-silent device leaves the must-ack set,
+		// unblocking tombstone reclaim). nil when the caller wires no registry.
+		WithActivityTouch(activityTouch)
 	if metrics != nil {
 		syncMux = syncMux.WithMetrics(metrics.ObserveBlobStored)
 	}

@@ -83,6 +83,12 @@ type Handler struct {
 	// the attachments store, injected as a closure so the packages stay decoupled.
 	// nil = no attachment store wired (tests that only exercise notes).
 	attachmentDeleter func(account ids.AccountNumberHash, id [32]byte)
+	// activityTouch records that a device made an authed sync request, feeding the
+	// horizon-GC soft-retire (MYND-422): a long-silent device drops out of the
+	// must-ack set so tombstone reclaim can proceed. Injected as a closure over the
+	// auth registry + the shared day-bucket marker so this package stays decoupled
+	// from auth.Registry. nil = no activity tracking wired (notes-only tests).
+	activityTouch func(account ids.AccountNumberHash, dev ids.DeviceID)
 }
 
 // New returns a sync Handler over the given store + token store.
@@ -116,6 +122,23 @@ func (h *Handler) WithPreAuthLimiter(g PreAuthLimiter) *Handler {
 func (h *Handler) WithAttachmentDeleter(fn func(account ids.AccountNumberHash, id [32]byte)) *Handler {
 	h.attachmentDeleter = fn
 	return h
+}
+
+// WithActivityTouch attaches the per-request activity recorder (F4): called on
+// every authed pull/push so the horizon-GC knows a device is still active. Wiring
+// it is what makes soft-retire actually fire — without it every device sits at
+// LastActivity 0 forever and tombstone ciphertext never gets reclaimed. nil = off.
+func (h *Handler) WithActivityTouch(fn func(account ids.AccountNumberHash, dev ids.DeviceID)) *Handler {
+	h.activityTouch = fn
+	return h
+}
+
+// touchActivity records an authed sync touch if the recorder is wired (no-op
+// otherwise). Any authed pull/push counts as activity.
+func (h *Handler) touchActivity(account ids.AccountNumberHash, dev ids.DeviceID) {
+	if h.activityTouch != nil {
+		h.activityTouch(account, dev)
+	}
 }
 
 // WithMetrics attaches an aggregate-only observation hook (MYND-440, SYNC-24):
@@ -273,6 +296,8 @@ func (h *Handler) handlePush(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusTooManyRequests, "rate")
 		return
 	}
+	// An authed push is device activity — feed the horizon-GC soft-retire (F4).
+	h.touchActivity(sess.Account, sess.Device)
 	var req pushReq
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, MaxBlobSize*4)).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, "bad_request")
@@ -418,6 +443,8 @@ func (h *Handler) handlePull(w http.ResponseWriter, r *http.Request) {
 	metas, next := h.store.ChangedSince(sess.Account, cursor, limit)
 	// Record the device's cursor ack (the must-ack signal MYND-422 aggregates).
 	h.store.AckCursor(sess.Account, sess.Device, cursor)
+	// An authed pull is device activity — feed the horizon-GC soft-retire (F4).
+	h.touchActivity(sess.Account, sess.Device)
 
 	resp := pullResp{NextCursor: next, Metas: make([]syncMetaWire, 0, len(metas))}
 	for _, m := range metas {
@@ -504,6 +531,31 @@ func (h *Handler) handleMeta(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]bool{"ok": true})
 
 	case http.MethodGet:
+		// Authed fetch (F1 Faz B): an enrolled device polls its OWN meta each sync
+		// cycle to pick up a password-side change made on another device. A valid
+		// session serves the session's account directly — no ?account= query, and
+		// NOT behind the pre-auth limiter (it is the enrolled device's own data,
+		// rate-limited like the other sync routes). Falls through to the pre-auth
+		// bootstrap path only when there is no session.
+		if sess, ok := h.session(r); ok {
+			if h.rl != nil && !h.rl.Allow(sess.Account) {
+				writeErr(w, http.StatusTooManyRequests, "rate")
+				return
+			}
+			meta, err := h.store.GetMeta(sess.Account)
+			if errors.Is(err, store.ErrNotFound) {
+				writeErr(w, http.StatusNotFound, "not_found")
+				return
+			}
+			if err != nil {
+				writeErr(w, http.StatusInternalServerError, "internal")
+				return
+			}
+			w.Header().Set("Content-Type", "application/octet-stream")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(meta)
+			return
+		}
 		// Pre-auth (session-less) fetch — gate it with the global pre-auth limiter so
 		// it cannot be hammered without bound (no per-account key: the account is an
 		// attacker-supplied query value; keying on it would itself be an unbounded map).

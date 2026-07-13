@@ -53,6 +53,112 @@ func do(t *testing.T, srv *httptest.Server, method, path, token, body string) (*
 	return resp, buf.Bytes()
 }
 
+// F4: an authed pull/push must stamp the device's LastActivity via the wired
+// activity recorder, so the horizon-GC soft-retire can eventually fire. Before
+// this landed, TouchActivity had no production caller and every device sat at 0.
+func TestActivityTouch_AuthedPullAndPushStampLastActivity(t *testing.T) {
+	st := store.NewMemStore()
+	reg := auth.NewRegistry()
+	ts := auth.NewTokenStore(reg)
+	en := auth.NewEnrollment(reg, ts)
+	var a ids.AccountNumberHash
+	a[0] = 0x42
+	var d ids.DeviceID
+	d[0] = 0x01
+	res, err := en.Enroll(a, d, auth.PathPassword)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Wire the recorder exactly as httpapi.NewServer does, but with a fixed
+	// nonzero marker so the assertion is deterministic (no wall clock in tests).
+	const marker = uint64(20000)
+	mux := http.NewServeMux()
+	New(st, ts).WithActivityTouch(func(acct ids.AccountNumberHash, dev ids.DeviceID) {
+		_ = reg.TouchActivity(acct, dev, marker)
+	}).Register(mux)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	token := hex.EncodeToString(res.Token)
+
+	// Precondition: an unseen device sits at LastActivity 0 — F4's whole problem.
+	if rec, ok := reg.Get(a, d); !ok || rec.LastActivity != 0 {
+		t.Fatalf("precondition: want LastActivity 0, got ok=%v rec=%+v", ok, rec)
+	}
+
+	// An authed pull records activity.
+	if resp, _ := do(t, srv, http.MethodGet, "/sync/pull?cursor=0", token, ""); resp.StatusCode != http.StatusOK {
+		t.Fatalf("pull status = %d", resp.StatusCode)
+	}
+	if rec, ok := reg.Get(a, d); !ok || rec.LastActivity != marker {
+		t.Fatalf("after pull: want LastActivity %d, got ok=%v rec=%+v", marker, ok, rec)
+	}
+
+	// An authed push (empty body → 200 with no blobs) records activity too.
+	reg.TouchActivity(a, d, 0) // no-op (marker not greater); confirms pull already stamped
+	if resp, _ := do(t, srv, http.MethodPost, "/sync/push", token, `{"blobs":[]}`); resp.StatusCode != http.StatusOK {
+		t.Fatalf("push status = %d", resp.StatusCode)
+	}
+	if rec, _ := reg.Get(a, d); rec.LastActivity != marker {
+		t.Fatalf("after push: want LastActivity %d, got %d", marker, rec.LastActivity)
+	}
+
+	// An UNauthenticated pull must NOT stamp activity (no session → no touch).
+	var d2 ids.DeviceID
+	d2[0] = 0x02
+	if _, ok := reg.Get(a, d2); ok {
+		t.Fatal("precondition: d2 should not exist yet")
+	}
+	if resp, _ := do(t, srv, http.MethodGet, "/sync/pull?cursor=0", "", ""); resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unauth pull status = %d, want 401", resp.StatusCode)
+	}
+}
+
+// F1 Faz B: an enrolled device fetches its OWN meta via an authed GET (no
+// ?account= query, not behind the pre-auth limiter) so the sync loop's meta phase
+// can pick up a password-side change made on another device.
+func TestMeta_AuthedGetReturnsSessionMeta(t *testing.T) {
+	st := store.NewMemStore()
+	reg := auth.NewRegistry()
+	ts := auth.NewTokenStore(reg)
+	en := auth.NewEnrollment(reg, ts)
+	var a ids.AccountNumberHash
+	a[0] = 0x42
+	var d ids.DeviceID
+	d[0] = 0x01
+	res, err := en.Enroll(a, d, auth.PathPassword)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	New(st, ts).Register(mux)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	token := hex.EncodeToString(res.Token)
+
+	// Not seeded yet → authed GET is 404.
+	if resp, _ := do(t, srv, http.MethodGet, "/vault.meta", token, ""); resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("authed GET before seed = %d, want 404", resp.StatusCode)
+	}
+	// Seed via the authed PUT.
+	meta := "opaque-vault-meta-bytes"
+	if resp, _ := do(t, srv, http.MethodPut, "/vault.meta", token, meta); resp.StatusCode != http.StatusOK {
+		t.Fatalf("PUT /vault.meta = %d", resp.StatusCode)
+	}
+	// Authed GET (no ?account=) returns the session's meta verbatim.
+	resp, body := do(t, srv, http.MethodGet, "/vault.meta", token, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("authed GET = %d, want 200", resp.StatusCode)
+	}
+	if string(body) != meta {
+		t.Fatalf("authed GET body = %q, want %q", body, meta)
+	}
+	// No token and no ?account= → the pre-auth path rejects as bad_request.
+	if resp, _ := do(t, srv, http.MethodGet, "/vault.meta", "", ""); resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("unauth GET without account = %d, want 400", resp.StatusCode)
+	}
+}
+
 func TestPushPull_RoundTrip(t *testing.T) {
 	srv, token := setup(t)
 	defer srv.Close()
