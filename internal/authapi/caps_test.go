@@ -40,7 +40,7 @@ func registerAccount(t *testing.T, srv *httptest.Server, accountHex string) *htt
 	t.Helper()
 	resp, _ := postJSON(t, srv.URL+"/auth/register", "", registerReq{
 		AccountHashHex: accountHex,
-		Username:       "u-" + accountHex[:4],
+		Username:       accountHex, // AS9: username = account-hash hex
 		SaltHex:        strings.Repeat("11", 16),
 		Iterations:     1,
 		StoredKeyHex:   strings.Repeat("22", 32),
@@ -107,7 +107,7 @@ func TestScramInit_HandshakeCapAndTTL(t *testing.T) {
 	ttl := 60 * time.Second
 	srv := setupCaps(t, nil, 0, 2, ttl, clock)
 	acct := acctHex(7)
-	user := "u-" + acct[:4]
+	user := acct // AS9: username = account-hash hex
 	if resp := registerAccount(t, srv, acct); resp.StatusCode != http.StatusOK {
 		t.Fatalf("register status %d", resp.StatusCode)
 	}

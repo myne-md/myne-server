@@ -211,6 +211,13 @@ func parseDevice(s string) (ids.DeviceID, bool) {
 	return d, true
 }
 
+// canonicalUsername is the ONLY accepted SCRAM username for an account: the
+// lowercase hex of its account hash (AS9). Single-sourced so the register door
+// and the init door cannot drift on the encoding; see server-protocol.md §3.1.
+func canonicalUsername(a ids.AccountNumberHash) string {
+	return hex.EncodeToString(a[:])
+}
+
 // --- POST /auth/register: upload the SCRAM verifier (first-write only) ---
 
 type registerReq struct {
@@ -240,7 +247,12 @@ func (h *Handler) handleRegister(w http.ResponseWriter, r *http.Request) {
 	salt, e1 := hex.DecodeString(req.SaltHex)
 	storedKey, e2 := hex.DecodeString(req.StoredKeyHex)
 	serverKey, e3 := hex.DecodeString(req.ServerKeyHex)
-	if !ok || e1 != nil || e2 != nil || e3 != nil || req.Iterations < 1 || req.Username == "" {
+	// AS9: the SCRAM username MUST be the canonical lowercase hex of the account
+	// hash — never the raw account number (bearer semantics). Enforced at the
+	// door so the persisted auth state structurally cannot contain a raw account
+	// number, even from an outdated client (server-protocol.md §3.1).
+	if !ok || e1 != nil || e2 != nil || e3 != nil || req.Iterations < 1 ||
+		req.Username != canonicalUsername(account) {
 		writeErr(w, http.StatusBadRequest, "bad_request")
 		return
 	}
@@ -342,8 +354,10 @@ func (h *Handler) handleScramInit(w http.ResponseWriter, r *http.Request) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	sc, exists := h.creds[account]
-	if !exists || sc.username != req.Username {
-		// Do not distinguish unknown-account from wrong-username (no enumeration).
+	if !exists || sc.username != req.Username || req.Username != canonicalUsername(account) {
+		// Unknown account, wrong username, and a non-canonical (e.g. raw/display-
+		// form) username are all the SAME 401 — no enumeration signal (AS9: only
+		// the hash-hex identity is accepted on any pre-auth surface).
 		writeErr(w, http.StatusUnauthorized, "unauthenticated")
 		return
 	}

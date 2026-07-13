@@ -37,8 +37,9 @@ func newEnv(t *testing.T) *testClient {
 	t.Cleanup(srv.Close)
 
 	c := &testClient{
-		srv:      srv,
-		username: "MY-TEST",
+		srv: srv,
+		// AS9: the SCRAM username IS the account-hash hex (canonical lowercase).
+		username: strings.Repeat("42", 16),
 		account:  strings.Repeat("42", 16),
 		secret:   bytes.Repeat([]byte{0xab}, 32),
 		salt:     bytes.Repeat([]byte{0x11}, 16),
@@ -271,5 +272,53 @@ func TestRegister_DuplicateRejected(t *testing.T) {
 	})
 	if resp.StatusCode != http.StatusConflict {
 		t.Fatalf("duplicate register should 409, got %d", resp.StatusCode)
+	}
+}
+
+// AS9: the SCRAM username MUST be the canonical lowercase hex of the 16-byte
+// account hash. A raw (display-form) account number — or any other string — is
+// rejected at register, so the persisted auth state structurally cannot contain
+// a raw bearer credential, even from an outdated client.
+func TestRegister_RejectsNonHashUsername(t *testing.T) {
+	c := newEnv(t)
+	cred, err := scram.MakeCredential(c.secret, c.salt, c.iters)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range []string{
+		"MY-ABCD-EFGH-JKMN-PQRS-T", // display-form account number
+		"alice",                    // arbitrary username
+		strings.Repeat("ab", 16),   // valid hash shape, but a DIFFERENT account's
+		"",                         // empty
+	} {
+		resp, _ := postJSON(t, c.srv.URL+"/auth/register", "", registerReq{
+			AccountHashHex: c.account,
+			Username:       bad,
+			SaltHex:        hex.EncodeToString(c.salt),
+			Iterations:     c.iters,
+			StoredKeyHex:   hex.EncodeToString(cred.StoredKey),
+			ServerKeyHex:   hex.EncodeToString(cred.ServerKey),
+		})
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("register with username %q: want 400, got %d", bad, resp.StatusCode)
+		}
+	}
+}
+
+// Init rejects a non-canonical username with the SAME 401 as unknown-account /
+// wrong-username — no enumeration signal, and no raw-form identity accepted on
+// any pre-auth surface.
+func TestScramInit_RejectsNonCanonicalUsernameUniformly(t *testing.T) {
+	c := newEnv(t)
+	c.register(t)
+	for _, bad := range []string{"MY-ABCD-EFGH-JKMN-PQRS-T", strings.Repeat("ab", 16), "alice"} {
+		resp, _ := postJSON(t, c.srv.URL+"/auth/scram/init", "", scramInitReq{
+			AccountHashHex: c.account,
+			Username:       bad,
+			ClientNonce:    "cn",
+		})
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("init with username %q: want 401, got %d", bad, resp.StatusCode)
+		}
 	}
 }

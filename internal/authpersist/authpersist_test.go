@@ -55,9 +55,9 @@ func dev(b byte) ids.DeviceID           { var d ids.DeviceID; d[0] = b; return d
 
 // postRegister drives POST /auth/register (uploads a SCRAM verifier; no proof needed).
 // This handler holds h.mu AND triggers the persistence save — the deadlock probe.
-func (e *env) postRegister(t *testing.T, a ids.AccountNumberHash, username string) int {
+func (e *env) postRegister(t *testing.T, a ids.AccountNumberHash) int {
 	t.Helper()
-	body := registerBody(a, username)
+	body := registerBody(a)
 	resp, err := http.Post(e.srv.URL+"/auth/register", "application/json", strings.NewReader(body))
 	if err != nil {
 		t.Fatalf("register POST: %v", err)
@@ -66,9 +66,10 @@ func (e *env) postRegister(t *testing.T, a ids.AccountNumberHash, username strin
 	return resp.StatusCode
 }
 
-func registerBody(a ids.AccountNumberHash, username string) string {
+func registerBody(a ids.AccountNumberHash) string {
+	// AS9: the register endpoint only accepts username == account-hash hex.
 	return `{"account_hash_hex":"` + hex.EncodeToString(a[:]) +
-		`","username":"` + username +
+		`","username":"` + hex.EncodeToString(a[:]) +
 		`","salt_hex":"` + strings.Repeat("ab", 16) +
 		`","iterations":1,"stored_key_hex":"` + strings.Repeat("cd", 32) +
 		`","server_key_hex":"` + strings.Repeat("ef", 32) + `"}`
@@ -95,7 +96,7 @@ func TestPersist_RegisterDeadlockFreeAndCredSurvivesReload(t *testing.T) {
 
 	// The register handler holds h.mu and fires the persistence hook (now a lock-free
 	// dirty-marker, not a synchronous Save). A returned status proves it does not hang.
-	if code := e.postRegister(t, a, "user-a"); code != 200 {
+	if code := e.postRegister(t, a); code != 200 {
 		t.Fatalf("register: status %d (a hang/deadlock would never reach here)", code)
 	}
 	// Persistence is coalesced now — flush to materialise the write, then assert it landed.
@@ -107,7 +108,7 @@ func TestPersist_RegisterDeadlockFreeAndCredSurvivesReload(t *testing.T) {
 	// Reload into fresh stores: the SCRAM verifier survived, so the first-write-only
 	// guard still fires (409) — persistence preserves the invariant across restart.
 	e2 := newEnv(t, dir)
-	if code := e2.postRegister(t, a, "user-a"); code != http.StatusConflict {
+	if code := e2.postRegister(t, a); code != http.StatusConflict {
 		t.Fatalf("re-register after reload: status %d, want 409 (cred should have survived)", code)
 	}
 }
@@ -276,7 +277,7 @@ func TestPersist_FilePermsAndNoStaleTemp(t *testing.T) {
 	dir := t.TempDir()
 	e := newEnv(t, dir)
 	e.enroll(t, acct(0x41), dev(0x04))
-	e.postRegister(t, acct(0x41), "u")
+	e.postRegister(t, acct(0x41))
 
 	info, err := os.Stat(e.path)
 	if err != nil {

@@ -36,8 +36,8 @@ func TestScramPlus_RealTLSExporterBindsAndEmptyIsRejected(t *testing.T) {
 	defer srv.Close()
 
 	// Register a credential over TLS (register needs no channel binding).
-	username := "MY-TLS"
 	account := strings.Repeat("42", 16)
+	username := account // AS9: username = account-hash hex
 	secret := []byte(strings.Repeat("\xcd", 32))
 	salt := []byte(strings.Repeat("\x11", 16))
 	cred, err := scram.MakeCredential(secret, salt, 1)
