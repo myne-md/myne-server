@@ -226,6 +226,13 @@ func TestFSStore_NoStaleTempFiles(t *testing.T) {
 // change — the prior blob intact, quota unchanged, version not advanced (SYNC-23
 // graceful ENOSPC + atomic-rename: old-or-new-never-partial).
 func TestFSStore_WriteFailureIsCleanReject(t *testing.T) {
+	// The write failure is simulated with a read-only (0o500) blobs dir. Root
+	// bypasses DAC permission checks, so the write would succeed and the test
+	// would spuriously fail — skip under root (CI runs as root in the golang
+	// container); developers running as non-root still exercise it.
+	if os.Geteuid() == 0 {
+		t.Skip("read-only-dir write-failure simulation is a no-op as root")
+	}
 	s, dir := newFS(t)
 	a, id := acct(0x0A), blob(0x0A)
 	if _, err := s.PutBlob(a, id, []byte("good")); err != nil {
