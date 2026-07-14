@@ -9,12 +9,15 @@
 # Determinism requires:
 #   - SOURCE_DATE_EPOCH pinned to the source commit time (reproducible clock)
 #   - buildkit rewrite-timestamp=true (normalize layer mtimes)
-#   - --provenance=false --sbom=false (provenance/SBOM carry build-env metadata and
-#     are attached SEPARATELY as digest-bound attestations, OUTSIDE the reproduced
-#     image — baking them in would perturb the digest)
+#   - no provenance/SBOM baked in (they carry build-env metadata and are attached
+#     SEPARATELY as digest-bound attestations, OUTSIDE the reproduced image —
+#     baking them in would perturb the digest). buildctl attaches neither by
+#     default; docker buildx needs --provenance=false --sbom=false.
 #   - digest-pinned base images (in the Dockerfile)
 #
-# Usage: scripts/repro-gate.sh   (run from the repo root; needs docker buildx)
+# Usage: scripts/repro-gate.sh   (run from the repo root). Uses buildctl when
+# present (the CI buildkit image) and falls back to `docker buildx` locally —
+# both drive the same buildkit OCI exporter, so the digest is identical.
 set -eu
 
 SDE="$(git log -1 --format=%ct)"
@@ -22,16 +25,27 @@ DIR="$(mktemp -d)"
 trap 'rm -rf "$DIR"' EXIT
 
 build() {
-  docker buildx build --no-cache --provenance=false --sbom=false \
-    --build-arg SOURCE_DATE_EPOCH="$SDE" \
-    --output "type=oci,dest=$DIR/img$1.tar,rewrite-timestamp=true" \
-    . >"$DIR/build$1.log" 2>&1
+  if command -v buildctl-daemonless.sh >/dev/null 2>&1; then
+    buildctl-daemonless.sh build \
+      --frontend dockerfile.v0 --local context=. --local dockerfile=. \
+      --opt build-arg:SOURCE_DATE_EPOCH="$SDE" --no-cache \
+      --output "type=oci,dest=$DIR/img$1.tar,rewrite-timestamp=true" \
+      >"$DIR/build$1.log" 2>&1
+  else
+    docker buildx build --no-cache --provenance=false --sbom=false \
+      --build-arg SOURCE_DATE_EPOCH="$SDE" \
+      --output "type=oci,dest=$DIR/img$1.tar,rewrite-timestamp=true" \
+      . >"$DIR/build$1.log" 2>&1
+  fi
 }
 
 digest() {
-  # The manifest digest the OCI index points at = the image's content digest.
+  # The first manifest digest in the OCI index = the image's content digest
+  # (single-platform build -> manifests[0]). Read without python3 (absent from
+  # the buildkit image); the OCI index is one-line JSON, so the first sha256 is
+  # the manifest digest.
   tar -xOf "$DIR/img$1.tar" index.json \
-    | python3 -c "import json,sys;print(json.load(sys.stdin)['manifests'][0]['digest'])"
+    | grep -oE 'sha256:[0-9a-f]{64}' | head -1
 }
 
 echo "repro-gate: SOURCE_DATE_EPOCH=$SDE"
