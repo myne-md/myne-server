@@ -38,6 +38,25 @@ type Config struct {
 	MaxHandshakes          uint64 // 0 = unlimited (opt-out)
 	HandshakeTTLSeconds    uint64 // 0 = handshakes never expire (opt-out)
 	MaxAttachmentsPerVault uint64 // 0 = unlimited (opt-out)
+
+	// Built-in encrypted off-box backup (MYNE_BACKUP_*, MYND-505). Disabled by
+	// default. When enabled, the server drives a bundled restic to snapshot the fs
+	// store to an off-box target on a schedule. Only meaningful on the fs backend —
+	// mem has no on-disk tree. Confidentiality is unchanged (blobs are already
+	// client-encrypted, TB5/§6); the backup encryption's load-bearing job is
+	// auth.json plus bounding retention. Retention (days) is the disclosed window
+	// (threat-model §7 / self-host-policy §3); widening it re-discloses.
+	BackupEnabled         bool   // MYNE_BACKUP_ENABLED; default false
+	BackupIntervalSeconds uint64 // MYNE_BACKUP_INTERVAL_SECONDS; scheduler tick
+	BackupRepository      string // MYNE_BACKUP_REPOSITORY; restic repo URI
+	BackupPasswordFile    string // MYNE_BACKUP_PASSWORD_FILE; restic repo key file (never on argv)
+	BackupRetentionDays   uint64 // MYNE_BACKUP_RETENTION_DAYS; disclosed bound, default 14
+	BackupRcloneConfig    string // MYNE_BACKUP_RCLONE_CONFIG; SFTP transport config (Task 6)
+	// Image-internal wiring (not operator policy): the bundled restic path + a
+	// writable cache dir. The container image sets these in ENV; an operator tunes
+	// the knobs above (repository/retention/interval), not these.
+	BackupResticBin string // MYNE_BACKUP_RESTIC_BIN; path to bundled restic, default "restic" (PATH)
+	BackupCacheDir  string // MYNE_BACKUP_CACHE_DIR; RESTIC_CACHE_DIR (writable for the runtime UID)
 }
 
 // loadConfig reads the MYNE_* env vars and fails fast on any invalid value, so a
@@ -61,6 +80,9 @@ func loadConfig() (Config, error) {
 		MaxHandshakes:          16384,
 		HandshakeTTLSeconds:    60,
 		MaxAttachmentsPerVault: 100_000,
+		BackupIntervalSeconds:  86400,    // daily
+		BackupRetentionDays:    14,       // disclosed off-box window
+		BackupResticBin:        "restic", // resolved on PATH by default
 	}
 
 	if cfg.StorageBackend != "mem" && cfg.StorageBackend != "fs" {
@@ -112,6 +134,44 @@ func loadConfig() (Config, error) {
 	// enrollment entirely — refuse to start rather than serve a dead auth surface.
 	if cfg.PreAuthBurst == 0 {
 		return Config{}, fmt.Errorf("MYNE_PREAUTH_RATELIMIT_BURST must be > 0 (0 rejects all pre-auth requests, locking out enrollment)")
+	}
+
+	// Backup config (MYND-505). Read unconditionally; enforce only when enabled so a
+	// disabled server ignores half-set backup vars and starts exactly as before.
+	if b, ok, e := boolEnv("MYNE_BACKUP_ENABLED"); e != nil {
+		return Config{}, e
+	} else if ok {
+		cfg.BackupEnabled = b
+	}
+	cfg.BackupRepository = os.Getenv("MYNE_BACKUP_REPOSITORY")
+	cfg.BackupPasswordFile = os.Getenv("MYNE_BACKUP_PASSWORD_FILE")
+	cfg.BackupRcloneConfig = os.Getenv("MYNE_BACKUP_RCLONE_CONFIG")
+	cfg.BackupResticBin = envOr("MYNE_BACKUP_RESTIC_BIN", cfg.BackupResticBin)
+	cfg.BackupCacheDir = os.Getenv("MYNE_BACKUP_CACHE_DIR")
+	if cfg.BackupIntervalSeconds, err = uintEnv("MYNE_BACKUP_INTERVAL_SECONDS", cfg.BackupIntervalSeconds); err != nil {
+		return Config{}, err
+	}
+	if cfg.BackupRetentionDays, err = uintEnv("MYNE_BACKUP_RETENTION_DAYS", cfg.BackupRetentionDays); err != nil {
+		return Config{}, err
+	}
+	if cfg.BackupEnabled {
+		// Backup snapshots the on-disk store tree; mem has none.
+		if cfg.StorageBackend != "fs" {
+			return Config{}, fmt.Errorf("MYNE_BACKUP_ENABLED requires MYNE_STORAGE_BACKEND=fs (mem has no on-disk store to back up)")
+		}
+		if cfg.BackupRepository == "" {
+			return Config{}, fmt.Errorf("MYNE_BACKUP_ENABLED requires MYNE_BACKUP_REPOSITORY")
+		}
+		if cfg.BackupPasswordFile == "" {
+			return Config{}, fmt.Errorf("MYNE_BACKUP_ENABLED requires MYNE_BACKUP_PASSWORD_FILE")
+		}
+		if cfg.BackupIntervalSeconds == 0 {
+			return Config{}, fmt.Errorf("MYNE_BACKUP_INTERVAL_SECONDS must be > 0 when backup is enabled")
+		}
+		// A 0-day retention would prune every snapshot on the same run that took it.
+		if cfg.BackupRetentionDays == 0 {
+			return Config{}, fmt.Errorf("MYNE_BACKUP_RETENTION_DAYS must be > 0 when backup is enabled")
+		}
 	}
 
 	// Clamp is the SINGLE floor-enforcement point: config cannot push the horizon

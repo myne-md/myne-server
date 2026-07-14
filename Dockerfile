@@ -44,12 +44,52 @@ RUN GOOS="${TARGETOS}" GOARCH="${TARGETARCH}" \
     go build -trimpath -ldflags="-buildid= -s -w" \
     -o /out/myne-server ./cmd/myne-server
 
+# --- fetch stage: sha256-pinned restic + rclone (backup engine + transport) --
+# MYND-505: the server drives a bundled restic for encrypted off-box backups.
+# distroless has no shell/ssh, so restic's SFTP backend rides rclone's pure-Go
+# SFTP (restic `rclone:` backend) — no external ssh. Both binaries are pinned by
+# sha256 (the SYNC-20 pin-by-digest discipline) and extracted by the stdlib-only
+# fetchtool, so the fetch is deterministic and the repro-gate's two-build digest
+# holds. Runs on the native builder ($BUILDPLATFORM) but downloads TARGETARCH.
+FROM --platform=$BUILDPLATFORM golang:1.26.4@sha256:792443b89f65105abba56b9bd5e97f680a80074ac62fc844a584212f8c8102c3 AS fetch
+ARG TARGETARCH=amd64
+ARG RESTIC_VERSION=0.19.1
+ARG RCLONE_VERSION=1.74.4
+WORKDIR /src
+COPY go.mod ./
+COPY scripts/fetchtool ./scripts/fetchtool
+RUN set -eu; mkdir -p /out; \
+    case "${TARGETARCH}" in \
+      amd64) RESTIC_SHA=f415415624dcc452f2a02b8c33641791a8c6d6d3b65bbb3543fcf9a25151585c; \
+             RCLONE_SHA=fe435e0c36228e7c2f116a8701f01127bb1f694005fc11d1f27186c8bca4115d ;; \
+      arm64) RESTIC_SHA=a5f64aaab53d51e311fa3829124c5b703f2d14cf187d8640b6be3b2b49376465; \
+             RCLONE_SHA=97685285c9ad6a0cf17d5844115d2a67245af6444db672187074bd9c358de419 ;; \
+      *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    go run ./scripts/fetchtool \
+      "https://github.com/restic/restic/releases/download/v${RESTIC_VERSION}/restic_${RESTIC_VERSION}_linux_${TARGETARCH}.bz2" \
+      "${RESTIC_SHA}" bz2 "" /out/restic; \
+    go run ./scripts/fetchtool \
+      "https://github.com/rclone/rclone/releases/download/v${RCLONE_VERSION}/rclone-v${RCLONE_VERSION}-linux-${TARGETARCH}.zip" \
+      "${RCLONE_SHA}" zip "/rclone" /out/rclone
+
 # --- runtime stage: distroless static, non-root -----------------------------
 # distroless static:nonroot carries ca-certificates (for a future S3 backend,
 # SYNC-22) + a nonroot UID (65532) + no shell/package-manager/secrets.
 FROM gcr.io/distroless/static:nonroot@sha256:963fa6c544fe5ce420f1f54fb88b6fb01479f054c8056d0f74cc2c6000df5240
 
 COPY --from=build /out/myne-server /usr/local/bin/myne-server
+
+# Bundled backup engine (MYND-505): sha256-pinned restic + its rclone SFTP
+# transport. The server invokes restic via os/exec (no shell needed); restic
+# finds rclone on PATH. RESTIC_CACHE_DIR must be writable for UID 65532 (the
+# distroless HOME is not) — /tmp is. These are defaults; backup stays OFF until
+# the operator sets MYNE_BACKUP_ENABLED + a repository + a password file.
+COPY --from=fetch /out/restic /usr/local/bin/restic
+COPY --from=fetch /out/rclone /usr/local/bin/rclone
+ENV PATH="/usr/local/bin" \
+    MYNE_BACKUP_RESTIC_BIN="/usr/local/bin/restic" \
+    MYNE_BACKUP_CACHE_DIR="/tmp/restic-cache"
 
 # Non-root by default (distroless nonroot = UID 65532); restated for clarity.
 USER nonroot:nonroot

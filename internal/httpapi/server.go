@@ -21,6 +21,7 @@ import (
 	"github.com/myne-md/myne-server/internal/auth"
 	"github.com/myne-md/myne-server/internal/authapi"
 	"github.com/myne-md/myne-server/internal/authpersist"
+	"github.com/myne-md/myne-server/internal/backup"
 	"github.com/myne-md/myne-server/internal/gcquota"
 	"github.com/myne-md/myne-server/internal/ids"
 	"github.com/myne-md/myne-server/internal/poke"
@@ -246,6 +247,23 @@ func runListener(ctx context.Context, ln net.Listener) error {
 			}
 		}, gcInterval)
 		go sched.Start(ctx)
+	}
+
+	// Built-in encrypted off-box backup (MYND-505). Best-effort: a failed run logs
+	// and is retried on the next tick — it never blocks serving. Only started when
+	// enabled (which loadConfig already gates on the fs backend + a repo + a
+	// password file). The ticker is an internal timer only; no wall-clock/IP surface.
+	if cfg.BackupEnabled {
+		backupSched := backup.NewScheduler(
+			cfg.backupRunner(),
+			cfg.StoragePath,
+			time.Duration(cfg.BackupIntervalSeconds)*time.Second,
+			func(err error) {
+				log.Printf("backup: scheduled run failed, will retry next interval: %v", err)
+			},
+		)
+		go backupSched.Start(ctx)
+		log.Printf("backup: scheduled encrypted off-box backup every %ds (retention %dd)", cfg.BackupIntervalSeconds, cfg.BackupRetentionDays)
 	}
 
 	// Migrations already ran (pre-listen, above) and the store is open → ready to serve.

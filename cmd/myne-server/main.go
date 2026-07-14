@@ -18,12 +18,28 @@ import (
 )
 
 func main() {
-	// `myne-server healthcheck` is a self-probe for the container HEALTHCHECK:
-	// the distroless runtime image has no shell or curl, so the binary probes
-	// its own /healthz over loopback and maps the result to an exit code. It
-	// reads only the static 200 body — no IP/timestamp surface.
-	if len(os.Args) > 1 && os.Args[1] == "healthcheck" {
-		os.Exit(httpapi.HealthCheckProbe(os.Getenv("MYNE_SERVER_ADDR")))
+	// Subcommand dispatch (the distroless runtime image has no shell, so these are
+	// invoked directly, never via a wrapper script).
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "healthcheck":
+			// Self-probe for the container HEALTHCHECK: the binary probes its own
+			// /healthz over loopback and maps the result to an exit code. Reads only
+			// the static 200 body — no IP/timestamp surface.
+			os.Exit(httpapi.HealthCheckProbe(os.Getenv("MYNE_SERVER_ADDR")))
+		case "backup", "backup-check", "restore":
+			// On-demand encrypted off-box backup / integrity check / restore
+			// (MYND-505). Runs the bundled restic against the fs store and exits by
+			// result. Cancelled cleanly on SIGTERM so a long operation doesn't wedge
+			// a shutdown.
+			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+			defer stop()
+			sub := os.Args[1]
+			if sub == "backup-check" {
+				sub = "check"
+			}
+			os.Exit(httpapi.BackupCLI(ctx, sub, os.Args[2:]))
+		}
 	}
 
 	addr := os.Getenv("MYNE_SERVER_ADDR")

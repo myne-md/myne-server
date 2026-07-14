@@ -52,6 +52,18 @@ type Migrator struct {
 // NewMigrator builds the production migrator for a store root. MYNE_MIGRATE_SKIP_SNAPSHOT=1
 // is the explicit, at-own-risk override for operators with their own backup strategy
 // or a COW filesystem (snapshot is mandatory-by-default otherwise).
+// OpenFS runs the forward-only migration fail-safe fence, then opens the FSStore
+// at root — the sequence boot performs across its migrate + open phases, named
+// once so a caller that needs "is this store bootable by this binary?" gets
+// boot-identical semantics (a version newer than this binary refuses; SYNC-30).
+// Used by restore-verification; boot keeps its two phases explicit for clarity.
+func OpenFS(root string) (*FSStore, error) {
+	if err := NewMigrator(root).Run(); err != nil {
+		return nil, err
+	}
+	return NewFSStore(root)
+}
+
 func NewMigrator(root string) *Migrator {
 	skip, _ := strconv.ParseBool(os.Getenv("MYNE_MIGRATE_SKIP_SNAPSHOT"))
 	return &Migrator{
