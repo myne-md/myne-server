@@ -51,3 +51,25 @@ pre-commit:
           fi
         done
         exit $fail
+
+# Heavier gate before push — mirrors the the CI configuration build+test steps so a
+# broken build/test surfaces locally, not only after the push reaches CI.
+# (fmt/vet already run on pre-commit above.)
+pre-push:
+  parallel: false
+  commands:
+    build:
+      run: go build ./...
+    test:
+      run: go test ./... -count=1
+
+# Reject accidental AI co-author / attribution trailers in commit messages
+# (project policy). Lefthook passes the commit-message file path as {1}.
+commit-msg:
+  commands:
+    no-ai-coauthor:
+      run: |
+        if grep -qiE 'Co-Authored-By:.*(Claude|Anthropic)|Generated with .*Claude|🤖 Generated' "{1}"; then
+          echo "commit message carries an AI co-author/attribution trailer — remove it (project policy)."
+          exit 1
+        fi
