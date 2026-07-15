@@ -147,6 +147,12 @@ type BlobStore interface {
 	// BlobAttachmentID returns the associated attachment-id hex ("" if the blob is
 	// unknown or is a note record).
 	BlobAttachmentID(account ids.AccountNumberHash, blobID ids.BlobID) string
+
+	// DeleteAccount permanently removes an account's entire vault namespace (blobs,
+	// meta, head, index, tombstones — and, for the fs backend, the co-located
+	// attachments subtree) plus its in-memory index. Irreversible (the operator /
+	// self-service deletion path, MYND-506). Idempotent on a missing account.
+	DeleteAccount(account ids.AccountNumberHash) error
 }
 
 // HeadIDLen is the byte length of a head_id (SHA-256).

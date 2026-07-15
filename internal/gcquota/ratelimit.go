@@ -61,7 +61,8 @@ func (r *RateLimiter) Refill() {
 // unlimited (the hosted value is set by the payment epic, MYND-430; self-host sets
 // its own).
 type QuotaGuard struct {
-	ceiling uint64
+	ceiling  uint64
+	override func(account ids.AccountNumberHash, base uint64) uint64 // optional per-account effective ceiling (MYND-506)
 }
 
 // NewQuotaGuard creates a guard with the given ceiling (0 = unlimited).
@@ -69,21 +70,40 @@ func NewQuotaGuard(ceilingBytes uint64) *QuotaGuard {
 	return &QuotaGuard{ceiling: ceilingBytes}
 }
 
-// WouldExceedTotal reports whether currentBytes+addBytes would cross the ceiling
-// (0 = unlimited). It is store-agnostic so a caller holding a byte total drawn from
-// more than one source can gate on the combined figure — this is how the attachment
-// transport folds its bytes into the SAME per-account AS17 ceiling as the blob store
-// (unified total, no per-subsystem ceiling to bypass).
-func (q *QuotaGuard) WouldExceedTotal(currentBytes, addBytes uint64) bool {
-	if q.ceiling == 0 {
+// WithOverride installs a per-account effective-ceiling resolver so an operator's
+// per-account quota override wins over the global default (MYND-506). fn receives the
+// account + the global ceiling and returns the ceiling to enforce (0 = unlimited).
+func (q *QuotaGuard) WithOverride(fn func(account ids.AccountNumberHash, base uint64) uint64) *QuotaGuard {
+	q.override = fn
+	return q
+}
+
+// effective returns the ceiling to enforce for an account: the override when set,
+// else the global ceiling.
+func (q *QuotaGuard) effective(account ids.AccountNumberHash) uint64 {
+	if q.override != nil {
+		return q.override(account, q.ceiling)
+	}
+	return q.ceiling
+}
+
+// WouldExceedTotalForAccount reports whether currentBytes+addBytes would cross the
+// account's effective ceiling (0 = unlimited). Store-agnostic so a caller holding a
+// byte total drawn from more than one source can gate on the combined figure — this
+// is how the attachment transport folds its bytes into the SAME per-account AS17
+// ceiling as the blob store (unified total, no per-subsystem ceiling to bypass), and
+// the per-account override applies uniformly across both paths.
+func (q *QuotaGuard) WouldExceedTotalForAccount(account ids.AccountNumberHash, currentBytes, addBytes uint64) bool {
+	c := q.effective(account)
+	if c == 0 {
 		return false
 	}
-	return currentBytes+addBytes > q.ceiling
+	return currentBytes+addBytes > c
 }
 
 // WouldExceed reports whether storing addBytes more would push the account over its
-// ceiling (caller maps true → HTTP 507 "quota"). Uses the dedup'd substrate counter
-// from the blob store (the sync-push path).
+// effective ceiling (caller maps true → HTTP 507 "quota"). Uses the dedup'd substrate
+// counter from the blob store (the sync-push path).
 func (q *QuotaGuard) WouldExceed(s store.BlobStore, account ids.AccountNumberHash, addBytes uint64) bool {
-	return q.WouldExceedTotal(s.QuotaBytes(account), addBytes)
+	return q.WouldExceedTotalForAccount(account, s.QuotaBytes(account), addBytes)
 }

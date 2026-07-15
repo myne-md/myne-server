@@ -89,11 +89,34 @@ type Handler struct {
 	// auth registry + the shared day-bucket marker so this package stays decoupled
 	// from auth.Registry. nil = no activity tracking wired (notes-only tests).
 	activityTouch func(account ids.AccountNumberHash, dev ids.DeviceID)
+	// frozen reports whether an account is operator-frozen (MYND-506): a frozen
+	// account's PUSH is refused, but PULL is never blocked (data is never held
+	// hostage — the "frozen is minimal" invariant). Injected as a closure over the
+	// accounts store so this package stays decoupled. nil = no freeze wired.
+	frozen func(account ids.AccountNumberHash) bool
+	// accountStatus returns the caller's own status projection (stored bytes, device
+	// count, frozen, effective ceilings) for GET /account/status. The account is the
+	// authenticated one; nil = the endpoint reports unavailable.
+	accountStatus func(account ids.AccountNumberHash) any
 }
 
 // New returns a sync Handler over the given store + token store.
 func New(s store.BlobStore, ts *auth.TokenStore) *Handler {
 	return &Handler{store: s, auth: ts}
+}
+
+// WithFrozenCheck installs the operator-freeze predicate (MYND-506). It gates PUSH
+// only; pull deliberately never consults it.
+func (h *Handler) WithFrozenCheck(fn func(account ids.AccountNumberHash) bool) *Handler {
+	h.frozen = fn
+	return h
+}
+
+// WithAccountStatus installs the GET /account/status projection (MYND-506). fn is
+// invoked with the AUTHENTICATED account (never a URL/query value).
+func (h *Handler) WithAccountStatus(fn func(account ids.AccountNumberHash) any) *Handler {
+	h.accountStatus = fn
+	return h
 }
 
 // WithPolicy attaches the MYND-422 rate-limiter + quota guard. Either may be nil.
@@ -156,6 +179,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/sync/pull", h.handlePull)
 	mux.HandleFunc("/sync/blob", h.handleBlob)
 	mux.HandleFunc("/vault.meta", h.handleMeta)
+	mux.HandleFunc("/account/status", h.handleAccountStatus)
 }
 
 // --- wire types ---
@@ -232,6 +256,31 @@ type errBody struct {
 	ErrorCode string `json:"error_code"`
 }
 
+// handleAccountStatus serves GET /account/status: the caller's own enforcement-state
+// projection (MYND-506). The account is resolved from the DEVICE TOKEN — never from
+// the URL or query, so the account number never appears in a request line or log. An
+// identifier a client places in the URL/query is ignored (never a selector).
+func (h *Handler) handleAccountStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeErr(w, http.StatusMethodNotAllowed, "bad_request")
+		return
+	}
+	sess, ok := h.session(r)
+	if !ok {
+		writeErr(w, http.StatusUnauthorized, "unauthenticated")
+		return
+	}
+	if h.rl != nil && !h.rl.Allow(sess.Account) {
+		writeErr(w, http.StatusTooManyRequests, "rate")
+		return
+	}
+	if h.accountStatus == nil {
+		writeErr(w, http.StatusServiceUnavailable, "unavailable")
+		return
+	}
+	writeJSON(w, h.accountStatus(sess.Account))
+}
+
 func writeErr(w http.ResponseWriter, status int, code string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -294,6 +343,12 @@ func (h *Handler) handlePush(w http.ResponseWriter, r *http.Request) {
 	}
 	if h.rl != nil && !h.rl.Allow(sess.Account) {
 		writeErr(w, http.StatusTooManyRequests, "rate")
+		return
+	}
+	// A frozen account cannot push (MYND-506) — pull stays open (handlePull never
+	// consults this). Checked before recording activity so a refused push is a no-op.
+	if h.frozen != nil && h.frozen(sess.Account) {
+		writeErr(w, http.StatusForbidden, "frozen")
 		return
 	}
 	// An authed push is device activity — feed the horizon-GC soft-retire (F4).
@@ -564,7 +619,7 @@ func (h *Handler) handleMeta(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// Pre-auth fetch by account_number_hash (the bootstrap).
-		account, ok := parseAccountHash(r.URL.Query().Get("account"))
+		account, ok := ids.ParseAccountNumberHash(r.URL.Query().Get("account"))
 		if !ok {
 			writeErr(w, http.StatusBadRequest, "bad_request")
 			return
@@ -585,14 +640,4 @@ func (h *Handler) handleMeta(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeErr(w, http.StatusMethodNotAllowed, "bad_request")
 	}
-}
-
-func parseAccountHash(s string) (ids.AccountNumberHash, bool) {
-	b, err := hex.DecodeString(s)
-	if err != nil || len(b) != ids.AccountNumberHashLen {
-		return ids.AccountNumberHash{}, false
-	}
-	var a ids.AccountNumberHash
-	copy(a[:], b)
-	return a, true
 }

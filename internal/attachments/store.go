@@ -63,6 +63,10 @@ type Backend interface {
 	// the per-vault ceiling, and returns the bytes released from the quota total.
 	// ok=false when the id is unknown.
 	Reclaim(a ids.AccountNumberHash, id AttachmentID) (bytesFreed uint64, ok bool)
+	// DeleteAccount drops the account's in-memory attachment index (MYND-506). For
+	// the fs backend the bodies themselves live under the blob store's account dir and
+	// are removed by store.DeleteAccount; this only clears the index.
+	DeleteAccount(a ids.AccountNumberHash)
 }
 
 type entry struct {
@@ -81,6 +85,14 @@ type Store struct {
 	accountBytes   map[ids.AccountNumberHash]uint64
 	maxIDsPerVault int // 0 = unlimited; caps distinct attachment ids per vault (OOM bound)
 	vaults         map[ids.AccountNumberHash]map[AttachmentID]*entry
+}
+
+// DeleteAccount drops the account's in-memory attachment index + byte total (MYND-506).
+func (s *Store) DeleteAccount(a ids.AccountNumberHash) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.vaults, a)
+	delete(s.accountBytes, a)
 }
 
 // NewStore returns an empty attachment store (unlimited id count until WithMaxIDs).

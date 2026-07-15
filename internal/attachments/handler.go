@@ -20,11 +20,12 @@ type RateLimiter interface {
 	Allow(account ids.AccountNumberHash) bool
 }
 
-// AttachQuota reports whether currentBytes+addBytes would cross the per-account
-// ceiling (nil = disabled). It is store-agnostic so attachment bytes fold into the
-// SAME AS17 total as blob bytes (see gcquota.QuotaGuard.WouldExceedTotal).
+// AttachQuota reports whether currentBytes+addBytes would cross the account's
+// effective per-account ceiling (nil = disabled). It is store-agnostic so attachment
+// bytes fold into the SAME AS17 total as blob bytes, and the per-account quota
+// override (MYND-506) applies here too (see gcquota.QuotaGuard.WouldExceedTotalForAccount).
 type AttachQuota interface {
-	WouldExceedTotal(currentBytes, addBytes uint64) bool
+	WouldExceedTotalForAccount(account ids.AccountNumberHash, currentBytes, addBytes uint64) bool
 }
 
 // Handler serves the resumable attachment transport. Every route is session-bound
@@ -163,7 +164,7 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request) {
 			current = h.used(sess.Account)
 		}
 		current += h.store.AccountBytes(sess.Account)
-		if h.qg.WouldExceedTotal(current, uint64(total)) {
+		if h.qg.WouldExceedTotalForAccount(sess.Account, current, uint64(total)) {
 			w.WriteHeader(http.StatusInsufficientStorage)
 			return
 		}

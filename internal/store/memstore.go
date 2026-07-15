@@ -469,6 +469,15 @@ func (m *MemStore) GetBlob(account ids.AccountNumberHash, blobID ids.BlobID) ([]
 // ListAccounts returns every account namespace present (for the GC scheduler,
 // MYND-440). It is an enumeration of opaque account_number_hash keys — no IP, no
 // content. Not part of BlobStore; the scheduler duck-types on it.
+// DeleteAccount removes the account's entire in-memory vault namespace. Irreversible
+// (MYND-506); idempotent on a missing account.
+func (m *MemStore) DeleteAccount(account ids.AccountNumberHash) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.vaults, account)
+	return nil
+}
+
 func (m *MemStore) ListAccounts() []ids.AccountNumberHash {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

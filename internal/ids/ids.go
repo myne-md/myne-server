@@ -8,6 +8,8 @@
 // a revocable bearer credential. Revoking a token MUST NOT touch a device_id.
 package ids
 
+import "encoding/hex"
+
 const (
 	// AccountNumberHashLen is the byte length of an account_number_hash.
 	AccountNumberHashLen = 16
@@ -22,6 +24,20 @@ const (
 // rate-limiting, and quota. It is NEVER an IP. It is a fixed-size array so it can
 // be used directly as a map key (comparable).
 type AccountNumberHash [AccountNumberHashLen]byte
+
+// ParseAccountNumberHash decodes an AccountNumberHashLen-byte account_number_hash
+// from lowercase hex. ok is false unless s is exactly that many bytes of valid hex.
+// This is the single decoder for the hash the sync / auth / admin surfaces receive
+// on the wire (kept here so those packages don't each re-implement it).
+func ParseAccountNumberHash(s string) (AccountNumberHash, bool) {
+	var a AccountNumberHash
+	b, err := hex.DecodeString(s)
+	if err != nil || len(b) != AccountNumberHashLen {
+		return a, false
+	}
+	copy(a[:], b)
+	return a, true
+}
 
 // DeviceID is the client-generated, permanent version-vector actor and registry
 // key. The server never assigns or re-issues it.

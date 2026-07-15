@@ -38,6 +38,7 @@ type Config struct {
 	MaxHandshakes          uint64 // 0 = unlimited (opt-out)
 	HandshakeTTLSeconds    uint64 // 0 = handshakes never expire (opt-out)
 	MaxAttachmentsPerVault uint64 // 0 = unlimited (opt-out)
+	MaxDevicesPerAccount   uint64 // MYNE_MAX_DEVICES_PER_ACCOUNT; 0 = unlimited (default). Per-account override wins (MYND-506).
 
 	// Built-in encrypted off-box backup (MYNE_BACKUP_*, MYND-505). Disabled by
 	// default. When enabled, the server drives a bundled restic to snapshot the fs
@@ -57,6 +58,11 @@ type Config struct {
 	// the knobs above (repository/retention/interval), not these.
 	BackupResticBin string // MYNE_BACKUP_RESTIC_BIN; path to bundled restic, default "restic" (PATH)
 	BackupCacheDir  string // MYNE_BACKUP_CACHE_DIR; RESTIC_CACHE_DIR (writable for the runtime UID)
+
+	// AdminSocket is the operator-console admin API's Unix domain socket path
+	// (MYNE_ADMIN_SOCKET; "" = admin API disabled). Local-only, filesystem-permission
+	// access, no bearer secret (MYND-506). Never a TCP port / public edge.
+	AdminSocket string
 }
 
 // loadConfig reads the MYNE_* env vars and fails fast on any invalid value, so a
@@ -129,6 +135,9 @@ func loadConfig() (Config, error) {
 	if cfg.MaxAttachmentsPerVault, err = uintEnv("MYNE_MAX_ATTACHMENTS_PER_VAULT", cfg.MaxAttachmentsPerVault); err != nil {
 		return Config{}, err
 	}
+	if cfg.MaxDevicesPerAccount, err = uintEnv("MYNE_MAX_DEVICES_PER_ACCOUNT", cfg.MaxDevicesPerAccount); err != nil {
+		return Config{}, err
+	}
 
 	// A pre-auth burst of 0 would reject every registration/handshake, locking out
 	// enrollment entirely — refuse to start rather than serve a dead auth surface.
@@ -148,6 +157,7 @@ func loadConfig() (Config, error) {
 	cfg.BackupRcloneConfig = os.Getenv("MYNE_BACKUP_RCLONE_CONFIG")
 	cfg.BackupResticBin = envOr("MYNE_BACKUP_RESTIC_BIN", cfg.BackupResticBin)
 	cfg.BackupCacheDir = os.Getenv("MYNE_BACKUP_CACHE_DIR")
+	cfg.AdminSocket = os.Getenv("MYNE_ADMIN_SOCKET")
 	if cfg.BackupIntervalSeconds, err = uintEnv("MYNE_BACKUP_INTERVAL_SECONDS", cfg.BackupIntervalSeconds); err != nil {
 		return Config{}, err
 	}

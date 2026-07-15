@@ -113,6 +113,18 @@ func subtleEqualDevice(a, b ids.DeviceID) bool {
 	return subtle.ConstantTimeCompare(a[:], b[:]) == 1
 }
 
+// DeleteAccountTokens revokes every device token for an account (MYND-506, the
+// operator/self-service deletion path). Idempotent on a missing account.
+func (s *TokenStore) DeleteAccountTokens(account ids.AccountNumberHash) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for k, b := range s.byToken {
+		if b.account == account {
+			delete(s.byToken, k)
+		}
+	}
+}
+
 // --- Persistence snapshot/restore (MYND auth-persistence) ---
 
 // PersistedToken is the serializable form of one token binding. TokenHex is the raw

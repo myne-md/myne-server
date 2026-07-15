@@ -90,6 +90,29 @@ func (r *Registry) hasAnyDevice(account ids.AccountNumberHash) bool {
 	return len(r.accounts[account]) > 0
 }
 
+// DeleteAccount removes an account's entire device registry (MYND-506). Irreversible;
+// idempotent on a missing account.
+func (r *Registry) DeleteAccount(account ids.AccountNumberHash) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.accounts, account)
+}
+
+// CountActiveDevices returns the number of non-retired devices for an account —
+// the count that occupies the per-account device cap (MYND-506). A retired device
+// frees its slot.
+func (r *Registry) CountActiveDevices(account ids.AccountNumberHash) uint64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var n uint64
+	for _, rec := range r.accounts[account] {
+		if !rec.Retired {
+			n++
+		}
+	}
+	return n
+}
+
 // hasApprovedActiveDevice reports whether the account has at least one approved,
 // non-retired device (the approver for a password-path enrollment).
 func (r *Registry) hasApprovedActiveDevice(account ids.AccountNumberHash) bool {

@@ -215,6 +215,20 @@ func (v *fsVault) toIndex() vaultIndex {
 func (s *FSStore) vaultDir(a ids.AccountNumberHash) string {
 	return filepath.Join(s.root, hex.EncodeToString(a[:]))
 }
+
+// DeleteAccount removes the account's entire on-disk vault dir (blobs + meta + head
+// + index + tombstones + the attachments subtree — all under one account dir) and its
+// in-memory index. Irreversible (MYND-506). Idempotent: RemoveAll on a missing dir is
+// a no-op, and deleting an absent map key is a no-op.
+func (s *FSStore) DeleteAccount(account ids.AccountNumberHash) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := os.RemoveAll(s.vaultDir(account)); err != nil {
+		return err
+	}
+	delete(s.vaults, account)
+	return nil
+}
 func (s *FSStore) blobPath(a ids.AccountNumberHash, b ids.BlobID) string {
 	return filepath.Join(s.vaultDir(a), "blobs", hex.EncodeToString(b[:]))
 }

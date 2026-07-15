@@ -47,6 +47,16 @@ type fsEntry struct {
 	deleted  bool
 }
 
+// DeleteAccount drops the account's in-memory attachment index + byte total (MYND-506).
+// The on-disk bodies live under the blob store's account dir and are removed by
+// store.DeleteAccount's RemoveAll; this clears only the index.
+func (s *FSStore) DeleteAccount(a ids.AccountNumberHash) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.vaults, a)
+	delete(s.accountBytes, a)
+}
+
 const attachmentsIndexFile = "attachments-index.json"
 
 type fsIndexEntry struct {

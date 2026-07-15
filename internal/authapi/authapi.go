@@ -109,6 +109,37 @@ type Handler struct {
 	// region (it re-reads creds under h.mu, so a held lock would self-deadlock). nil
 	// for the mem backend (no persistence).
 	onAuthChange func()
+
+	// frozen / maxDevices are the operator enforcement gates (MYND-506), injected as
+	// closures over the accounts store so this package stays decoupled. frozen blocks
+	// enrollment token-minting for a frozen account; maxDevices returns the account's
+	// effective device cap (0 = unlimited), enforced against the active-device count
+	// when a NEW device enrolls. nil = enforcement disabled (mem/test default).
+	frozen     func(account ids.AccountNumberHash) bool
+	maxDevices func(account ids.AccountNumberHash) uint64
+}
+
+// WithAccountGate installs the operator enforcement gates (MYND-506): frozen blocks
+// enrollment for a frozen account; maxDevices returns the effective per-account device
+// cap (0 = unlimited), enforced when a new device enrolls. Either may be nil.
+func (h *Handler) WithAccountGate(frozen func(ids.AccountNumberHash) bool, maxDevices func(ids.AccountNumberHash) uint64) *Handler {
+	h.frozen = frozen
+	h.maxDevices = maxDevices
+	return h
+}
+
+// DeleteAccount removes an account's SCRAM verifier + device registry + device tokens
+// (MYND-506, the operator/self-service deletion path) and persists the change. The
+// caller removes the account's blob + attachment data separately (remove-then-forget).
+func (h *Handler) DeleteAccount(account ids.AccountNumberHash) {
+	h.mu.Lock()
+	delete(h.creds, account)
+	h.mu.Unlock()
+	h.reg.DeleteAccount(account)
+	h.tokens.DeleteAccountTokens(account)
+	if h.onAuthChange != nil {
+		h.onAuthChange()
+	}
 }
 
 // SetOnChange installs the persistence save hook (the authpersist coordinator's Save).
@@ -191,16 +222,6 @@ func randHex(n int) (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
-func parseAccount(s string) (ids.AccountNumberHash, bool) {
-	b, err := hex.DecodeString(s)
-	if err != nil || len(b) != ids.AccountNumberHashLen {
-		return ids.AccountNumberHash{}, false
-	}
-	var a ids.AccountNumberHash
-	copy(a[:], b)
-	return a, true
-}
-
 func parseDevice(s string) (ids.DeviceID, bool) {
 	b, err := hex.DecodeString(s)
 	if err != nil || len(b) != ids.DeviceIDLen {
@@ -243,7 +264,7 @@ func (h *Handler) handleRegister(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "bad_request")
 		return
 	}
-	account, ok := parseAccount(req.AccountHashHex)
+	account, ok := ids.ParseAccountNumberHash(req.AccountHashHex)
 	salt, e1 := hex.DecodeString(req.SaltHex)
 	storedKey, e2 := hex.DecodeString(req.StoredKeyHex)
 	serverKey, e3 := hex.DecodeString(req.ServerKeyHex)
@@ -345,7 +366,7 @@ func (h *Handler) handleScramInit(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "bad_request")
 		return
 	}
-	account, ok := parseAccount(req.AccountHashHex)
+	account, ok := ids.ParseAccountNumberHash(req.AccountHashHex)
 	if !ok || req.ClientNonce == "" {
 		writeErr(w, http.StatusBadRequest, "bad_request")
 		return
@@ -482,6 +503,14 @@ func (h *Handler) handleScramFinal(w http.ResponseWriter, r *http.Request) {
 	}
 	delete(h.hs, req.HandshakeID)
 
+	// Operator enforcement (MYND-506): a frozen account cannot mint an enrollment
+	// token (blocks new devices AND pending-approval completions). Pull is unaffected
+	// (a different surface). Checked after SCRAM proof so it leaks no enumeration signal.
+	if h.frozen != nil && h.frozen(hs.account) {
+		writeErr(w, http.StatusForbidden, "frozen")
+		return
+	}
+
 	// SCRAM proved account ownership. Apply the gate. If the device is already
 	// registered + approved (a pending device returning after approval), issue
 	// its token via CompleteApproval; otherwise Enroll (which gates new devices).
@@ -500,6 +529,14 @@ func (h *Handler) handleScramFinal(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	} else {
+		// New device: enforce the effective per-account device cap (MYND-506). 0 =
+		// unlimited. A retired device frees its slot (CountActiveDevices excludes it).
+		if h.maxDevices != nil {
+			if cap := h.maxDevices(hs.account); cap > 0 && h.reg.CountActiveDevices(hs.account) >= cap {
+				writeErr(w, http.StatusForbidden, "device_limit")
+				return
+			}
+		}
 		res, eerr := h.enroll.Enroll(hs.account, device, path)
 		doSave = true // Enroll registered the device (even when it lands pending)
 		if errors.Is(eerr, auth.ErrPendingApproval) {

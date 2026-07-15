@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/myne-md/myne-server/internal/adminapi"
 	"github.com/myne-md/myne-server/internal/httpapi"
 )
 
@@ -39,6 +40,10 @@ func main() {
 				sub = "check"
 			}
 			os.Exit(httpapi.BackupCLI(ctx, sub, os.Args[2:]))
+		case "admin":
+			// Operator console CLI (MYND-506): a thin client over the local admin
+			// Unix socket. No server process runs here; it dials the running server.
+			os.Exit(adminapi.RunCLI(os.Getenv("MYNE_ADMIN_SOCKET"), os.Args[2:]))
 		}
 	}
 

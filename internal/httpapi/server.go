@@ -17,6 +17,8 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/myne-md/myne-server/internal/accounts"
+	"github.com/myne-md/myne-server/internal/adminapi"
 	"github.com/myne-md/myne-server/internal/attachments"
 	"github.com/myne-md/myne-server/internal/auth"
 	"github.com/myne-md/myne-server/internal/authapi"
@@ -154,11 +156,32 @@ func runListener(ctx context.Context, ln net.Listener) error {
 		go authCoord.Start(ctx)
 	}
 
+	// Per-account operator enforcement policy (MYND-506): freeze + quota/device-cap
+	// overrides, persisted to accounts.json beside auth.json. fs-backend only (mem is
+	// the dev/E2E reference — no enforcement, like authpersist). Load fails closed on a
+	// too-new/corrupt file; an absent file is first boot (empty → all defaults).
+	var acctStore *accounts.Store
+	if cfg.StorageBackend == "fs" {
+		acctStore = accounts.New(filepath.Join(cfg.StoragePath, "accounts.json"))
+		if err := acctStore.Load(); err != nil {
+			return err
+		}
+		go acctStore.Start(ctx)
+	}
+
 	// Rate-limit keyed on account_number_hash, never IP (C4). Quota ceiling
 	// 0 = unlimited until set (SYNC-23; hosted value lands with MYND-430). The
 	// clamped horizon policy (cfg.Policy) is consumed by the GC scheduler (MYND-440).
 	rl := gcquota.NewRateLimiter(cfg.RateLimitBurst, cfg.RateLimitRefill)
 	qg := gcquota.NewQuotaGuard(cfg.Policy.QuotaCeilingBytes)
+	if acctStore != nil {
+		// A per-account quota override wins over the global ceiling; the enroll gate
+		// enforces freeze + the effective per-account device cap (MYND-506).
+		qg.WithOverride(acctStore.EffectiveQuota)
+		authHandler.WithAccountGate(acctStore.Frozen, func(a ids.AccountNumberHash) uint64 {
+			return acctStore.EffectiveMaxDevices(a, cfg.MaxDevicesPerAccount)
+		})
+	}
 
 	// Refill the rate-limiter buckets periodically (server-internal timer; not a
 	// user-facing timestamp).
@@ -203,7 +226,30 @@ func runListener(ctx context.Context, ln net.Listener) error {
 	activityTouch := func(a ids.AccountNumberHash, d ids.DeviceID) {
 		_ = reg.TouchActivity(a, d, gcquota.DayBucketMarker())
 	}
-	srv := newHTTPServer(NewServer(blobStore, tokens, authHandler, rl, qg, ready, metrics, preAuthMeta, attachStore, activityTouch))
+	// usedBytes is the unified AS17 stored-byte total the quota gate is defined
+	// against — blobs + attachments. One definition, read by both /account/status and
+	// the operator admin API so the two projections can't drift.
+	usedBytes := func(a ids.AccountNumberHash) uint64 {
+		return blobStore.QuotaBytes(a) + attachStore.AccountBytes(a)
+	}
+	// GET /account/status projection (MYND-506): the caller's own stored bytes +
+	// device count + frozen + EFFECTIVE ceilings. Same sources as the admin API,
+	// scoped to one (token-resolved) account.
+	accountStatus := func(a ids.AccountNumberHash) any {
+		v := accountStatusView{
+			StoredBytes: usedBytes(a),
+			DeviceCount: reg.CountActiveDevices(a),
+			QuotaBytes:  cfg.Policy.QuotaCeilingBytes,
+			MaxDevices:  cfg.MaxDevicesPerAccount,
+		}
+		if acctStore != nil {
+			v.Frozen = acctStore.Frozen(a)
+			v.QuotaBytes = acctStore.EffectiveQuota(a, cfg.Policy.QuotaCeilingBytes)
+			v.MaxDevices = acctStore.EffectiveMaxDevices(a, cfg.MaxDevicesPerAccount)
+		}
+		return v
+	}
+	srv := newHTTPServer(NewServer(blobStore, tokens, authHandler, rl, qg, ready, metrics, preAuthMeta, attachStore, activityTouch, acctStore, accountStatus))
 
 	// Aggregate-only metrics on a SEPARATE listener (SYNC-24) — never the public edge.
 	// Disabled unless MYNE_METRICS_ADDR is set; bind it to localhost/internal only.
@@ -266,6 +312,47 @@ func runListener(ctx context.Context, ln net.Listener) error {
 		log.Printf("backup: scheduled encrypted off-box backup every %ds (retention %dd)", cfg.BackupIntervalSeconds, cfg.BackupRetentionDays)
 	}
 
+	// Operator console admin API (MYND-506) on a LOCAL Unix domain socket — never a
+	// TCP port / public edge; access is filesystem permissions on the socket. Disabled
+	// unless MYNE_ADMIN_SOCKET is set. A bind failure fails startup; it serves until
+	// ctx cancel.
+	adminLn, err := adminapi.Listen(cfg.AdminSocket)
+	if err != nil {
+		return err
+	}
+	if adminLn != nil {
+		// Live enforcement-state projection: accounts from the store, stored bytes =
+		// blobs + attachments (the unified AS17 total), device count from the registry,
+		// policy from the accounts store (nil on mem backend → defaults). No wall-clock
+		// / activity / time-series is exposed (MYND-440 aggregate-only).
+		listAccounts := func() []ids.AccountNumberHash {
+			if l, ok := blobStore.(interface {
+				ListAccounts() []ids.AccountNumberHash
+			}); ok {
+				return l.ListAccounts()
+			}
+			return nil
+		}
+		// Irreversible account delete (MYND-506) — remove-then-forget: blob +
+		// attachment data first, then auth + policy, so no half-deleted account is
+		// served if a later step fails.
+		deleteAccount := func(a ids.AccountNumberHash) error {
+			if err := blobStore.DeleteAccount(a); err != nil {
+				return err
+			}
+			attachStore.DeleteAccount(a)
+			authHandler.DeleteAccount(a)
+			if acctStore != nil {
+				acctStore.Delete(a)
+			}
+			return nil
+		}
+		adminMux := adminapi.New(listAccounts, usedBytes, reg.CountActiveDevices, acctStore, cfg.MaxAccounts).
+			WithDelete(deleteAccount).Mux()
+		go adminapi.Serve(ctx, adminLn, adminMux)
+		log.Printf("myne-server: operator admin API on unix socket %s", cfg.AdminSocket)
+	}
+
 	// Migrations already ran (pre-listen, above) and the store is open → ready to serve.
 	ready.SetReady()
 
@@ -310,7 +397,18 @@ func NewRouter(a auth.Authenticator) http.Handler {
 // (policy disabled). attachStore is the attachment Backend (MYND-468 — the caller
 // selects mem/fs to match the blob store; nil constructs a fresh in-memory one,
 // the pre-468 behavior tests rely on).
-func NewServer(s store.BlobStore, tokens *auth.TokenStore, authHandler *authapi.Handler, rl syncapi.RateLimiter, qg *gcquota.QuotaGuard, ready *Readiness, metrics *Metrics, preAuthMeta syncapi.PreAuthLimiter, attachStore attachments.Backend, activityTouch func(ids.AccountNumberHash, ids.DeviceID)) http.Handler {
+// accountStatusView is the caller-facing GET /account/status body (MYND-506): the
+// user's own live stats + EFFECTIVE ceilings + frozen state. Effective = the
+// per-account override when set, else the global default (0 = unlimited).
+type accountStatusView struct {
+	StoredBytes uint64 `json:"stored_bytes"`
+	DeviceCount uint64 `json:"device_count"`
+	Frozen      bool   `json:"frozen"`
+	QuotaBytes  uint64 `json:"quota_bytes"`
+	MaxDevices  uint64 `json:"max_devices"`
+}
+
+func NewServer(s store.BlobStore, tokens *auth.TokenStore, authHandler *authapi.Handler, rl syncapi.RateLimiter, qg *gcquota.QuotaGuard, ready *Readiness, metrics *Metrics, preAuthMeta syncapi.PreAuthLimiter, attachStore attachments.Backend, activityTouch func(ids.AccountNumberHash, ids.DeviceID), acctStore *accounts.Store, accountStatus func(ids.AccountNumberHash) any) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", healthz)
 	if ready != nil {
@@ -334,6 +432,13 @@ func NewServer(s store.BlobStore, tokens *auth.TokenStore, authHandler *authapi.
 		WithActivityTouch(activityTouch)
 	if metrics != nil {
 		syncMux = syncMux.WithMetrics(metrics.ObserveBlobStored)
+	}
+	if acctStore != nil {
+		// Operator freeze gates PUSH here; pull never consults it (MYND-506).
+		syncMux = syncMux.WithFrozenCheck(acctStore.Frozen)
+	}
+	if accountStatus != nil {
+		syncMux = syncMux.WithAccountStatus(accountStatus) // GET /account/status (token-derived)
 	}
 	syncMux.Register(mux)
 	// SSE poke (MYND-423): same per-account token bucket as the sync routes (one
