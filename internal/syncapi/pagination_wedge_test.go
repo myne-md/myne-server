@@ -3,6 +3,7 @@
 package syncapi
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -135,11 +136,20 @@ func TestPull_MultiPageFloorWedgeRecoversViaReconcile(t *testing.T) {
 		}
 		cursor = pr.NextCursor
 	}
-	// The reconcile walk surfaces the WHOLE manifest across pages — every live
-	// blob plus the reclaimed blob's surviving tombstone meta (so the client
-	// reconstructs the one deletion from manifest presence). The point is it
-	// drained past the floor without wedging, covering every uuid.
-	if len(seen) != total {
-		t.Fatalf("reconcile drained %d manifest entries across pages, want %d", len(seen), total)
+	// The reconcile walk surfaces every LIVE blob across pages; the reclaimed
+	// victim is manifest-ABSENT (the client reconstructs the deletion from
+	// manifest-absence, sync-protocol §11.2/§11.3), never a size-0 meta. The
+	// point is the walk drained past the floor without wedging.
+	if len(seen) != total-1 {
+		t.Fatalf("reconcile drained %d manifest entries across pages, want %d (live only)", len(seen), total-1)
+	}
+	if seen[hex.EncodeToString(victim[:])] {
+		t.Fatalf("reclaimed blob %x must be absent from the reconcile manifest", victim[:])
+	}
+	// The drained cursor sits at/above the floor, so the device's next PLAIN
+	// incremental pull is served — the recovery truly un-wedges it.
+	rf, _ := do(t, srv, http.MethodGet, fmt.Sprintf("/sync/pull?cursor=%d", cursor), token, "")
+	if rf.StatusCode != http.StatusOK {
+		t.Fatalf("post-reconcile incremental pull status %d, want 200", rf.StatusCode)
 	}
 }

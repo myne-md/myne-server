@@ -24,6 +24,12 @@ type Version uint64
 // ErrNotFound is returned when a blob or head is absent.
 var ErrNotFound = errors.New("store: not found")
 
+// ErrReclaimed is returned when a blob's ciphertext body was Layer-2 reclaimed
+// (sync-protocol §11.3): the record survives as (uuid, final_version, marker)
+// but the bytes are gone. Distinct from ErrNotFound so the API can signal
+// "reclaimed, full-reconcile" instead of serving an empty body as if live.
+var ErrReclaimed = errors.New("store: blob reclaimed")
+
 // ErrHeadCASMismatch is returned when an AdvanceHead's prev-hash does not match
 // the current head pointer (a stale base — a fork the server must not accept).
 var ErrHeadCASMismatch = errors.New("store: head CAS mismatch")
@@ -61,7 +67,9 @@ type BlobStore interface {
 	PutBlob(account ids.AccountNumberHash, blobID ids.BlobID, ciphertext []byte) (Version, error)
 
 	// GetBlob returns the stored opaque ciphertext + its version for
-	// (account, blobID), or ErrNotFound.
+	// (account, blobID). Returns ErrNotFound if the blob is absent, or
+	// ErrReclaimed if the body was Layer-2 reclaimed (§11.3) — a reclaimed
+	// blob must never read as a live empty ciphertext.
 	GetBlob(account ids.AccountNumberHash, blobID ids.BlobID) (ciphertext []byte, version Version, err error)
 
 	// BlobVersion returns the current opaque version for (account, blobID) without
@@ -105,14 +113,21 @@ type BlobStore interface {
 	// MUST equal the blob's current version (0 for a new blob), else ErrBlobCASMismatch.
 	// contentNonce is the client-supplied public-header discriminator (the server never
 	// parses the blob). A byte-identical re-push at the correct base is idempotent.
+	// A successful version advance clears any tombstone record and the reclaimed
+	// mark: a new content version supersedes the deletion (§11.1), so a later GC
+	// pass must not reclaim the resurrected body.
 	// Returns the resulting version.
 	PushBlob(account ids.AccountNumberHash, blobID ids.BlobID, baseVersion Version, contentNonce [ContentNonceLen]byte, ciphertext []byte) (Version, error)
 
 	// ChangedSince returns up to `limit` SyncMeta whose per-vault change-sequence is
 	// greater than `cursor`, ordered by that sequence, plus the new cursor (the max
-	// sequence returned, or `cursor` if none). The cursor is opaque, per-device,
-	// monotone, wall-clock-free; selection is by the server's own change-sequence,
-	// never a timestamp (ledger SYNC-6).
+	// sequence in the selected window, or `cursor` if none). It omits Layer-2
+	// reclaimed records — a reclaimed uuid is absent from the manifest (§11.3),
+	// never a size-0 live meta — but the returned cursor still advances ACROSS
+	// them, so a page may legitimately be empty while the cursor moves; a cursor
+	// that stalled below the reclaim floor would 410 every later pull. The cursor
+	// is opaque, per-device, monotone, wall-clock-free; selection is by the
+	// server's own change-sequence, never a timestamp (ledger SYNC-6).
 	ChangedSince(account ids.AccountNumberHash, cursor uint64, limit int) (metas []SyncMeta, newCursor uint64)
 
 	// AckCursor records a device's pull cursor position — the ack the MYND-422

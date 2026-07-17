@@ -54,6 +54,7 @@ type blobEntry struct {
 	contentNonce [ContentNonceLen]byte
 	size         int
 	changeSeq    uint64 // per-vault sequence of this blob's last mutation
+	reclaimed    bool   // L2-reclaimed → body dropped; omitted from ChangedSince, GetBlob → ErrReclaimed
 	// attachmentID is the full 32-byte attachment-id (hex) for an attachment
 	// record (MYND-468); "" for notes. Opaque; echoed in ChangedSince.
 	attachmentID string
@@ -162,13 +163,23 @@ func (m *MemStore) PushBlob(account ids.AccountNumberHash, blobID ids.BlobID, ba
 	e.contentNonce = contentNonce
 	e.size = len(buf)
 	e.version++
+	// A new content version supersedes any recorded deletion (§11.1): clear the
+	// tombstone + reclaimed mark so a later GC pass cannot reclaim the
+	// resurrected body, and the record re-enters the manifest.
+	e.reclaimed = false
+	delete(v.tombstones, blobID)
 	v.seq++
 	e.changeSeq = v.seq
 	return e.version, nil
 }
 
 // ChangedSince returns up to limit SyncMeta with change-sequence > cursor, ordered
-// by sequence, plus the new cursor.
+// by sequence, plus the new cursor. The window is selected over ALL entries (live
+// + reclaimed) so the cursor advances across reclaimed records; only live entries
+// are emitted — a reclaimed uuid is manifest-absent (§11.3), never a size-0 meta.
+// Filtering the window itself instead would stall the cursor below the reclaim
+// floor whenever the highest sequences are reclaimed → every later incremental
+// pull 410s (an unbreakable reconcile loop).
 func (m *MemStore) ChangedSince(account ids.AccountNumberHash, cursor uint64, limit int) ([]SyncMeta, uint64) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -177,7 +188,8 @@ func (m *MemStore) ChangedSince(account ids.AccountNumberHash, cursor uint64, li
 	if v == nil {
 		return nil, cursor
 	}
-	// Collect blobs with changeSeq > cursor.
+	// Collect blobs with changeSeq > cursor (reclaimed included: they occupy
+	// window slots so the cursor moves over them; a page may be empty).
 	type item struct {
 		id ids.BlobID
 		e  *blobEntry
@@ -195,6 +207,12 @@ func (m *MemStore) ChangedSince(account ids.AccountNumberHash, cursor uint64, li
 	newCursor := cursor
 	out := make([]SyncMeta, 0, len(items))
 	for _, it := range items {
+		if it.e.changeSeq > newCursor {
+			newCursor = it.e.changeSeq
+		}
+		if it.e.reclaimed {
+			continue
+		}
 		out = append(out, SyncMeta{
 			BlobID:          it.id,
 			Version:         it.e.version,
@@ -202,9 +220,6 @@ func (m *MemStore) ChangedSince(account ids.AccountNumberHash, cursor uint64, li
 			Size:            it.e.size,
 			AttachmentIDHex: it.e.attachmentID,
 		})
-		if it.e.changeSeq > newCursor {
-			newCursor = it.e.changeSeq
-		}
 	}
 	return out, newCursor
 }
@@ -352,6 +367,7 @@ func (m *MemStore) ReclaimTombstone(account ids.AccountNumberHash, blobID ids.Bl
 		v.quotaBytes -= uint64(len(e.ciphertext))
 		e.ciphertext = nil
 		e.size = 0
+		e.reclaimed = true // manifest-absent from now on; GetBlob → ErrReclaimed
 	}
 	rec.reclaimed = true
 	if rec.changeSeq > v.reclaimFloor {
@@ -449,6 +465,8 @@ func bytesEqual(a, b []byte) bool {
 }
 
 // GetBlob returns the stored opaque ciphertext + version, or ErrNotFound.
+// A Layer-2 reclaimed blob returns ErrReclaimed — serving its dropped body as a
+// live empty ciphertext would let a puller overwrite real notes with 0 bytes.
 func (m *MemStore) GetBlob(account ids.AccountNumberHash, blobID ids.BlobID) ([]byte, Version, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -460,6 +478,9 @@ func (m *MemStore) GetBlob(account ids.AccountNumberHash, blobID ids.BlobID) ([]
 	e := v.blobs[blobID]
 	if e == nil {
 		return nil, 0, ErrNotFound
+	}
+	if e.reclaimed {
+		return nil, e.version, ErrReclaimed
 	}
 	out := make([]byte, len(e.ciphertext))
 	copy(out, e.ciphertext)

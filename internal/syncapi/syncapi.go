@@ -541,6 +541,14 @@ func (h *Handler) handleBlob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ct, ver, err := h.store.GetBlob(sess.Account, id)
+	// A Layer-2 reclaimed blob is fail-closed 410 (§11.3): a 200 with an empty
+	// body would read as a live zero-byte ciphertext and the puller would
+	// overwrite a real note with it. 410 (vs 404) tells the client this uuid
+	// once existed and was reclaimed — drop/quarantine, don't re-push.
+	if errors.Is(err, store.ErrReclaimed) {
+		writeErr(w, http.StatusGone, "blob_reclaimed")
+		return
+	}
 	if errors.Is(err, store.ErrNotFound) {
 		writeErr(w, http.StatusNotFound, "not_found")
 		return

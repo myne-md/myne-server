@@ -160,6 +160,100 @@ func TestFSStore_ChangedSinceOrderedAndCursor(t *testing.T) {
 	}
 }
 
+// F2 parity with MemStore: reclaimed records are omitted from the metas while
+// the returned cursor advances across them.
+func TestFSStore_ChangedSinceOmitsReclaimedButAdvancesCursor(t *testing.T) {
+	s, _ := newFS(t)
+	a := acct(0x0C)
+	for i := byte(1); i <= 3; i++ {
+		if _, err := s.PushBlob(a, blob(i), 0, nonce(i), []byte{i}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.SetTombstone(a, blob(3), 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ReclaimTombstone(a, blob(3)); err != nil {
+		t.Fatal(err)
+	}
+	metas, cur := s.ChangedSince(a, 0, 10)
+	if len(metas) != 2 || metas[0].BlobID != blob(1) || metas[1].BlobID != blob(2) {
+		t.Fatalf("reclaimed record leaked into ChangedSince: %+v", metas)
+	}
+	if cur != 3 {
+		t.Fatalf("cursor = %d, want 3 (must advance across the reclaimed record)", cur)
+	}
+	empty, cur2 := s.ChangedSince(a, 2, 10)
+	if len(empty) != 0 || cur2 != 3 {
+		t.Fatalf("reclaimed-only window: n=%d cur=%d, want 0 metas + cursor 3", len(empty), cur2)
+	}
+}
+
+func TestFSStore_GetBlobReclaimedErr(t *testing.T) {
+	s, _ := newFS(t)
+	a, id := acct(0x0D), blob(0x0D)
+	if _, err := s.PushBlob(a, id, 0, nonce(1), []byte("body")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetTombstone(a, id, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ReclaimTombstone(a, id); err != nil {
+		t.Fatal(err)
+	}
+	_, v, err := s.GetBlob(a, id)
+	if !errors.Is(err, ErrReclaimed) {
+		t.Fatalf("reclaimed GetBlob err = %v, want ErrReclaimed (never a live empty body)", err)
+	}
+	if v != 1 {
+		t.Fatalf("reclaimed GetBlob version = %d, want 1", v)
+	}
+}
+
+// F3 + durability: the version advance clears the tombstone + reclaimed mark,
+// and the clear survives a restart (the index reload must not resurrect it).
+func TestFSStore_PushBlobClearsReclaimedAndTombstonePersisted(t *testing.T) {
+	dir := t.TempDir()
+	a, id := acct(0x0E), blob(0x0E)
+	{
+		s, err := NewFSStore(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.PushBlob(a, id, 0, nonce(1), []byte("v1")); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.SetTombstone(a, id, 1); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.ReclaimTombstone(a, id); err != nil {
+			t.Fatal(err)
+		}
+		v2, err := s.PushBlob(a, id, 1, nonce(2), []byte("v2"))
+		if err != nil || v2 != 2 {
+			t.Fatalf("resurrection push = (%d, %v)", v2, err)
+		}
+		if _, _, _, ok := s.TombstoneRecord(a, id); ok {
+			t.Fatal("tombstone record survived the version advance")
+		}
+	}
+	// Reopen — the resurrected state must reload from the persisted index.
+	s2, err := NewFSStore(dir)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	if _, _, _, ok := s2.TombstoneRecord(a, id); ok {
+		t.Fatal("tombstone record resurrected by reload")
+	}
+	if ct, v, err := s2.GetBlob(a, id); err != nil || v != 2 || !bytes.Equal(ct, []byte("v2")) {
+		t.Fatalf("resurrected blob wrong after reload: %q v=%d err=%v", ct, v, err)
+	}
+	metas, _ := s2.ChangedSince(a, 0, 10)
+	if len(metas) != 1 || metas[0].BlobID != id {
+		t.Fatalf("resurrected blob missing from the manifest after reload: %+v", metas)
+	}
+}
+
 // TestFSStore_DurabilityReload is the load-bearing FS test: state written by one
 // FSStore must survive a process restart (a fresh FSStore on the same dir). This
 // is what makes backup = volume snapshot and migration = move-the-dir meaningful.

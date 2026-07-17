@@ -399,7 +399,11 @@ func (s *FSStore) PushBlob(account ids.AccountNumberHash, blobID ids.BlobID, bas
 	m.contentNonce = contentNonce
 	m.size = len(ciphertext)
 	m.version++
+	// A new content version supersedes any recorded deletion (§11.1): clear the
+	// reclaimed mark AND the tombstone record so a later GC pass cannot reclaim
+	// the resurrected body, and the record re-enters the manifest.
 	m.reclaimed = false
+	delete(v.tombstones, blobID)
 	v.seq++
 	m.changeSeq = v.seq
 	if err := s.persist(account, v); err != nil {
@@ -418,6 +422,12 @@ func (s *FSStore) GetBlob(account ids.AccountNumberHash, blobID ids.BlobID) ([]b
 	m := v.blobs[blobID]
 	if m == nil {
 		return nil, 0, ErrNotFound
+	}
+	// A Layer-2 reclaimed blob's body is gone from disk; ErrReclaimed keeps it
+	// from reading as a live empty ciphertext (a puller would write 0 bytes
+	// over a real note).
+	if m.reclaimed {
+		return nil, m.version, ErrReclaimed
 	}
 	return s.readBody(account, blobID), m.version, nil
 }
@@ -505,6 +515,11 @@ func (s *FSStore) QuotaBytes(account ids.AccountNumberHash) uint64 {
 	return 0
 }
 
+// ChangedSince selects its window over ALL entries (live + reclaimed) so the
+// cursor advances across reclaimed records, then emits only live ones — a
+// reclaimed uuid is manifest-absent (§11.3), never a size-0 meta. See the
+// MemStore counterpart for why filtering the window instead wedges the cursor
+// below the reclaim floor.
 func (s *FSStore) ChangedSince(account ids.AccountNumberHash, cursor uint64, limit int) ([]SyncMeta, uint64) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -529,10 +544,13 @@ func (s *FSStore) ChangedSince(account ids.AccountNumberHash, cursor uint64, lim
 	newCursor := cursor
 	out := make([]SyncMeta, 0, len(items))
 	for _, it := range items {
-		out = append(out, SyncMeta{BlobID: it.id, Version: it.m.version, ContentNonce: it.m.contentNonce, Size: it.m.size, AttachmentIDHex: it.m.attachmentID})
 		if it.m.changeSeq > newCursor {
 			newCursor = it.m.changeSeq
 		}
+		if it.m.reclaimed {
+			continue
+		}
+		out = append(out, SyncMeta{BlobID: it.id, Version: it.m.version, ContentNonce: it.m.contentNonce, Size: it.m.size, AttachmentIDHex: it.m.attachmentID})
 	}
 	return out, newCursor
 }

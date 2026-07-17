@@ -110,6 +110,37 @@ func TestHorizonGC_SoftRetiresPastHorizonDevice(t *testing.T) {
 	}
 }
 
+// F3 at the GC layer: a blob resurrected by a post-tombstone version advance
+// must never be reclaimed by a later pass — the push cleared the tombstone
+// record, so even a fully-acked sweep has nothing to act on.
+func TestHorizonGC_ResurrectedBlobNotReclaimed(t *testing.T) {
+	st := store.NewMemStore()
+	reg := auth.NewRegistry()
+	ts := auth.NewTokenStore(reg)
+	a := acct(5)
+	d1 := dev(1)
+	enrollDev(t, reg, ts, a, d1)
+	reg.TouchActivity(a, d1, 100)
+
+	if _, err := st.PushBlob(a, blob(1), 0, nonce(1), []byte("v1")); err != nil {
+		t.Fatal(err)
+	}
+	_ = st.SetTombstone(a, blob(1), 1)
+	// Resurrection: a legitimate conflict push advances the version (seq 2).
+	if _, err := st.PushBlob(a, blob(1), 1, nonce(2), []byte("v2")); err != nil {
+		t.Fatal(err)
+	}
+	st.AckCursor(a, d1, 2) // fully acked — the ack gate would NOT protect it
+
+	g := NewHorizonGC(st, reg, DefaultPolicy())
+	if rec, _ := g.Run(a, 100); rec != 0 {
+		t.Fatalf("reclaimed %d, want 0 (tombstone cleared by the version advance)", rec)
+	}
+	if ct, v, err := st.GetBlob(a, blob(1)); err != nil || v != 2 || string(ct) != "v2" {
+		t.Fatalf("resurrected body damaged: %q v=%d err=%v", ct, v, err)
+	}
+}
+
 func TestPolicy_HorizonFloor(t *testing.T) {
 	p := Policy{HorizonMarkers: 5}.Clamp()
 	if p.HorizonMarkers != MinHorizonMarkers {
