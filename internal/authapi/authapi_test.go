@@ -261,6 +261,51 @@ func TestDevices_ListAndRevoke(t *testing.T) {
 	}
 }
 
+// The wire half of MYND-574 task 94: a revoked device's 401 carries
+// `device_revoked`, and an unknown token's 401 carries `unauthenticated`. Same
+// status, two codes — and the pair is the test, because a server that answered
+// `device_revoked` to everything would pass either assertion alone while making
+// a web client erase its local copy on any stale token.
+func TestDevices_RevokedTokenGetsDeviceRevokedCode(t *testing.T) {
+	c := newEnv(t)
+	c.register(t)
+	tok := c.scramEnroll(t, devID(0x01), "password").TokenHex
+
+	rresp, rbody := postJSON(t, c.srv.URL+"/auth/devices/revoke", tok, deviceActionReq{
+		DeviceIDHex: devHex(0x01),
+	})
+	if rresp.StatusCode != 200 {
+		t.Fatalf("revoke status %d: %s", rresp.StatusCode, rbody)
+	}
+
+	codeFor := func(bearer string) (int, string) {
+		req, _ := http.NewRequest(http.MethodGet, c.srv.URL+"/auth/devices", nil)
+		req.Header.Set("Authorization", "Bearer "+bearer)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var eb struct {
+			ErrorCode string `json:"error_code"`
+		}
+		_ = json.NewDecoder(resp.Body).Decode(&eb)
+		return resp.StatusCode, eb.ErrorCode
+	}
+
+	status, code := codeFor(tok)
+	if status != http.StatusUnauthorized || code != "device_revoked" {
+		t.Fatalf("revoked device: want 401 device_revoked, got %d %q", status, code)
+	}
+
+	// A token this server never issued must NOT be reported as revoked — it has
+	// no idea, and guessing is what would make the code destructive.
+	status, code = codeFor("ab" + tok[2:])
+	if status != http.StatusUnauthorized || code != "unauthenticated" {
+		t.Fatalf("unknown token: want 401 unauthenticated, got %d %q", status, code)
+	}
+}
+
 func TestRegister_DuplicateRejected(t *testing.T) {
 	c := newEnv(t)
 	c.register(t)

@@ -39,6 +39,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -99,6 +100,12 @@ type Handler struct {
 	maxHandshakes int
 	hsTTL         time.Duration
 	now           func() time.Time
+
+	// requireChannelBinding, when non-nil, is asked whether an account refuses
+	// unbound sessions (MYND-577's per-account opt-out). nil = no account
+	// refuses, which is the shipped behaviour; the hook exists so the opt-out
+	// lands without a schema or wire change.
+	requireChannelBinding func(ids.AccountNumberHash) bool
 
 	// serverCbind is the channel-binding data the server expects in client-final
 	// (the TLS exporter in production; empty over loopback http — R3 wiring).
@@ -167,6 +174,15 @@ func New(reg *auth.Registry, tokens *auth.TokenStore) *Handler {
 }
 
 // WithPreAuthLimiter attaches the global pre-auth rate bucket (nil = disabled).
+// WithRequireChannelBinding installs the per-account "bound sessions only"
+// predicate (MYND-577). Unwired today; the seam exists so the opt-out can land
+// without a schema or wire change. An account that returns true refuses the
+// unbound gs2 form, which is how it refuses browser access.
+func (h *Handler) WithRequireChannelBinding(p func(ids.AccountNumberHash) bool) *Handler {
+	h.requireChannelBinding = p
+	return h
+}
+
 func (h *Handler) WithPreAuthLimiter(g PreAuthLimiter) *Handler {
 	h.preAuth = g
 	return h
@@ -337,13 +353,48 @@ type scramInitResp struct {
 // and never mismatches a client that also sends empty. TLS < 1.3 falls back to
 // empty on purpose: the exporter's absent-vs-empty-context forms only agree
 // cross-impl under TLS 1.3.
-func (h *Handler) requestCbind(r *http.Request) []byte {
-	if r.TLS != nil && r.TLS.Version >= tls.VersionTLS13 {
-		if ekm, err := r.TLS.ExportKeyingMaterial(scram.ExporterLabel, nil, scram.ExporterLen); err == nil {
-			return ekm
+func (h *Handler) requestCbind(r *http.Request) ([]byte, error) {
+	if r.TLS != nil {
+		if r.TLS.Version < tls.VersionTLS13 {
+			// Real TLS, but below 1.3. The exporter's absent-vs-empty-context
+			// forms only agree cross-implementation under 1.3, so there is no
+			// binding we can compute correctly here — and falling back to EMPTY
+			// would silently bind a real-TLS session to nothing while the client
+			// believed it was bound. Refuse instead (MYND-574 task 36).
+			return nil, errNoChannelBinding
 		}
+		ekm, err := r.TLS.ExportKeyingMaterial(scram.ExporterLabel, nil, scram.ExporterLen)
+		if err != nil {
+			// Same reasoning: over real TLS, an unavailable exporter is a
+			// failure, never a silent downgrade to empty.
+			return nil, errNoChannelBinding
+		}
+		return ekm, nil
 	}
-	return h.serverCbind
+	// No application-terminated TLS: a proxy terminated it, or this is loopback.
+	// The application genuinely has no exporter, so it binds to the empty
+	// `serverCbind` — and, because it advertises no channel binding, it also
+	// accepts the honest unbound gs2 form (`n,,`) that a browser must send.
+	return h.serverCbind, nil
+}
+
+// errNoChannelBinding is returned when the server terminates TLS but cannot
+// produce a tls-exporter. It is never surfaced to the client as a distinct
+// status — the handler answers the same 401 as any other auth failure — so it
+// leaks no configuration detail.
+var errNoChannelBinding = errors.New("authapi: no channel binding available over terminated TLS")
+
+// allowUnbound reports whether this request may authenticate with the unbound
+// gs2 form. True exactly when the server advertises NO channel binding: if it
+// advertised `tls-exporter`, accepting `n,,` would let an attacker who strips
+// the advertisement talk a bindable client out of binding.
+//
+// A browser is permanently in the unbound class — no browser exposes
+// TLS-exporter keying material to page JavaScript — which is why the web client
+// is only reachable through a deployment that does not app-terminate TLS, and
+// why `threat-model.md` A4 is ⚠️ Best-effort on web rather than 🔒 Mitigated.
+func (h *Handler) allowUnbound(r *http.Request) bool {
+	return !h.usesTLSExporter(r)
 }
 
 // usesTLSExporter reports whether this request will bind to a real tls-exporter
@@ -492,9 +543,24 @@ func (h *Handler) handleScramFinal(w http.ResponseWriter, r *http.Request) {
 	// F5: bind to THIS request's tls-exporter (app-terminated TLS 1.3) or the empty
 	// h.serverCbind fallback. The client-final's connection is the one the exporter
 	// is computed over on both ends, so init's connection is irrelevant to the bind.
-	serverSig, err := scram.VerifyClientFinal(
-		sc.cred, hs.username, hs.clientNonce, hs.combinedNonce, h.requestCbind(r), req.ClientFinal,
+	cbind, cbErr := h.requestCbind(r)
+	if cbErr != nil {
+		// Terminated TLS with no usable exporter: refuse rather than bind to
+		// empty. Same 401 as any other failure — no enumeration signal.
+		delete(h.hs, req.HandshakeID)
+		writeErr(w, http.StatusUnauthorized, "unauthenticated")
+		return
+	}
+	serverSig, bound, err := scram.VerifyClientFinalWithPolicy(
+		sc.cred, hs.username, hs.clientNonce, hs.combinedNonce, cbind, h.allowUnbound(r), req.ClientFinal,
 	)
+	if err == nil && !bound && h.requireChannelBinding != nil && h.requireChannelBinding(hs.account) {
+		// Per-account opt-out seam (MYND-577): an account that has declared
+		// "bound sessions only" refuses an unbound one here. nil hook = feature
+		// absent, which is today's state; wiring it later needs no schema change
+		// and no wire change.
+		err = scram.ErrChannelBindMismatch
+	}
 	if err != nil {
 		// One-shot handshake: a failed proof burns it (no online guessing reuse).
 		delete(h.hs, req.HandshakeID)
@@ -559,6 +625,26 @@ func (h *Handler) handleScramFinal(w http.ResponseWriter, r *http.Request) {
 
 // --- authed device management ---
 
+// sessionWithCode is session() plus the reason it failed. `session` stays as the
+// boolean form for the call sites that genuinely do not care, so this addition
+// cannot change any of their behaviour by accident.
+func (h *Handler) sessionWithCode(r *http.Request) (auth.Session, string) {
+	authz := r.Header.Get("Authorization")
+	const pfx = "Bearer "
+	if !strings.HasPrefix(authz, pfx) {
+		return auth.Session{}, "unauthenticated"
+	}
+	tok, err := hex.DecodeString(strings.TrimPrefix(authz, pfx))
+	if err != nil {
+		return auth.Session{}, "unauthenticated"
+	}
+	sess, err := h.tokens.AuthenticateSession(ids.DeviceToken(tok))
+	if err != nil {
+		return auth.Session{}, auth.FailureCode(err)
+	}
+	return sess, ""
+}
+
 func (h *Handler) session(r *http.Request) (auth.Session, bool) {
 	const pfx = "Bearer "
 	authz := r.Header.Get("Authorization")
@@ -587,9 +673,9 @@ func (h *Handler) handleDevices(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusMethodNotAllowed, "bad_request")
 		return
 	}
-	sess, ok := h.session(r)
-	if !ok {
-		writeErr(w, http.StatusUnauthorized, "unauthenticated")
+	sess, authCode := h.sessionWithCode(r)
+	if authCode != "" {
+		writeErr(w, http.StatusUnauthorized, authCode)
 		return
 	}
 	recs := h.reg.List(sess.Account)
@@ -613,9 +699,9 @@ func (h *Handler) handleApprove(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusMethodNotAllowed, "bad_request")
 		return
 	}
-	sess, ok := h.session(r)
-	if !ok {
-		writeErr(w, http.StatusUnauthorized, "unauthenticated")
+	sess, authCode := h.sessionWithCode(r)
+	if authCode != "" {
+		writeErr(w, http.StatusUnauthorized, authCode)
 		return
 	}
 	var req deviceActionReq
@@ -643,9 +729,9 @@ func (h *Handler) handleRevoke(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusMethodNotAllowed, "bad_request")
 		return
 	}
-	sess, ok := h.session(r)
-	if !ok {
-		writeErr(w, http.StatusUnauthorized, "unauthenticated")
+	sess, authCode := h.sessionWithCode(r)
+	if authCode != "" {
+		writeErr(w, http.StatusUnauthorized, authCode)
 		return
 	}
 	var req deviceActionReq
@@ -658,12 +744,15 @@ func (h *Handler) handleRevoke(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "bad_request")
 		return
 	}
-	// Revoke the token (availability — sync stops to that device) + retire the
-	// registry record. device_id is NOT destroyed (SYNC-2: revoking the token
+	// Retiring the registry record IS the revocation: AuthenticateSession reads
+	// that row on every request and fail-closes on it. The token binding is left
+	// in place on purpose (MYND-574 task 94) — it is what lets the revoked
+	// device's next request be answered `device_revoked` rather than
+	// `unauthenticated`, which is the difference between "sign in again" and "the
+	// account owner removed you". device_id is NOT destroyed (SYNC-2: revoking
 	// never touches device_id).
 	var doSave bool
 	defer h.maybeSave(&doSave)
-	h.tokens.RevokeDevice(sess.Account, device)
 	_ = h.reg.Retire(sess.Account, device)
 	doSave = true
 	writeJSON(w, map[string]bool{"ok": true})

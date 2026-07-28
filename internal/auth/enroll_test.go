@@ -107,6 +107,10 @@ func TestTokens_RevokeStopsAuthButKeepsDeviceID(t *testing.T) {
 	}
 }
 
+// A retired device's token is REJECTED, and since MYND-574 task 94 it is
+// rejected with its own error. Both halves are asserted: the rejection is the
+// security property (it must never fail open), and the specific error is what a
+// client needs in order to tell a deliberate removal from an expired session.
 func TestTokens_RetiredDeviceTokenRejected(t *testing.T) {
 	reg, ts, en := newEnroll()
 	a, d := acct(5), dev(1)
@@ -115,8 +119,57 @@ func TestTokens_RetiredDeviceTokenRejected(t *testing.T) {
 	if err := reg.Retire(a, d); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ts.Authenticate(res.Token); !errors.Is(err, ErrUnauthenticated) {
-		t.Fatalf("retired device token still valid: %v", err)
+	_, err := ts.Authenticate(res.Token)
+	if err == nil {
+		t.Fatal("retired device token still valid")
+	}
+	if !errors.Is(err, ErrDeviceRevoked) {
+		t.Fatalf("want ErrDeviceRevoked, got %v", err)
+	}
+}
+
+// The pairing that gives the code its meaning: an UNRESOLVABLE token stays
+// `ErrUnauthenticated`. The server genuinely does not know whether it was
+// revoked, expired, or never existed — and claiming "revoked" from a guess would
+// make a web client erase its local copy on any stale token. It is also what
+// keeps the code from being a device-enumeration oracle: only the holder of a
+// token this server issued can ever see it.
+func TestTokens_UnknownTokenIsUnauthenticatedNotRevoked(t *testing.T) {
+	_, ts, _ := newEnroll()
+	var bogus ids.DeviceToken = make([]byte, TokenLen)
+	bogus[0] = 0xAB
+	_, err := ts.Authenticate(bogus)
+	if !errors.Is(err, ErrUnauthenticated) {
+		t.Fatalf("want ErrUnauthenticated for an unknown token, got %v", err)
+	}
+	if errors.Is(err, ErrDeviceRevoked) {
+		t.Fatal("an unknown token must never be reported as revoked")
+	}
+}
+
+// Revocation must survive a restart AS revocation (task 94).
+//
+// The code is reachable only because a retired device's token binding is kept
+// rather than deleted. That retention has to hold through persistence too: a
+// snapshot that pruned bindings for retired devices — an obviously reasonable
+// tidy-up — would leave auth still failing closed while silently downgrading the
+// answer to `unauthenticated` on the next boot. Nothing else would notice, which
+// is exactly why it is pinned here rather than left to the shape of the code.
+func TestTokens_RevocationSurvivesAPersistenceRoundTrip(t *testing.T) {
+	reg, ts, en := newEnroll()
+	a, d := acct(7), dev(1)
+	res, _ := en.Enroll(a, d, PathPassword)
+	if err := reg.Retire(a, d); err != nil {
+		t.Fatal(err)
+	}
+
+	reg2 := NewRegistry()
+	reg2.LoadDevices(reg.DeviceSnapshot())
+	ts2 := NewTokenStore(reg2)
+	ts2.LoadTokens(ts.TokenSnapshot())
+
+	if _, err := ts2.Authenticate(res.Token); !errors.Is(err, ErrDeviceRevoked) {
+		t.Fatalf("want ErrDeviceRevoked after a restart, got %v", err)
 	}
 }
 

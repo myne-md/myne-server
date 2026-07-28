@@ -5,6 +5,7 @@ package attachments
 import (
 	"bytes"
 	"encoding/hex"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -109,6 +110,62 @@ func TestAttachment_Unauthenticated(t *testing.T) {
 	id := strings.Repeat("ef", 32)
 	if resp, _ := req(t, srv, http.MethodGet, "/attachments/"+id, "", "", nil); resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("unauth GET status %d, want 401", resp.StatusCode)
+	}
+}
+
+// The attachment routes are authed routes, so `server-protocol.md` §3.1's
+// `device_revoked` MUST applies to them too (MYND-574 task 94).
+//
+// The pair is the test. A revoked device must hear `device_revoked` on EVERY
+// authed route, not just whichever one it happened to call first — a client whose
+// sync route says "you were removed" while its attachment route says "sign in
+// again" acts on whichever answer arrived, which is a race. And an unknown token
+// must still hear `unauthenticated`, because a web client treats the revoked code
+// as terminal and erases its local copy: answering it on a guess is destructive.
+func TestAttachment_RevokedDeviceGetsDeviceRevokedCode(t *testing.T) {
+	st := NewStore()
+	reg := auth.NewRegistry()
+	ts := auth.NewTokenStore(reg)
+	en := auth.NewEnrollment(reg, ts)
+	var a ids.AccountNumberHash
+	a[0] = 0x42
+	var d ids.DeviceID
+	d[0] = 1
+	res, err := en.Enroll(a, d, auth.PathPassword)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	New(st, ts).Register(mux)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	token := hex.EncodeToString(res.Token)
+	id := strings.Repeat("cd", 32)
+
+	// Still enrolled: the route authenticates, so a 401 here would mean the test
+	// is measuring the wrong thing.
+	if resp, _ := req(t, srv, http.MethodGet, "/attachments/"+id, token, "", nil); resp.StatusCode == http.StatusUnauthorized {
+		t.Fatal("live token rejected before the device was revoked")
+	}
+
+	if err := reg.Retire(a, d); err != nil {
+		t.Fatal(err)
+	}
+
+	codeFor := func(bearer string) (int, string) {
+		resp, body := req(t, srv, http.MethodGet, "/attachments/"+id, bearer, "", nil)
+		var eb struct {
+			ErrorCode string `json:"error_code"`
+		}
+		_ = json.Unmarshal(body, &eb)
+		return resp.StatusCode, eb.ErrorCode
+	}
+
+	if status, code := codeFor(token); status != http.StatusUnauthorized || code != "device_revoked" {
+		t.Fatalf("revoked device: want 401 device_revoked, got %d %q", status, code)
+	}
+	if status, code := codeFor("ab" + token[2:]); status != http.StatusUnauthorized || code != "unauthenticated" {
+		t.Fatalf("unknown token: want 401 unauthenticated, got %d %q", status, code)
 	}
 }
 

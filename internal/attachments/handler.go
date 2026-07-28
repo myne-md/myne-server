@@ -73,21 +73,43 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("PUT /attachments/{id}", h.handlePut)
 }
 
-func (h *Handler) session(r *http.Request) (auth.Session, bool) {
+// session extracts + validates the bearer token, returning the bound session and
+// — when it fails — the wire `error_code` the 401 must carry.
+//
+// The code is returned rather than folded into a bool because
+// `server-protocol.md` §3.1 makes `device_revoked` a MUST on **every** authed
+// route, and these three are authed. A client whose sync routes learn it was
+// revoked while its attachment routes keep saying `unauthenticated` would see
+// the terminal signal only on whichever request happened to land first — which
+// is a race, not a policy.
+func (h *Handler) session(r *http.Request) (auth.Session, string) {
 	const pfx = "Bearer "
 	authz := r.Header.Get("Authorization")
 	if !strings.HasPrefix(authz, pfx) {
-		return auth.Session{}, false
+		return auth.Session{}, "unauthenticated"
 	}
 	tok, err := hex.DecodeString(strings.TrimPrefix(authz, pfx))
 	if err != nil {
-		return auth.Session{}, false
+		return auth.Session{}, "unauthenticated"
 	}
 	sess, err := h.auth.AuthenticateSession(ids.DeviceToken(tok))
 	if err != nil {
-		return auth.Session{}, false
+		return auth.Session{}, auth.FailureCode(err)
 	}
-	return sess, true
+	return sess, ""
+}
+
+// writeAuthErr answers an authentication failure on the attachment routes.
+//
+// These routes otherwise answer with a bare status and no body — they move
+// opaque ciphertext, and there is nothing to say about a bad range or a missing
+// id that the status does not already say. The 401 is the exception, because the
+// code IS the message: it is the only way the client can tell a stale session
+// from a removal it must honour.
+func writeAuthErr(w http.ResponseWriter, code string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusUnauthorized)
+	_, _ = fmt.Fprintf(w, `{"error_code":%q}`, code)
 }
 
 // ParseID decodes a lowercase-hex 32-byte attachment-id. Exported for the
@@ -105,9 +127,9 @@ func ParseID(s string) (AttachmentID, bool) {
 // handleHead reports the current uploaded length + completeness — the resume +
 // dedup probe. 200 with X-Uploaded-Length / X-Complete if known; 404 if unknown.
 func (h *Handler) handleHead(w http.ResponseWriter, r *http.Request) {
-	sess, ok := h.session(r)
-	if !ok {
-		w.WriteHeader(http.StatusUnauthorized)
+	sess, authCode := h.session(r)
+	if authCode != "" {
+		writeAuthErr(w, authCode)
 		return
 	}
 	if h.rl != nil && !h.rl.Allow(sess.Account) {
@@ -135,9 +157,9 @@ func (h *Handler) handleHead(w http.ResponseWriter, r *http.Request) {
 // length) declaring ?total=M. Opaque ciphertext only; the AEAD is never chunked —
 // these are transport ranges over one atomic blob.
 func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request) {
-	sess, ok := h.session(r)
-	if !ok {
-		w.WriteHeader(http.StatusUnauthorized)
+	sess, authCode := h.session(r)
+	if authCode != "" {
+		writeAuthErr(w, authCode)
 		return
 	}
 	if h.rl != nil && !h.rl.Allow(sess.Account) {
@@ -204,9 +226,9 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request) {
 // (206) or the whole blob (200). Bytes are opaque ciphertext; the client verifies
 // the whole-blob tag after reassembly and re-fetches on failure.
 func (h *Handler) handleGet(w http.ResponseWriter, r *http.Request) {
-	sess, ok := h.session(r)
-	if !ok {
-		w.WriteHeader(http.StatusUnauthorized)
+	sess, authCode := h.session(r)
+	if authCode != "" {
+		writeAuthErr(w, authCode)
 		return
 	}
 	if h.rl != nil && !h.rl.Allow(sess.Account) {

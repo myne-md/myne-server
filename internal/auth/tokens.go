@@ -4,7 +4,6 @@ package auth
 
 import (
 	"crypto/rand"
-	"crypto/subtle"
 	"encoding/hex"
 	"sync"
 
@@ -82,8 +81,16 @@ func (s *TokenStore) AuthenticateSession(token ids.DeviceToken) (Session, error)
 	// token whose device record is absent (a torn/partial load) must NOT authenticate
 	// — reject when the device is missing OR retired (fail-closed, not fail-open).
 	rec, found := s.registry.Get(b.account, b.device)
-	if !found || rec.Retired {
+	if !found {
 		return Session{}, ErrUnauthenticated
+	}
+	// A KNOWN but retired row is the one case this server can speak to with
+	// certainty: it issued the token, it holds the registry record, and that
+	// record says the account owner removed this device. Everything else stays
+	// ErrUnauthenticated — see that error's doc for why the distinction is not
+	// cosmetic. Both still reject; only the reason differs.
+	if rec.Retired {
+		return Session{}, ErrDeviceRevoked
 	}
 	return Session{Account: b.account, Device: b.device}, nil
 }
@@ -96,22 +103,28 @@ func (s *TokenStore) Revoke(token ids.DeviceToken) {
 	s.mu.Unlock()
 }
 
-// RevokeDevice invalidates every token bound to a device (used by "Remove device"
-// + MYND-422 soft-retire). Availability-only: it stops that device's sync; it is
-// not a cryptographic lock (v0.1 has no forward secrecy).
-func (s *TokenStore) RevokeDevice(account ids.AccountNumberHash, dev ids.DeviceID) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for k, b := range s.byToken {
-		if b.account == account && subtleEqualDevice(b.device, dev) {
-			delete(s.byToken, k)
-		}
-	}
-}
-
-func subtleEqualDevice(a, b ids.DeviceID) bool {
-	return subtle.ConstantTimeCompare(a[:], b[:]) == 1
-}
+// There is deliberately no `RevokeDevice` (MYND-574 task 94).
+//
+// There used to be: it deleted every token binding for a device, and "Remove
+// device" called it alongside `Registry.Retire`. The deletion is what made the
+// honest `device_revoked` answer unreachable — a revoked device's next request
+// arrived carrying a token the map no longer held, so the server could not tell
+// it from a token it had never issued, and answered `unauthenticated` to both.
+// The removal path retired the registry row and then threw away the only thing
+// that could point at it.
+//
+// **The registry row IS the revocation**, and AuthenticateSession reads it on
+// every request. Retiring the row was already the load-bearing check (a torn
+// persistence load must not fail OPEN), so nothing about the security property
+// changes; a second mechanism that only removed the server's ability to explain
+// itself was subtraction wearing the name of a control. What the retained
+// binding costs is a dead map entry per revoked device; what it buys is that the
+// device can be TOLD.
+//
+// A method named for revoking that no longer revoked anything would be worse
+// than none: the next reader either deletes it or reimplements the deletion, and
+// the reimplementation is silent — auth keeps failing closed, only the wire code
+// regresses. So the callers call `Registry.Retire` and nothing else.
 
 // DeleteAccountTokens revokes every device token for an account (MYND-506, the
 // operator/self-service deletion path). Idempotent on a missing account.

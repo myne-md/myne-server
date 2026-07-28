@@ -63,6 +63,14 @@ type Config struct {
 	// (MYNE_ADMIN_SOCKET; "" = admin API disabled). Local-only, filesystem-permission
 	// access, no bearer secret (MYND-506). Never a TCP port / public edge.
 	AdminSocket string
+
+	// AllowedOrigins is the comma-separated CORS allowlist for the Phase 3 web
+	// client (MYNE_ALLOWED_ORIGINS; "" = CORS off = the pre-web behaviour, which
+	// is what every native-only deployment wants). Exact origins, never `*` —
+	// see internal/httpapi/cors.go. Per-deployment by necessity: the hosted app
+	// origin and each self-hoster's own origin are different strings, and TB5
+	// says both deployments run the same protocol with the same model.
+	AllowedOrigins string
 }
 
 // loadConfig reads the MYNE_* env vars and fails fast on any invalid value, so a
@@ -158,6 +166,7 @@ func loadConfig() (Config, error) {
 	cfg.BackupResticBin = envOr("MYNE_BACKUP_RESTIC_BIN", cfg.BackupResticBin)
 	cfg.BackupCacheDir = os.Getenv("MYNE_BACKUP_CACHE_DIR")
 	cfg.AdminSocket = os.Getenv("MYNE_ADMIN_SOCKET")
+	cfg.AllowedOrigins = os.Getenv("MYNE_ALLOWED_ORIGINS")
 	if cfg.BackupIntervalSeconds, err = uintEnv("MYNE_BACKUP_INTERVAL_SECONDS", cfg.BackupIntervalSeconds); err != nil {
 		return Config{}, err
 	}

@@ -249,7 +249,7 @@ func runListener(ctx context.Context, ln net.Listener) error {
 		}
 		return v
 	}
-	srv := newHTTPServer(NewServer(blobStore, tokens, authHandler, rl, qg, ready, metrics, preAuthMeta, attachStore, activityTouch, acctStore, accountStatus))
+	srv := newHTTPServer(NewServer(blobStore, tokens, authHandler, rl, qg, ready, metrics, preAuthMeta, attachStore, activityTouch, acctStore, accountStatus, cfg.AllowedOrigins))
 
 	// Aggregate-only metrics on a SEPARATE listener (SYNC-24) — never the public edge.
 	// Disabled unless MYNE_METRICS_ADDR is set; bind it to localhost/internal only.
@@ -408,7 +408,7 @@ type accountStatusView struct {
 	MaxDevices  uint64 `json:"max_devices"`
 }
 
-func NewServer(s store.BlobStore, tokens *auth.TokenStore, authHandler *authapi.Handler, rl syncapi.RateLimiter, qg *gcquota.QuotaGuard, ready *Readiness, metrics *Metrics, preAuthMeta syncapi.PreAuthLimiter, attachStore attachments.Backend, activityTouch func(ids.AccountNumberHash, ids.DeviceID), acctStore *accounts.Store, accountStatus func(ids.AccountNumberHash) any) http.Handler {
+func NewServer(s store.BlobStore, tokens *auth.TokenStore, authHandler *authapi.Handler, rl syncapi.RateLimiter, qg *gcquota.QuotaGuard, ready *Readiness, metrics *Metrics, preAuthMeta syncapi.PreAuthLimiter, attachStore attachments.Backend, activityTouch func(ids.AccountNumberHash, ids.DeviceID), acctStore *accounts.Store, accountStatus func(ids.AccountNumberHash) any, allowedOrigins string) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", healthz)
 	if ready != nil {
@@ -464,5 +464,11 @@ func NewServer(s store.BlobStore, tokens *auth.TokenStore, authHandler *authapi.
 		h = metrics.middleware(h)
 	}
 	h = accessLog(nil, h)
+	// CORS for the browser client (main repo phase3-web-client task 34) sits
+	// directly INSIDE noIP and outside everything else: preflights must be
+	// answered before any router or token check runs, because the routes the
+	// browser hits first are pre-auth ones and several do not implement OPTIONS
+	// at all. Empty allowlist = nil policy = no CORS code path.
+	h = cors(parseAllowedOrigins(allowedOrigins), h)
 	return noIP(h)
 }

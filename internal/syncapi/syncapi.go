@@ -265,9 +265,9 @@ func (h *Handler) handleAccountStatus(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusMethodNotAllowed, "bad_request")
 		return
 	}
-	sess, ok := h.session(r)
-	if !ok {
-		writeErr(w, http.StatusUnauthorized, "unauthenticated")
+	sess, authCode := h.sessionWithCode(r)
+	if authCode != "" {
+		writeErr(w, http.StatusUnauthorized, authCode)
 		return
 	}
 	if h.rl != nil && !h.rl.Allow(sess.Account) {
@@ -291,6 +291,26 @@ func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// sessionWithCode is session() plus the reason it failed. `session` stays as the
+// boolean form for the call sites that genuinely do not care, so this addition
+// cannot change any of their behaviour by accident.
+func (h *Handler) sessionWithCode(r *http.Request) (auth.Session, string) {
+	authz := r.Header.Get("Authorization")
+	const pfx = "Bearer "
+	if !strings.HasPrefix(authz, pfx) {
+		return auth.Session{}, "unauthenticated"
+	}
+	tok, err := hex.DecodeString(strings.TrimPrefix(authz, pfx))
+	if err != nil {
+		return auth.Session{}, "unauthenticated"
+	}
+	sess, err := h.auth.AuthenticateSession(ids.DeviceToken(tok))
+	if err != nil {
+		return auth.Session{}, auth.FailureCode(err)
+	}
+	return sess, ""
 }
 
 // session extracts + validates the bearer token, returning the bound session.
@@ -336,9 +356,9 @@ func (h *Handler) handlePush(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusMethodNotAllowed, "bad_request")
 		return
 	}
-	sess, ok := h.session(r)
-	if !ok {
-		writeErr(w, http.StatusUnauthorized, "unauthenticated")
+	sess, authCode := h.sessionWithCode(r)
+	if authCode != "" {
+		writeErr(w, http.StatusUnauthorized, authCode)
 		return
 	}
 	if h.rl != nil && !h.rl.Allow(sess.Account) {
@@ -460,9 +480,9 @@ func (h *Handler) handlePull(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusMethodNotAllowed, "bad_request")
 		return
 	}
-	sess, ok := h.session(r)
-	if !ok {
-		writeErr(w, http.StatusUnauthorized, "unauthenticated")
+	sess, authCode := h.sessionWithCode(r)
+	if authCode != "" {
+		writeErr(w, http.StatusUnauthorized, authCode)
 		return
 	}
 	if h.rl != nil && !h.rl.Allow(sess.Account) {
@@ -526,9 +546,9 @@ func (h *Handler) handleBlob(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusMethodNotAllowed, "bad_request")
 		return
 	}
-	sess, ok := h.session(r)
-	if !ok {
-		writeErr(w, http.StatusUnauthorized, "unauthenticated")
+	sess, authCode := h.sessionWithCode(r)
+	if authCode != "" {
+		writeErr(w, http.StatusUnauthorized, authCode)
 		return
 	}
 	if h.rl != nil && !h.rl.Allow(sess.Account) {
@@ -576,9 +596,9 @@ const MaxVaultMetaSize = 64 * 1024
 func (h *Handler) handleMeta(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodPut:
-		sess, ok := h.session(r)
-		if !ok {
-			writeErr(w, http.StatusUnauthorized, "unauthenticated")
+		sess, authCode := h.sessionWithCode(r)
+		if authCode != "" {
+			writeErr(w, http.StatusUnauthorized, authCode)
 			return
 		}
 		if h.rl != nil && !h.rl.Allow(sess.Account) {
