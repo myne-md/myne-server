@@ -186,3 +186,32 @@ func TestRegistry_TouchActivityIsMonotone(t *testing.T) {
 		t.Fatalf("LastActivity = %d, want 5 (monotone, older ignored)", rec.LastActivity)
 	}
 }
+
+// TestRegistry_ListOrderIsDeterministic pins MYND-588: List must return the
+// roster sorted by DeviceID, identically on every call. Go randomises map
+// iteration, so an unsorted List reshuffles GET /auth/devices between calls —
+// visible as rows teleporting under the cursor, and a wrong-device-removal
+// hazard on the per-row Remove button. Devices are inserted out of ID order and
+// the sorted order is asserted over many calls; without the sort at least one
+// call almost certainly diverges.
+func TestRegistry_ListOrderIsDeterministic(t *testing.T) {
+	reg := NewRegistry()
+	a := acct(7)
+	for _, b := range []byte{3, 1, 2} {
+		if err := reg.register(a, dev(b), true); err != nil {
+			t.Fatalf("register %d: %v", b, err)
+		}
+	}
+	want := []ids.DeviceID{dev(1), dev(2), dev(3)}
+	for call := 0; call < 32; call++ {
+		got := reg.List(a)
+		if len(got) != len(want) {
+			t.Fatalf("call %d: len = %d, want %d", call, len(got), len(want))
+		}
+		for i := range want {
+			if got[i].DeviceID != want[i] {
+				t.Fatalf("call %d: order[%d] = %x, want %x", call, i, got[i].DeviceID, want[i])
+			}
+		}
+	}
+}

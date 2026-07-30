@@ -3,7 +3,9 @@
 package auth
 
 import (
+	"bytes"
 	"errors"
+	"sort"
 	"sync"
 
 	"github.com/myne-md/myne-server/internal/ids"
@@ -71,14 +73,23 @@ func (r *Registry) Get(account ids.AccountNumberHash, dev ids.DeviceID) (DeviceR
 	return *rec, true
 }
 
-// List returns copies of every device record for an account.
+// List returns copies of every device record for an account, in a deterministic
+// order (MYND-588). Go randomises map iteration on every range, so without the
+// sort GET /auth/devices hands back a freshly shuffled roster on every call and
+// the device list reshuffles under the user's cursor. The sort key is the
+// immutable DeviceID bytes — a stable identity that never moves; sorting by a
+// name or last-activity would reintroduce the same class of bug (rows jumping on
+// rename / sync) in a subtler form.
 func (r *Registry) List(account ids.AccountNumberHash) []DeviceRecord {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	var out []DeviceRecord
+	out := make([]DeviceRecord, 0, len(r.accounts[account]))
 	for _, rec := range r.accounts[account] {
 		out = append(out, *rec)
 	}
+	sort.Slice(out, func(i, j int) bool {
+		return bytes.Compare(out[i].DeviceID[:], out[j].DeviceID[:]) < 0
+	})
 	return out
 }
 
