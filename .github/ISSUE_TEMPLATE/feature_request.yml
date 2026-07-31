@@ -1,0 +1,34 @@
+name: Feature request
+description: Suggest an enhancement to the sync server or its wire protocol.
+title: "[Feature]: "
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The server is TB5 — a curious or compelled operator is assumed. Proposals may not add a way for the server to learn plaintext, correlate accounts, or log client IPs persistently. See [`docs/threat-model.md`](https://github.com/myne-md/myne/blob/main/docs/threat-model.md) and the server's own `CLAUDE.md` non-negotiable commitments.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you've considered
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and this isn't a duplicate.
+          required: true
+        - label: This preserves the zero-knowledge trust boundary — no new plaintext exposure, cross-account correlation, or persistent per-IP logging.
+          required: true

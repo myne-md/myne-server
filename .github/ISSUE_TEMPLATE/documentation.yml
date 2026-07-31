@@ -1,0 +1,25 @@
+name: Documentation
+description: The server README, deployment docs, or the server-protocol spec is wrong, unclear, or missing.
+title: "[Docs]: "
+labels: [documentation]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The normative server-protocol spec lives in the main repo (`myne/docs/spec/server-protocol.md`, once written). Self-hosting and operations runbooks live in `the operations repository`.
+  - type: input
+    id: where
+    attributes:
+      label: Which document or page?
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What's wrong or missing?
+    validations:
+      required: true
+  - type: textarea
+    id: fix
+    attributes:
+      label: Suggested fix

@@ -1,0 +1,107 @@
+name: Bug report
+description: The sync server misbehaves — blob storage, conflict detection, auth, quota, or the wire protocol.
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The server is **outside the trust boundary by design** (TB5) — it stores opaque ciphertext and never sees plaintext or keys.
+
+        - **Zero-knowledge / crypto issues do not go here.** Anything where the server could learn plaintext, correlate accounts, or where hosted and self-hosted diverge in security goes to **security@myne.md** privately — see [SECURITY.md](https://github.com/myne-md/myne/blob/main/SECURITY.md).
+        - **Search first**, and never paste an account number, a token, or anything that could identify a real account.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect to happen?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. …
+        2. …
+        3. …
+    validations:
+      required: true
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: Deployment
+      description: Hosted and self-hosted share the exact same trust boundary; tell us which you hit it on.
+      options:
+        - Hosted (app.example.com / maintainer-run)
+        - Self-hosted
+    validations:
+      required: true
+  - type: input
+    id: server-version
+    attributes:
+      label: Server version / commit
+    validations:
+      required: true
+  - type: input
+    id: go-version
+    attributes:
+      label: Go version
+      placeholder: "e.g. go1.23.4"
+  - type: dropdown
+    id: run-mode
+    attributes:
+      label: How is it running?
+      options:
+        - Docker / Compose
+        - Kubernetes
+        - Bare binary (systemd)
+        - Other
+  - type: input
+    id: os
+    attributes:
+      label: Host OS / distro
+      placeholder: "e.g. Debian 12, Ubuntu 24.04, Alpine 3.20"
+  - type: dropdown
+    id: database
+    attributes:
+      label: Datastore
+      options:
+        - PostgreSQL
+        - SQLite
+        - Other
+        - Not sure / not applicable
+  - type: dropdown
+    id: proxy
+    attributes:
+      label: Reverse proxy / TLS terminator
+      options:
+        - nginx
+        - Caddy
+        - Traefik
+        - None (direct)
+        - Other
+  - type: input
+    id: resources
+    attributes:
+      label: Resources & scale
+      placeholder: "e.g. 2 vCPU / 2 GiB RAM, ~50 accounts, ~5k blobs"
+  - type: textarea
+    id: logs
+    attributes:
+      label: Server logs
+      description: Redact secrets. Note that per-IP logging is a project anti-feature — please don't paste client IPs.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and this isn't a duplicate.
+          required: true
+        - label: This is not a zero-knowledge / crypto vulnerability (those go privately to security@myne.md).
+          required: true
