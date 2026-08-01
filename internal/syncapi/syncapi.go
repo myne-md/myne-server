@@ -256,6 +256,12 @@ type errBody struct {
 	ErrorCode string `json:"error_code"`
 }
 
+// errPushHandled ends handlePush's store batch from inside the closure after the
+// closure has already written the client's response (400/409/413/507/500). It never
+// reaches the client — it only tells the code after the batch that the response is
+// written, so it cannot double-write one. Not an errors.Is target for callers.
+var errPushHandled = errors.New("syncapi: push response already written")
+
 // handleAccountStatus serves GET /account/status: the caller's own enforcement-state
 // projection (MYND-506). The account is resolved from the DEVICE TOKEN — never from
 // the URL or query, so the account number never appears in a request line or log. An
@@ -379,94 +385,115 @@ func (h *Handler) handlePush(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Blobs-first: store each content-addressed blob under CAS (SYNC-5).
-	results := make([]pushResult, 0, len(req.Blobs))
-	for _, b := range req.Blobs {
-		id, idOK := parseBlobID(b.BlobIDHex)
-		nonce, nOK := parseNonce(b.ContentNonce)
-		ct, err := base64.StdEncoding.DecodeString(b.CiphertextB64)
-		if !idOK || !nOK || err != nil {
-			writeErr(w, http.StatusBadRequest, "bad_request")
-			return
-		}
-		// An attachment record (MYND-468): validate the full id and its prefix
-		// relation to the record key BEFORE storing anything.
-		var attID [32]byte
-		isAttachment := b.AttachmentIDHex != ""
-		if isAttachment {
-			ab, aerr := hex.DecodeString(b.AttachmentIDHex)
-			if aerr != nil || len(ab) != 32 {
+	// Every mutation this request performs runs inside ONE store batch, so a
+	// backend that writes per-vault bookkeeping per mutation writes it once for
+	// the whole request instead of once per blob (myne-server#6: a 50k-blob push
+	// was quadratic and never returned). Semantics are unchanged — the batch is a
+	// durability-granularity scope, not a transaction, so the CAS abort below
+	// still leaves the already-stored prefix stored.
+	var resp pushResp
+	berr := h.store.Batch(sess.Account, func() error {
+		// Blobs-first: store each content-addressed blob under CAS (SYNC-5).
+		results := make([]pushResult, 0, len(req.Blobs))
+		for _, b := range req.Blobs {
+			id, idOK := parseBlobID(b.BlobIDHex)
+			nonce, nOK := parseNonce(b.ContentNonce)
+			ct, err := base64.StdEncoding.DecodeString(b.CiphertextB64)
+			if !idOK || !nOK || err != nil {
 				writeErr(w, http.StatusBadRequest, "bad_request")
-				return
+				return errPushHandled
 			}
-			copy(attID[:], ab)
-			if string(attID[:ids.BlobIDLen]) != string(id[:]) {
-				// The record key MUST be the id's first 16 bytes (§4.2 pin).
-				writeErr(w, http.StatusBadRequest, "bad_request")
-				return
+			// An attachment record (MYND-468): validate the full id and its prefix
+			// relation to the record key BEFORE storing anything.
+			var attID [32]byte
+			isAttachment := b.AttachmentIDHex != ""
+			if isAttachment {
+				ab, aerr := hex.DecodeString(b.AttachmentIDHex)
+				if aerr != nil || len(ab) != 32 {
+					writeErr(w, http.StatusBadRequest, "bad_request")
+					return errPushHandled
+				}
+				copy(attID[:], ab)
+				if string(attID[:ids.BlobIDLen]) != string(id[:]) {
+					// The record key MUST be the id's first 16 bytes (§4.2 pin).
+					writeErr(w, http.StatusBadRequest, "bad_request")
+					return errPushHandled
+				}
 			}
-		}
-		if len(ct) > MaxBlobSize {
-			writeErr(w, http.StatusRequestEntityTooLarge, "too_large")
-			return
-		}
-		if h.qg != nil && h.qg.WouldExceed(h.store, sess.Account, uint64(len(ct))) {
-			writeErr(w, http.StatusInsufficientStorage, "quota")
-			return
-		}
-		ver, perr := h.store.PushBlob(sess.Account, id, store.Version(b.BaseVersion), nonce, ct)
-		if errors.Is(perr, store.ErrBlobCASMismatch) {
-			writeErr(w, http.StatusConflict, "blob_stale")
-			return
-		}
-		if perr != nil {
-			writeErr(w, http.StatusInternalServerError, "internal")
-			return
-		}
-		if h.onStored != nil {
-			h.onStored(len(ct)) // aggregate metric only — no account/IP (MYND-440)
-		}
-		if isAttachment {
-			// Persist the prefix→full-id association: pull echoes it, GC bridges it.
-			_ = h.store.SetBlobAttachmentID(sess.Account, id, b.AttachmentIDHex)
-		}
-		if b.Tombstone {
-			// Record the (uuid, final_version, marker) for horizon-GC (MYND-422).
-			_ = h.store.SetTombstone(sess.Account, id, ver)
-			if isAttachment && h.attachmentDeleter != nil {
-				// §11.4 step 2: the stored attachment BODY reads as absent from
-				// now on; physical reclaim rides the record's horizon-GC.
-				h.attachmentDeleter(sess.Account, attID)
+			if len(ct) > MaxBlobSize {
+				writeErr(w, http.StatusRequestEntityTooLarge, "too_large")
+				return errPushHandled
 			}
+			if h.qg != nil && h.qg.WouldExceed(h.store, sess.Account, uint64(len(ct))) {
+				writeErr(w, http.StatusInsufficientStorage, "quota")
+				return errPushHandled
+			}
+			ver, perr := h.store.PushBlob(sess.Account, id, store.Version(b.BaseVersion), nonce, ct)
+			if errors.Is(perr, store.ErrBlobCASMismatch) {
+				writeErr(w, http.StatusConflict, "blob_stale")
+				return errPushHandled
+			}
+			if perr != nil {
+				writeErr(w, http.StatusInternalServerError, "internal")
+				return errPushHandled
+			}
+			if h.onStored != nil {
+				h.onStored(len(ct)) // aggregate metric only — no account/IP (MYND-440)
+			}
+			if isAttachment {
+				// Persist the prefix→full-id association: pull echoes it, GC bridges it.
+				_ = h.store.SetBlobAttachmentID(sess.Account, id, b.AttachmentIDHex)
+			}
+			if b.Tombstone {
+				// Record the (uuid, final_version, marker) for horizon-GC (MYND-422).
+				_ = h.store.SetTombstone(sess.Account, id, ver)
+				if isAttachment && h.attachmentDeleter != nil {
+					// §11.4 step 2: the stored attachment BODY reads as absent from
+					// now on; physical reclaim rides the record's horizon-GC.
+					h.attachmentDeleter(sess.Account, attID)
+				}
+			}
+			results = append(results, pushResult{BlobIDHex: b.BlobIDHex, Version: uint64(ver)})
 		}
-		results = append(results, pushResult{BlobIDHex: b.BlobIDHex, Version: uint64(ver)})
-	}
 
-	// Then CAS-advance the head, if supplied.
-	resp := pushResp{Results: results}
-	if req.NewHead != nil {
-		prev, perr := hex.DecodeString(req.NewHead.PrevHeadHashHex)
-		rec, rerr := base64.StdEncoding.DecodeString(req.NewHead.RecordB64)
-		if perr != nil || rerr != nil || len(prev) != store.HeadIDLen {
-			writeErr(w, http.StatusBadRequest, "bad_request")
-			return
+		// Then CAS-advance the head, if supplied.
+		resp = pushResp{Results: results}
+		if req.NewHead != nil {
+			prev, perr := hex.DecodeString(req.NewHead.PrevHeadHashHex)
+			rec, rerr := base64.StdEncoding.DecodeString(req.NewHead.RecordB64)
+			if perr != nil || rerr != nil || len(prev) != store.HeadIDLen {
+				writeErr(w, http.StatusBadRequest, "bad_request")
+				return errPushHandled
+			}
+			if len(rec) > MaxHeadRecordSize {
+				writeErr(w, http.StatusRequestEntityTooLarge, "too_large")
+				return errPushHandled
+			}
+			var prevArr [store.HeadIDLen]byte
+			copy(prevArr[:], prev)
+			newID, herr := h.store.AdvanceHead(sess.Account, prevArr, rec)
+			if errors.Is(herr, store.ErrHeadCASMismatch) {
+				writeErr(w, http.StatusConflict, "head_stale")
+				return errPushHandled
+			}
+			if herr != nil {
+				writeErr(w, http.StatusInternalServerError, "internal")
+				return errPushHandled
+			}
+			resp.HeadIDHex = hex.EncodeToString(newID[:])
 		}
-		if len(rec) > MaxHeadRecordSize {
-			writeErr(w, http.StatusRequestEntityTooLarge, "too_large")
-			return
-		}
-		var prevArr [store.HeadIDLen]byte
-		copy(prevArr[:], prev)
-		newID, herr := h.store.AdvanceHead(sess.Account, prevArr, rec)
-		if errors.Is(herr, store.ErrHeadCASMismatch) {
-			writeErr(w, http.StatusConflict, "head_stale")
-			return
-		}
-		if herr != nil {
-			writeErr(w, http.StatusInternalServerError, "internal")
-			return
-		}
-		resp.HeadIDHex = hex.EncodeToString(newID[:])
+		return nil
+	})
+	if errors.Is(berr, errPushHandled) {
+		return // the closure already wrote the response
+	}
+	if berr != nil {
+		// The batch's coalesced bookkeeping write failed. Reporting it is only
+		// possible because the success response is written out here rather than
+		// inside the closure — per-mutation persistence had no such point and
+		// answered 200 to a push whose index never reached disk.
+		writeErr(w, http.StatusInternalServerError, "internal")
+		return
 	}
 	// Contentless poke to the account's SSE subscribers (zero-payload, A13).
 	if h.notifier != nil && (len(req.Blobs) > 0 || req.NewHead != nil) {

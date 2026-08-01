@@ -12,11 +12,14 @@ package store
 
 import (
 	"bytes"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/myne-md/myne-server/internal/ids"
 )
@@ -267,5 +270,62 @@ func TestConcurrent_CrossVaultIsolation(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// FSStore's lock is per VAULT, not per store (myne-server#6, secondary): an account
+// whose write is in flight must not stall an unrelated account's. A store-wide
+// mutex turns one account's slow import into an outage for everyone else on the
+// deployment, and nothing else in this suite would notice — the invariant is about
+// what does NOT block, so it needs a mutation parked mid-write to observe.
+//
+// Deterministic, not timing-based: account 1's push parks inside its index write
+// (holding that vault's lock), account 2's push must complete while it is parked.
+// The timeout only exists so a regression fails loudly instead of hanging.
+func TestConcurrent_PerAccountLock_DoesNotSerializeVaults(t *testing.T) {
+	s, _ := newFS(t)
+	a1, a2 := acct(0xA1), acct(0xA2)
+
+	parked := make(chan struct{})
+	release := make(chan struct{})
+	inner := s.writeIndex
+	var once sync.Once
+	s.writeIndex = func(path string, data []byte) error {
+		if strings.Contains(path, hex.EncodeToString(a1[:])) {
+			once.Do(func() {
+				close(parked)
+				<-release
+			})
+		}
+		return inner(path, data)
+	}
+
+	slow := make(chan error, 1)
+	go func() {
+		_, err := s.PushBlob(a1, blob(1), 0, nonce(1), []byte("slow"))
+		slow <- err
+	}()
+	<-parked // a1's vault lock is now held across an in-flight index write
+
+	fast := make(chan error, 1)
+	go func() {
+		_, err := s.PushBlob(a2, blob(2), 0, nonce(2), []byte("fast"))
+		fast <- err
+	}()
+
+	select {
+	case err := <-fast:
+		if err != nil {
+			close(release)
+			t.Fatalf("push on account 2: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		close(release)
+		t.Fatal("a push on account 2 blocked behind account 1's in-flight write — the store lock is not sharded per account")
+	}
+
+	close(release)
+	if err := <-slow; err != nil {
+		t.Fatalf("push on account 1: %v", err)
 	}
 }

@@ -32,12 +32,32 @@ import (
 // FILE SIZES over the index on drift, finalizes a crashed partial==total file,
 // drops index entries whose files vanished, and rebuilds the per-account quota
 // counter from disk — restart-proof unified AS17 accounting.
+//
+// Locking is PER ACCOUNT, not per store, for the same reason as the blob FSStore:
+// WriteAt holds the lock across a chunk write, and on the final chunk across an
+// fsync + rename + dir-fsync, so a store-wide lock would make one account's 64 MiB
+// upload stall every other account's attachment traffic. s.mu guards only the
+// `accounts` map; each fsAccount carries the lock over its own entries, byte total
+// and disk writes. The two are never held nested — a resolver releases s.mu before
+// its caller takes acc.mu.
 type FSStore struct {
-	mu             sync.RWMutex
+	mu             sync.RWMutex // guards `accounts` (the map itself) ONLY
 	root           string
 	maxIDsPerVault int
-	vaults         map[ids.AccountNumberHash]map[AttachmentID]*fsEntry
-	accountBytes   map[ids.AccountNumberHash]uint64
+	accounts       map[ids.AccountNumberHash]*fsAccount
+}
+
+// fsAccount is one account's in-memory attachment index plus its byte total.
+type fsAccount struct {
+	mu sync.RWMutex // guards every field below AND this account's disk writes
+
+	// deleted is set by DeleteAccount after it drops the account from the map, so
+	// an upload that was already resolving this pointer refuses instead of
+	// recreating the account's directory.
+	deleted bool
+
+	entries map[AttachmentID]*fsEntry
+	bytes   uint64
 }
 
 type fsEntry struct {
@@ -52,9 +72,16 @@ type fsEntry struct {
 // store.DeleteAccount's RemoveAll; this clears only the index.
 func (s *FSStore) DeleteAccount(a ids.AccountNumberHash) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.vaults, a)
-	delete(s.accountBytes, a)
+	acc := s.accounts[a]
+	delete(s.accounts, a)
+	s.mu.Unlock()
+
+	if acc == nil {
+		return
+	}
+	acc.mu.Lock()
+	defer acc.mu.Unlock()
+	acc.deleted = true
 }
 
 const attachmentsIndexFile = "attachments-index.json"
@@ -73,9 +100,8 @@ func NewFSStore(root string) (*FSStore, error) {
 		return nil, err
 	}
 	s := &FSStore{
-		root:         root,
-		vaults:       make(map[ids.AccountNumberHash]map[AttachmentID]*fsEntry),
-		accountBytes: make(map[ids.AccountNumberHash]uint64),
+		root:     root,
+		accounts: make(map[ids.AccountNumberHash]*fsAccount),
 	}
 	if err := s.load(); err != nil {
 		return nil, err
@@ -133,7 +159,7 @@ func (s *FSStore) load() error {
 		if err := json.Unmarshal(raw, &idx); err != nil {
 			return err
 		}
-		v := make(map[AttachmentID]*fsEntry, len(idx))
+		acc := &fsAccount{entries: make(map[AttachmentID]*fsEntry, len(idx))}
 		var dirty bool
 		for idHex, ie := range idx {
 			id, ok := ParseID(idHex)
@@ -169,12 +195,12 @@ func (s *FSStore) load() error {
 			if ie.Complete != e.complete {
 				dirty = true
 			}
-			v[id] = e
-			s.accountBytes[acct] += uint64(e.uploaded)
+			acc.entries[id] = e
+			acc.bytes += uint64(e.uploaded)
 		}
-		s.vaults[acct] = v
+		s.accounts[acct] = acc
 		if dirty {
-			if err := s.persist(acct); err != nil {
+			if err := s.persist(acct, acc); err != nil {
 				return err
 			}
 		}
@@ -182,11 +208,10 @@ func (s *FSStore) load() error {
 	return nil
 }
 
-// persist writes the account's index atomically. Callers hold mu.
-func (s *FSStore) persist(a ids.AccountNumberHash) error {
-	v := s.vaults[a]
-	idx := make(map[string]fsIndexEntry, len(v))
-	for id, e := range v {
+// persist writes the account's index atomically. Callers hold acc.mu.
+func (s *FSStore) persist(a ids.AccountNumberHash, acc *fsAccount) error {
+	idx := make(map[string]fsIndexEntry, len(acc.entries))
+	for id, e := range acc.entries {
 		idx[hex.EncodeToString(id[:])] = fsIndexEntry{Total: e.total, Complete: e.complete, Deleted: e.deleted}
 	}
 	raw, err := json.Marshal(idx)
@@ -197,7 +222,7 @@ func (s *FSStore) persist(a ids.AccountNumberHash) error {
 }
 
 // finalize commits a full partial file: fsync + rename to the final name +
-// dir-fsync (the old-or-new-never-partial commit point). Callers hold mu.
+// dir-fsync (the old-or-new-never-partial commit point). Callers hold acc.mu.
 func (s *FSStore) finalize(a ids.AccountNumberHash, id AttachmentID) error {
 	partial := s.partialPath(a, id)
 	f, err := os.OpenFile(partial, os.O_WRONLY, 0o600)
@@ -221,28 +246,51 @@ func (s *FSStore) finalize(a ids.AccountNumberHash, id AttachmentID) error {
 	return nil
 }
 
-func (s *FSStore) vault(a ids.AccountNumberHash) map[AttachmentID]*fsEntry {
-	v := s.vaults[a]
-	if v == nil {
-		v = make(map[AttachmentID]*fsEntry)
-		s.vaults[a] = v
+// lookupAccount returns the account's index, or nil if it has none. It never
+// creates one. Returns with s.mu released, so the caller takes acc.mu unnested.
+func (s *FSStore) lookupAccount(a ids.AccountNumberHash) *fsAccount {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.accounts[a]
+}
+
+// accountFor returns the account's index, creating it if absent. Returns with
+// s.mu released, so the caller takes acc.mu unnested.
+func (s *FSStore) accountFor(a ids.AccountNumberHash) *fsAccount {
+	if acc := s.lookupAccount(a); acc != nil {
+		return acc
 	}
-	return v
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	acc := s.accounts[a]
+	if acc == nil {
+		acc = &fsAccount{entries: make(map[AttachmentID]*fsEntry)}
+		s.accounts[a] = acc
+	}
+	return acc
 }
 
 // Has reports a complete, non-deleted attachment (dedup probe).
 func (s *FSStore) Has(a ids.AccountNumberHash, id AttachmentID) bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	e := s.vaults[a][id]
+	acc := s.lookupAccount(a)
+	if acc == nil {
+		return false
+	}
+	acc.mu.RLock()
+	defer acc.mu.RUnlock()
+	e := acc.entries[id]
 	return e != nil && e.complete && !e.deleted
 }
 
 // UploadedLen returns the uploaded byte count (+known); deleted-is-absent.
 func (s *FSStore) UploadedLen(a ids.AccountNumberHash, id AttachmentID) (int, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	e := s.vaults[a][id]
+	acc := s.lookupAccount(a)
+	if acc == nil {
+		return 0, false
+	}
+	acc.mu.RLock()
+	defer acc.mu.RUnlock()
+	e := acc.entries[id]
 	if e == nil || e.deleted {
 		return 0, false
 	}
@@ -255,30 +303,33 @@ func (s *FSStore) WriteAt(a ids.AccountNumberHash, id AttachmentID, offset, tota
 	if total > MaxAttachmentSize {
 		return ErrTooLarge
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	v := s.vault(a)
-	e := v[id]
+	acc := s.accountFor(a)
+	acc.mu.Lock()
+	defer acc.mu.Unlock()
+	if acc.deleted {
+		return ErrNotFound
+	}
+	e := acc.entries[id]
 	if e != nil && e.deleted {
 		// §11.4 re-add: restart as a fresh upload (drop the stale retained body).
-		if _, ok := s.reclaimLocked(a, id); !ok {
+		if _, ok := s.reclaimLocked(a, acc, id); !ok {
 			return ErrBadOffset
 		}
 		e = nil
 	}
 	if e == nil {
-		if s.maxIDsPerVault > 0 && len(v) >= s.maxIDsPerVault {
+		if s.maxIDsPerVault > 0 && len(acc.entries) >= s.maxIDsPerVault {
 			return ErrTooManyAttachments
 		}
 		if err := os.MkdirAll(s.attachmentsDir(a), 0o700); err != nil {
 			return err
 		}
 		e = &fsEntry{total: total}
-		v[id] = e
+		acc.entries[id] = e
 		// Persist at upload-start so a restart still counts this id against
 		// the per-vault ceiling (half-finished uploads are the OOM/disk vector).
-		if err := s.persist(a); err != nil {
-			delete(v, id)
+		if err := s.persist(a, acc); err != nil {
+			delete(acc.entries, id)
 			return err
 		}
 	}
@@ -310,13 +361,13 @@ func (s *FSStore) WriteAt(a ids.AccountNumberHash, id AttachmentID, offset, tota
 		return err
 	}
 	e.uploaded += len(chunk)
-	s.accountBytes[a] += uint64(len(chunk))
+	acc.bytes += uint64(len(chunk))
 	if e.uploaded == total {
 		if err := s.finalize(a, id); err != nil {
 			return err
 		}
 		e.complete = true
-		if err := s.persist(a); err != nil {
+		if err := s.persist(a, acc); err != nil {
 			return err
 		}
 	}
@@ -325,9 +376,13 @@ func (s *FSStore) WriteAt(a ids.AccountNumberHash, id AttachmentID, offset, tota
 
 // ReadRange serves bytes [start, start+length) of a complete attachment.
 func (s *FSStore) ReadRange(a ids.AccountNumberHash, id AttachmentID, start, length int) ([]byte, int, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	e := s.vaults[a][id]
+	acc := s.lookupAccount(a)
+	if acc == nil {
+		return nil, 0, ErrNotFound
+	}
+	acc.mu.RLock()
+	defer acc.mu.RUnlock()
+	e := acc.entries[id]
 	if e == nil || !e.complete || e.deleted {
 		return nil, 0, ErrNotFound
 	}
@@ -353,37 +408,54 @@ func (s *FSStore) ReadRange(a ids.AccountNumberHash, id AttachmentID, start, len
 // AccountBytes is the account's live attachment byte total (rebuilt from disk
 // at load — restart-proof unified AS17 accounting).
 func (s *FSStore) AccountBytes(a ids.AccountNumberHash) uint64 {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.accountBytes[a]
+	acc := s.lookupAccount(a)
+	if acc == nil {
+		return 0
+	}
+	acc.mu.RLock()
+	defer acc.mu.RUnlock()
+	return acc.bytes
 }
 
 // MarkDeleted hides the body without dropping it (§11.4); persisted so the
 // deleted-is-absent state survives a restart.
 func (s *FSStore) MarkDeleted(a ids.AccountNumberHash, id AttachmentID) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if e := s.vaults[a][id]; e != nil && !e.deleted {
+	acc := s.lookupAccount(a)
+	if acc == nil {
+		return
+	}
+	acc.mu.Lock()
+	defer acc.mu.Unlock()
+	if acc.deleted {
+		return
+	}
+	if e := acc.entries[id]; e != nil && !e.deleted {
 		e.deleted = true
-		_ = s.persist(a)
+		_ = s.persist(a, acc)
 	}
 }
 
 // Reclaim physically drops the body + partial state and frees the id slot.
 func (s *FSStore) Reclaim(a ids.AccountNumberHash, id AttachmentID) (uint64, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	freed, ok := s.reclaimLocked(a, id)
+	acc := s.lookupAccount(a)
+	if acc == nil {
+		return 0, false
+	}
+	acc.mu.Lock()
+	defer acc.mu.Unlock()
+	if acc.deleted {
+		return 0, false
+	}
+	freed, ok := s.reclaimLocked(a, acc, id)
 	if ok {
-		_ = s.persist(a)
+		_ = s.persist(a, acc)
 	}
 	return freed, ok
 }
 
-// reclaimLocked drops files + counters without persisting. Callers hold mu.
-func (s *FSStore) reclaimLocked(a ids.AccountNumberHash, id AttachmentID) (uint64, bool) {
-	v := s.vault(a)
-	e := v[id]
+// reclaimLocked drops files + counters without persisting. Callers hold acc.mu.
+func (s *FSStore) reclaimLocked(a ids.AccountNumberHash, acc *fsAccount, id AttachmentID) (uint64, bool) {
+	e := acc.entries[id]
 	if e == nil {
 		return 0, false
 	}
@@ -394,12 +466,12 @@ func (s *FSStore) reclaimLocked(a ids.AccountNumberHash, id AttachmentID) (uint6
 		return 0, false
 	}
 	freed := uint64(e.uploaded)
-	if s.accountBytes[a] >= freed {
-		s.accountBytes[a] -= freed
+	if acc.bytes >= freed {
+		acc.bytes -= freed
 	} else {
-		s.accountBytes[a] = 0
+		acc.bytes = 0
 	}
-	delete(v, id)
+	delete(acc.entries, id)
 	return freed, true
 }
 

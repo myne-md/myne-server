@@ -6,9 +6,12 @@
 // content (trust boundary TB5); it has no root_key and cannot parse a vault head.
 //
 // The interface is backend-agnostic: it imposes no transaction requirement, because
-// push atomicity is blobs-first-then-head-CAS (ledger SYNC-5). An FS or SQL backend
-// can implement it later (MYND-421/438) without reshaping callers; the in-memory
-// MemStore is the reference implementation for the bootstrap skeleton.
+// push atomicity is blobs-first-then-head-CAS (ledger SYNC-5). Batch is NOT a
+// transaction either — it is a durability-granularity scope that lets a backend
+// coalesce the per-vault bookkeeping write a request would otherwise perform once
+// per mutation. An FS or SQL backend can implement it later (MYND-421/438) without
+// reshaping callers; the in-memory MemStore is the reference implementation for the
+// bootstrap skeleton.
 package store
 
 import (
@@ -162,6 +165,25 @@ type BlobStore interface {
 	// BlobAttachmentID returns the associated attachment-id hex ("" if the blob is
 	// unknown or is a note record).
 	BlobAttachmentID(account ids.AccountNumberHash, blobID ids.BlobID) string
+
+	// Batch runs fn as ONE storage batch over a single account's vault. A backend
+	// that writes per-vault bookkeeping on every mutation coalesces those writes
+	// into one at the end of fn instead of one per mutation — the difference
+	// between O(N) and O(N²) for a request carrying N blobs.
+	//
+	// This is a durability-granularity scope, NOT a transaction: it does not roll
+	// back. Every call inside fn keeps its exact semantics (CAS, quota accounting,
+	// idempotent replay, error values); what changes is that a crash inside a batch
+	// may lose the whole batch's bookkeeping rather than a prefix of it. Bodies are
+	// written and durable as before, so what survives such a crash is an orphan
+	// body a reopen already ignores — never a partial or corrupt index.
+	//
+	// The coalesced write happens whether or not fn returns an error: a backend
+	// must never leave its in-memory state ahead of disk. Batch returns fn's error
+	// if non-nil, else the coalesced write's error. Batches over one account nest;
+	// the write happens when the outermost one ends. A backend MUST NOT hold the
+	// vault's lock across fn — the calls inside it take that lock themselves.
+	Batch(account ids.AccountNumberHash, fn func() error) error
 
 	// DeleteAccount permanently removes an account's entire vault namespace (blobs,
 	// meta, head, index, tombstones — and, for the fs backend, the co-located

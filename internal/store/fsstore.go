@@ -35,15 +35,39 @@ import (
 // write leaves the prior bytes intact (old-or-new-never-partial): a live `cp -r`
 // of the volume is always restorable. The seam stays FS-agnostic (opaque
 // get/put/delete by namespaced key) so an S3 backend can drop in later.
+//
+// Locking is PER VAULT, not per store: s.mu guards only the `vaults` map (a map
+// lookup, never IO), and each fsVault carries the lock covering its own fields and
+// its own disk writes. Independent vaults have no reason to serialize against each
+// other, and a store-wide lock is what turns one account's slow import into an
+// availability event for every other account on the deployment. The two levels are
+// never held nested — a resolver releases s.mu before its caller takes v.mu — so
+// there is no lock order to get wrong.
 type FSStore struct {
-	mu     sync.RWMutex
+	mu     sync.RWMutex // guards `vaults` (the map itself) ONLY
 	root   string
 	vaults map[ids.AccountNumberHash]*fsVault
+	// writeIndex is the durable index-write primitive (default atomicWrite).
+	// Injectable so a test can count how many physical writes a batch of mutations
+	// coalesced into — the accounts.Store / authpersist discipline.
+	writeIndex func(path string, data []byte) error
 }
 
 // fsVault is one vault's in-memory metadata index. Ciphertext is on disk; head
 // and meta records are read from disk on demand (rare, small).
 type fsVault struct {
+	mu sync.RWMutex // guards every field below AND this vault's disk writes
+
+	// deleted is set by DeleteAccount after it drops the vault from the map, so a
+	// mutation that was already resolving this pointer refuses instead of writing
+	// the account's files back into existence.
+	deleted bool
+
+	// batchDepth > 0 means a Batch is open over this vault: persist only marks
+	// `dirty` and the outermost Batch performs the single coalesced write.
+	batchDepth int
+	dirty      bool
+
 	blobs        map[ids.BlobID]*fsBlobMeta
 	headID       [HeadIDLen]byte
 	hasHead      bool
@@ -71,7 +95,11 @@ func NewFSStore(dir string) (*FSStore, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	s := &FSStore{root: dir, vaults: make(map[ids.AccountNumberHash]*fsVault)}
+	s := &FSStore{
+		root:       dir,
+		vaults:     make(map[ids.AccountNumberHash]*fsVault),
+		writeIndex: atomicWrite,
+	}
 	if err := s.load(); err != nil {
 		return nil, err
 	}
@@ -220,14 +248,26 @@ func (s *FSStore) vaultDir(a ids.AccountNumberHash) string {
 // + index + tombstones + the attachments subtree — all under one account dir) and its
 // in-memory index. Irreversible (MYND-506). Idempotent: RemoveAll on a missing dir is
 // a no-op, and deleting an absent map key is a no-op.
+//
+// The map entry goes first so no new caller can resolve this vault; the tombstoning
+// flag + RemoveAll then run under the vault's own lock, which is what orders this
+// against an in-flight mutation. A mutation that already held v.mu completes and has
+// its files removed; one that arrives afterwards sees `deleted` and refuses, so
+// nothing writes a deleted account's files back into existence.
 func (s *FSStore) DeleteAccount(account ids.AccountNumberHash) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if err := os.RemoveAll(s.vaultDir(account)); err != nil {
-		return err
-	}
+	v := s.vaults[account]
 	delete(s.vaults, account)
-	return nil
+	s.mu.Unlock()
+
+	if v == nil {
+		return os.RemoveAll(s.vaultDir(account))
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.deleted = true
+	v.dirty = false
+	return os.RemoveAll(s.vaultDir(account))
 }
 func (s *FSStore) blobPath(a ids.AccountNumberHash, b ids.BlobID) string {
 	return filepath.Join(s.vaultDir(a), "blobs", hex.EncodeToString(b[:]))
@@ -280,23 +320,98 @@ func AtomicWrite(path string, data []byte) error {
 	return os.Chmod(path, 0o600)
 }
 
-// persist writes the vault's metadata index atomically. Callers hold mu.
+// persist records that the vault's metadata index needs writing. Outside a batch
+// that means writing it now; inside one it only marks the vault dirty and the
+// outermost Batch performs the single coalesced write. Callers hold v.mu.
+//
+// The distinction is the whole fix for the quadratic push (#6): toIndex() rebuilds
+// EVERY blob's metadata and json.Marshal sorts the map's keys, so a per-mutation
+// write costs O(i log i) at the i-th blob — Σ over one N-blob request is O(N² log N)
+// serialization plus 2N fsyncs, against a payload that is O(N).
 func (s *FSStore) persist(a ids.AccountNumberHash, v *fsVault) error {
+	if v.batchDepth > 0 {
+		v.dirty = true
+		return nil
+	}
+	return s.writeIndexNow(a, v)
+}
+
+// writeIndexNow serializes and durably writes the vault's index. Callers hold v.mu.
+func (s *FSStore) writeIndexNow(a ids.AccountNumberHash, v *fsVault) error {
 	raw, err := json.Marshal(v.toIndex())
 	if err != nil {
 		return err
 	}
-	return atomicWrite(filepath.Join(s.vaultDir(a), "index.json"), raw)
+	if err := s.writeIndex(filepath.Join(s.vaultDir(a), "index.json"), raw); err != nil {
+		return err
+	}
+	v.dirty = false
+	return nil
 }
 
-func (s *FSStore) vault(a ids.AccountNumberHash) *fsVault {
+// Batch coalesces every index write the mutations inside fn would each perform
+// into one write at the end. See BlobStore.Batch for the contract; the two points
+// that matter here are that v.mu is NOT held across fn (the calls inside it take
+// that lock themselves, and the push handler additionally reads QuotaBytes between
+// them) and that the coalesced write happens even when fn fails, because the
+// in-memory index has already advanced and must not run ahead of disk.
+//
+// It materializes the vault up front rather than lazily, because the batch flag has
+// to exist before the first mutation consults it — and a brand-new account's first
+// sync is exactly the case this fix is for. A batch that then mutates nothing leaves
+// an empty in-memory vault: never written to disk (nothing marked it dirty), gone on
+// restart, and reachable only by an already-enrolled device.
+func (s *FSStore) Batch(account ids.AccountNumberHash, fn func() error) error {
+	v := s.vaultFor(account)
+
+	v.mu.Lock()
+	v.batchDepth++
+	v.mu.Unlock()
+
+	ferr := fn()
+
+	v.mu.Lock()
+	v.batchDepth--
+	var werr error
+	if v.batchDepth == 0 && v.dirty && !v.deleted {
+		werr = s.writeIndexNow(account, v)
+	}
+	v.mu.Unlock()
+
+	if ferr != nil {
+		return ferr
+	}
+	return werr
+}
+
+func newFSVault() *fsVault {
+	return &fsVault{
+		blobs:      make(map[ids.BlobID]*fsBlobMeta),
+		cursors:    make(map[ids.DeviceID]uint64),
+		tombstones: make(map[ids.BlobID]*tombstoneRec),
+	}
+}
+
+// lookupVault returns the account's vault, or nil if it has none. It never
+// creates one — the read paths must not materialize a vault for an unknown
+// account. Returns with s.mu released, so the caller takes v.mu unnested.
+func (s *FSStore) lookupVault(a ids.AccountNumberHash) *fsVault {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.vaults[a]
+}
+
+// vaultFor returns the account's vault, creating it if absent. Returns with s.mu
+// released, so the caller takes v.mu unnested.
+func (s *FSStore) vaultFor(a ids.AccountNumberHash) *fsVault {
+	if v := s.lookupVault(a); v != nil {
+		return v
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	v := s.vaults[a]
 	if v == nil {
-		v = &fsVault{
-			blobs:      make(map[ids.BlobID]*fsBlobMeta),
-			cursors:    make(map[ids.DeviceID]uint64),
-			tombstones: make(map[ids.BlobID]*tombstoneRec),
-		}
+		v = newFSVault()
 		s.vaults[a] = v
 	}
 	return v
@@ -333,9 +448,12 @@ func (s *FSStore) readBody(a ids.AccountNumberHash, b ids.BlobID) []byte {
 // --- BlobStore implementation ----------------------------------------------
 
 func (s *FSStore) PutBlob(account ids.AccountNumberHash, blobID ids.BlobID, ciphertext []byte) (Version, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	v := s.vault(account)
+	v := s.vaultFor(account)
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.deleted {
+		return 0, ErrNotFound
+	}
 	m := v.blobs[blobID]
 	if m != nil && !m.reclaimed && bytesEqual(s.readBody(account, blobID), ciphertext) {
 		return m.version, nil // idempotent re-put
@@ -362,9 +480,12 @@ func (s *FSStore) PutBlob(account ids.AccountNumberHash, blobID ids.BlobID, ciph
 }
 
 func (s *FSStore) PushBlob(account ids.AccountNumberHash, blobID ids.BlobID, baseVersion Version, contentNonce [ContentNonceLen]byte, ciphertext []byte) (Version, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	v := s.vault(account)
+	v := s.vaultFor(account)
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.deleted {
+		return 0, ErrNotFound
+	}
 	m := v.blobs[blobID]
 	cur := Version(0)
 	if m != nil {
@@ -413,12 +534,12 @@ func (s *FSStore) PushBlob(account ids.AccountNumberHash, blobID ids.BlobID, bas
 }
 
 func (s *FSStore) GetBlob(account ids.AccountNumberHash, blobID ids.BlobID) ([]byte, Version, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	v := s.vaults[account]
+	v := s.lookupVault(account)
 	if v == nil {
 		return nil, 0, ErrNotFound
 	}
+	v.mu.RLock()
+	defer v.mu.RUnlock()
 	m := v.blobs[blobID]
 	if m == nil {
 		return nil, 0, ErrNotFound
@@ -433,12 +554,12 @@ func (s *FSStore) GetBlob(account ids.AccountNumberHash, blobID ids.BlobID) ([]b
 }
 
 func (s *FSStore) BlobVersion(account ids.AccountNumberHash, blobID ids.BlobID) (Version, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	v := s.vaults[account]
+	v := s.lookupVault(account)
 	if v == nil {
 		return 0, ErrNotFound
 	}
+	v.mu.RLock()
+	defer v.mu.RUnlock()
 	m := v.blobs[blobID]
 	if m == nil {
 		return 0, ErrNotFound
@@ -447,11 +568,14 @@ func (s *FSStore) BlobVersion(account ids.AccountNumberHash, blobID ids.BlobID) 
 }
 
 func (s *FSStore) GetHead(account ids.AccountNumberHash) ([]byte, [HeadIDLen]byte, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	var zero [HeadIDLen]byte
-	v := s.vaults[account]
-	if v == nil || !v.hasHead {
+	v := s.lookupVault(account)
+	if v == nil {
+		return nil, zero, ErrNotFound
+	}
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	if !v.hasHead {
 		return nil, zero, ErrNotFound
 	}
 	data, err := os.ReadFile(filepath.Join(s.vaultDir(account), "head"))
@@ -462,10 +586,13 @@ func (s *FSStore) GetHead(account ids.AccountNumberHash) ([]byte, [HeadIDLen]byt
 }
 
 func (s *FSStore) AdvanceHead(account ids.AccountNumberHash, prevHeadHash [HeadIDLen]byte, record []byte) ([HeadIDLen]byte, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	var zero [HeadIDLen]byte
-	v := s.vault(account)
+	v := s.vaultFor(account)
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.deleted {
+		return zero, ErrNotFound
+	}
 	if v.hasHead {
 		if prevHeadHash != v.headID {
 			return zero, ErrHeadCASMismatch
@@ -486,17 +613,18 @@ func (s *FSStore) AdvanceHead(account ids.AccountNumberHash, prevHeadHash [HeadI
 }
 
 func (s *FSStore) SetMeta(account ids.AccountNumberHash, meta []byte) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	v := s.vault(account)
+	v := s.vaultFor(account)
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.deleted {
+		return
+	}
 	_ = atomicWrite(filepath.Join(s.vaultDir(account), "meta"), meta)
 	_ = s.persist(account, v) // ensure the vault dir/index exists
 }
 
 func (s *FSStore) GetMeta(account ids.AccountNumberHash) ([]byte, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.vaults[account] == nil {
+	if s.lookupVault(account) == nil {
 		return nil, ErrNotFound
 	}
 	data, err := os.ReadFile(filepath.Join(s.vaultDir(account), "meta"))
@@ -507,12 +635,13 @@ func (s *FSStore) GetMeta(account ids.AccountNumberHash) ([]byte, error) {
 }
 
 func (s *FSStore) QuotaBytes(account ids.AccountNumberHash) uint64 {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if v := s.vaults[account]; v != nil {
-		return v.quotaBytes
+	v := s.lookupVault(account)
+	if v == nil {
+		return 0
 	}
-	return 0
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return v.quotaBytes
 }
 
 // ChangedSince selects its window over ALL entries (live + reclaimed) so the
@@ -521,12 +650,12 @@ func (s *FSStore) QuotaBytes(account ids.AccountNumberHash) uint64 {
 // MemStore counterpart for why filtering the window instead wedges the cursor
 // below the reclaim floor.
 func (s *FSStore) ChangedSince(account ids.AccountNumberHash, cursor uint64, limit int) ([]SyncMeta, uint64) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	v := s.vaults[account]
+	v := s.lookupVault(account)
 	if v == nil {
 		return nil, cursor
 	}
+	v.mu.RLock()
+	defer v.mu.RUnlock()
 	type item struct {
 		id ids.BlobID
 		m  *fsBlobMeta
@@ -558,10 +687,13 @@ func (s *FSStore) ChangedSince(account ids.AccountNumberHash, cursor uint64, lim
 // SetBlobAttachmentID associates the full attachment-id (hex) with a blob record
 // (MYND-468), persisted in the vault index. See BlobStore.SetBlobAttachmentID.
 func (s *FSStore) SetBlobAttachmentID(account ids.AccountNumberHash, blobID ids.BlobID, attachmentIDHex string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	v := s.vaults[account]
+	v := s.lookupVault(account)
 	if v == nil {
+		return ErrNotFound
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.deleted {
 		return ErrNotFound
 	}
 	m := v.blobs[blobID]
@@ -577,12 +709,12 @@ func (s *FSStore) SetBlobAttachmentID(account ids.AccountNumberHash, blobID ids.
 
 // BlobAttachmentID returns the associated attachment-id hex ("" if none).
 func (s *FSStore) BlobAttachmentID(account ids.AccountNumberHash, blobID ids.BlobID) string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	v := s.vaults[account]
+	v := s.lookupVault(account)
 	if v == nil {
 		return ""
 	}
+	v.mu.RLock()
+	defer v.mu.RUnlock()
 	m := v.blobs[blobID]
 	if m == nil {
 		return ""
@@ -591,9 +723,12 @@ func (s *FSStore) BlobAttachmentID(account ids.AccountNumberHash, blobID ids.Blo
 }
 
 func (s *FSStore) AckCursor(account ids.AccountNumberHash, device ids.DeviceID, pos uint64) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	v := s.vault(account)
+	v := s.vaultFor(account)
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.deleted {
+		return
+	}
 	if pos > v.cursors[device] {
 		v.cursors[device] = pos
 		_ = s.persist(account, v)
@@ -601,18 +736,22 @@ func (s *FSStore) AckCursor(account ids.AccountNumberHash, device ids.DeviceID, 
 }
 
 func (s *FSStore) DeviceCursor(account ids.AccountNumberHash, device ids.DeviceID) uint64 {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if v := s.vaults[account]; v != nil {
-		return v.cursors[device]
+	v := s.lookupVault(account)
+	if v == nil {
+		return 0
 	}
-	return 0
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return v.cursors[device]
 }
 
 func (s *FSStore) SetTombstone(account ids.AccountNumberHash, blobID ids.BlobID, finalVersion Version) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	v := s.vault(account)
+	v := s.vaultFor(account)
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.deleted {
+		return ErrNotFound
+	}
 	seq := uint64(0)
 	if m := v.blobs[blobID]; m != nil {
 		seq = m.changeSeq
@@ -622,12 +761,12 @@ func (s *FSStore) SetTombstone(account ids.AccountNumberHash, blobID ids.BlobID,
 }
 
 func (s *FSStore) Tombstone(account ids.AccountNumberHash, blobID ids.BlobID) (Version, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	v := s.vaults[account]
+	v := s.lookupVault(account)
 	if v == nil {
 		return 0, false
 	}
+	v.mu.RLock()
+	defer v.mu.RUnlock()
 	rec, ok := v.tombstones[blobID]
 	if !ok {
 		return 0, false
@@ -636,12 +775,12 @@ func (s *FSStore) Tombstone(account ids.AccountNumberHash, blobID ids.BlobID) (V
 }
 
 func (s *FSStore) TombstoneRecord(account ids.AccountNumberHash, blobID ids.BlobID) (Version, uint64, bool, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	v := s.vaults[account]
+	v := s.lookupVault(account)
 	if v == nil {
 		return 0, 0, false, false
 	}
+	v.mu.RLock()
+	defer v.mu.RUnlock()
 	rec, ok := v.tombstones[blobID]
 	if !ok {
 		return 0, 0, false, false
@@ -650,12 +789,12 @@ func (s *FSStore) TombstoneRecord(account ids.AccountNumberHash, blobID ids.Blob
 }
 
 func (s *FSStore) ListTombstones(account ids.AccountNumberHash) []ids.BlobID {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	v := s.vaults[account]
+	v := s.lookupVault(account)
 	if v == nil {
 		return nil
 	}
+	v.mu.RLock()
+	defer v.mu.RUnlock()
 	out := make([]ids.BlobID, 0, len(v.tombstones))
 	for id := range v.tombstones {
 		out = append(out, id)
@@ -667,10 +806,13 @@ func (s *FSStore) ListTombstones(account ids.AccountNumberHash) []ids.BlobID {
 // keeps (uuid, final_version, marker). Removing the file on disk — not just a
 // marker — is the load-bearing FS reclamation (SYNC-22): the bytes are gone.
 func (s *FSStore) ReclaimTombstone(account ids.AccountNumberHash, blobID ids.BlobID) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	v := s.vaults[account]
+	v := s.lookupVault(account)
 	if v == nil {
+		return ErrNotFound
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.deleted {
 		return ErrNotFound
 	}
 	rec, ok := v.tombstones[blobID]
@@ -693,12 +835,13 @@ func (s *FSStore) ReclaimTombstone(account ids.AccountNumberHash, blobID ids.Blo
 }
 
 func (s *FSStore) GCFloor(account ids.AccountNumberHash) uint64 {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if v := s.vaults[account]; v != nil {
-		return v.reclaimFloor
+	v := s.lookupVault(account)
+	if v == nil {
+		return 0
 	}
-	return 0
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return v.reclaimFloor
 }
 
 // ListAccounts returns every account namespace present (for the GC scheduler,

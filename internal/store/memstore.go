@@ -499,6 +499,14 @@ func (m *MemStore) DeleteAccount(account ids.AccountNumberHash) error {
 	return nil
 }
 
+// Batch has nothing to coalesce — MemStore keeps no on-disk bookkeeping, so its
+// mutations already cost what they cost — and therefore just runs fn. It lives on
+// the seam rather than behind a type assertion so a caller wraps its mutations the
+// same way whichever backend it was handed. See BlobStore.Batch.
+func (m *MemStore) Batch(_ ids.AccountNumberHash, fn func() error) error {
+	return fn()
+}
+
 func (m *MemStore) ListAccounts() []ids.AccountNumberHash {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

@@ -50,6 +50,52 @@ func BenchmarkPushBlob(b *testing.B) {
 	}
 }
 
+// BenchmarkPushRequestNBlobs measures a whole REQUEST-shaped push — N distinct new
+// blobs into one vault — batched against unbatched. BenchmarkPushBlob above pushes
+// the same blob into an otherwise-empty vault, so it never sees the cost that
+// myne-server#6 reported: per-mutation index writes rebuild every entry stored so
+// far, making the request quadratic in N. This is the benchmark that shows it, and
+// the one to re-run when touching the persist path.
+func BenchmarkPushRequestNBlobs(b *testing.B) {
+	const n = 500
+	ct := bytes.Repeat([]byte{0x5a}, 256)
+	modes := []struct {
+		name    string
+		batched bool
+	}{{"batched", true}, {"unbatched", false}}
+
+	for _, bk := range benchBackends() {
+		for _, mode := range modes {
+			b.Run(bk.name+"/"+mode.name, func(b *testing.B) {
+				for i := 0; i < b.N; i++ {
+					b.StopTimer()
+					s := bk.mk(b) // a fresh vault per iteration — N is the variable
+					a := acct(1)
+					b.StartTimer()
+
+					push := func() error {
+						for j := 0; j < n; j++ {
+							if _, err := s.PushBlob(a, blobN(j), 0, nonce(byte(j)), ct); err != nil {
+								return err
+							}
+						}
+						return nil
+					}
+					var err error
+					if mode.batched {
+						err = s.Batch(a, push)
+					} else {
+						err = push()
+					}
+					if err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+		}
+	}
+}
+
 func BenchmarkGetBlob(b *testing.B) {
 	for _, bk := range benchBackends() {
 		b.Run(bk.name, func(b *testing.B) {
