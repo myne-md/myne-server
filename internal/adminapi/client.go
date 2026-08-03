@@ -5,7 +5,6 @@ package adminapi
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -41,15 +40,15 @@ func RunCLI(sock string, args []string) int {
 		}
 	}
 	if len(pos) == 0 {
-		fmt.Fprintln(os.Stderr, "admin: usage: myne-server admin <list|show|stats|freeze|unfreeze|set-quota|set-max-devices|delete> [account] [value] [--json] [--yes]")
+		fmt.Fprintln(os.Stderr, "admin: usage: myne-server admin <list|show|stats|freeze|unfreeze|set-quota|set-max-devices|delete> [account-hash] [value] [--json] [--yes]")
 		return 2
 	}
 	c := newClient(sock)
 
-	// arg1 resolves an account identifier (raw number OR hash) to its hash hex.
+	// arg1 takes the 32-hex account_number_hash, as printed by `admin list`.
 	arg1Hash := func() (string, bool) {
 		if len(pos) < 2 {
-			fmt.Fprintf(os.Stderr, "admin %s: an account (raw number or hash) is required\n", pos[0])
+			fmt.Fprintf(os.Stderr, "admin %s: a 32-hex account_number_hash is required (see: myne-server admin list)\n", pos[0])
 			return "", false
 		}
 		h, err := accountHash(pos[1])
@@ -204,10 +203,26 @@ func printStats(raw []byte) {
 }
 
 // accountHash resolves an operator-supplied identifier to an account_number_hash hex.
-// A 32-hex-char string is taken as the hash verbatim; anything else is treated as a
-// display/canonical account number — "MY-" prefix + group dashes are display-only, so
-// they are stripped, the rest uppercased to the 20-char canonical form, and hashed
-// SHA-256(canonical)[:16] (account-number.md §1-2; matches the client's derivation).
+//
+// It accepts the 32-hex `account_number_hash` and NOTHING ELSE. `admin list`
+// prints that hash for every account, which is where an operator gets it.
+//
+// It deliberately does not accept a raw account number. It used to, by
+// stripping the "MY-" prefix and the group dashes, uppercasing, and hashing
+// the remaining 20 characters — which is not what `account-number.md` §5-6
+// defines. `normalize` also verifies that every character is in the Crockford
+// alphabet and that the Damm-32 check character is correct; skipping those two
+// steps meant a mistyped or transposed number — exactly the error class the
+// check character exists to catch, and which every client entry point refuses —
+// was silently accepted and hashed into a phantom account. `admin delete` is
+// one of the commands that took this path.
+//
+// The repair is to delete this second implementation rather than complete it.
+// A faithful port needs NFKD, i.e. `golang.org/x/text/unicode/norm`, which
+// would be this server's first third-party dependency (`go.mod` declares zero),
+// and adding a dependency is a security decision. A second copy of the frozen
+// §4.2 Damm-32 quasigroup table would also be a new drift surface for a
+// load-bearing constant, to buy operator ergonomics on a local admin socket.
 func accountHash(s string) (string, error) {
 	s = strings.TrimSpace(s)
 	if len(s) == 32 {
@@ -215,12 +230,5 @@ func accountHash(s string) (string, error) {
 			return strings.ToLower(s), nil
 		}
 	}
-	up := strings.ToUpper(s)
-	up = strings.TrimPrefix(up, "MY-")
-	canon := strings.NewReplacer("-", "", " ", "").Replace(up)
-	if len(canon) != 20 {
-		return "", fmt.Errorf("not a 32-hex account hash nor a 20-char account number")
-	}
-	sum := sha256.Sum256([]byte(canon))
-	return hex.EncodeToString(sum[:16]), nil
+	return "", fmt.Errorf("not a 32-hex account_number_hash (admin list prints it; raw account numbers are not accepted)")
 }

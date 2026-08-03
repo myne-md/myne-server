@@ -4,7 +4,6 @@ package adminapi
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/hex"
 	"path/filepath"
 	"strings"
@@ -92,23 +91,28 @@ func TestRunCLI_UnknownSubcommand(t *testing.T) {
 	}
 }
 
-func TestAccountHash_HashPassthroughAndRawNumber(t *testing.T) {
+func TestAccountHash_AcceptsOnlyTheHash(t *testing.T) {
 	// A 32-hex string is the account_number_hash verbatim (case-normalized).
 	hx := strings.Repeat("ab", 16)
 	if got, err := accountHash(strings.ToUpper(hx)); err != nil || got != hx {
 		t.Errorf("32-hex passthrough = %q, %v; want %q", got, err, hx)
 	}
-	// A display-form account number: MY- + dashes are display-only; hash the 20-char
-	// canonical form. SHA-256(canonical)[:16].
-	sum := sha256.Sum256([]byte("ABCDEFGHJKMNPQRSTVWX"))
-	want := hex.EncodeToString(sum[:16])
-	got, err := accountHash("MY-ABCD-EFGH-JKMN-PQRS-TVWX")
-	if err != nil {
-		t.Fatal(err)
+
+	// A raw account number is REFUSED, in every form an operator might type.
+	// The CLI holds no Crockford-alphabet check and no Damm-32 verifier, so it
+	// cannot tell a real number from a mistyped one; accepting either would
+	// hash a phantom account. `admin list` prints the hash — that is the input.
+	for _, raw := range []string{
+		"MY-ABCD-EFGH-JKMN-PQRS-TVWX", // display form
+		"0123456789ABCDEFGHJT",        // canonical form, Damm-valid
+		"0132456789ABCDEFGHJT",        // the same number with two chars transposed
+		"O123456789ABCDEFGHJT",        // 'O' is not in the Crockford alphabet
+	} {
+		if got, err := accountHash(raw); err == nil {
+			t.Errorf("accountHash(%q) = %q, want refusal", raw, got)
+		}
 	}
-	if got != want {
-		t.Errorf("raw account number hash = %q, want %q", got, want)
-	}
+
 	// Garbage is a clean error, not a panic.
 	if _, err := accountHash("nope"); err == nil {
 		t.Errorf("garbage identifier should error")
