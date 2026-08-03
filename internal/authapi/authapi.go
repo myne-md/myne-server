@@ -176,8 +176,15 @@ func New(reg *auth.Registry, tokens *auth.TokenStore) *Handler {
 // WithPreAuthLimiter attaches the global pre-auth rate bucket (nil = disabled).
 // WithRequireChannelBinding installs the per-account "bound sessions only"
 // predicate (MYND-577). Unwired today; the seam exists so the opt-out can land
-// without a schema or wire change. An account that returns true refuses the
-// unbound gs2 form, which is how it refuses browser access.
+// without a schema or wire change.
+//
+// An account that returns true refuses any session the server could not bind to
+// real exporter material. That is NOT the same as refusing browser access, and
+// the doc used to say it was: whether a binding exists is a property of the
+// DEPLOYMENT, not of the client. Behind a terminating reverse proxy the server
+// has no exporter, so this refuses every client including the native ones;
+// where the server terminates TLS itself it admits every native client. A
+// web-vs-native distinction needs a different signal.
 func (h *Handler) WithRequireChannelBinding(p func(ids.AccountNumberHash) bool) *Handler {
 	h.requireChannelBinding = p
 	return h
@@ -554,11 +561,28 @@ func (h *Handler) handleScramFinal(w http.ResponseWriter, r *http.Request) {
 	serverSig, bound, err := scram.VerifyClientFinalWithPolicy(
 		sc.cred, hs.username, hs.clientNonce, hs.combinedNonce, cbind, h.allowUnbound(r), req.ClientFinal,
 	)
-	if err == nil && !bound && h.requireChannelBinding != nil && h.requireChannelBinding(hs.account) {
+	if err == nil && h.requireChannelBinding != nil && h.requireChannelBinding(hs.account) &&
+		!(len(cbind) > 0 && bound) {
 		// Per-account opt-out seam (MYND-577): an account that has declared
-		// "bound sessions only" refuses an unbound one here. nil hook = feature
+		// "bound sessions only" refuses anything else here. nil hook = feature
 		// absent, which is today's state; wiring it later needs no schema change
 		// and no wire change.
+		//
+		// The predicate is `len(cbind) > 0 && bound`, NOT `bound`. `bound`
+		// means only "the client committed to the gs2 header the server
+		// expected" — and when the server sits behind a terminating reverse
+		// proxy it has no exporter, so `cbind` is empty and BOTH sides bind to
+		// nothing while `bound` is still true. Refusing on `!bound` alone would
+		// have accepted every session in exactly the deployment where no
+		// channel binding exists, which is the opposite of what the opt-out is
+		// for. There is really a binding only when the server had exporter
+		// material to bind to.
+		//
+		// Corollary worth stating because it is easy to assume otherwise: this
+		// can never be a web-vs-native discriminator. In a proxy-terminated
+		// deployment it refuses everyone; where the server does terminate TLS
+		// it admits every native client. "Refuse browser access" needs a
+		// different signal.
 		err = scram.ErrChannelBindMismatch
 	}
 	if err != nil {
