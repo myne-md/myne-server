@@ -98,3 +98,55 @@ func TestSCRAMVectors(t *testing.T) {
 	}
 	t.Logf("scram-auth: %d cases byte-exact", len(f.Cases))
 }
+
+// The exporter parameters that GENERATE the channel-binding data the cases
+// above take as given. `scram-auth` pins the arithmetic for a fixed
+// `cbind_data` and says nothing about where those bytes come from; they come
+// from `ExporterLabel` and `ExporterLen`, which used to exist only as two
+// hand-written copies — one here, one in the Rust client — each documenting
+// that the other must match it byte-for-byte, and neither checked. A
+// divergence is not a degraded handshake: both sides derive different
+// `cbind_data`, the client proof fails, and no -PLUS handshake can complete.
+
+type exporterCase struct {
+	VectorID  string `json:"vector_id"`
+	CaseKind  string `json:"case_kind"`
+	LabelHex  string `json:"expected_label_utf8_hex"`
+	LengthVal int    `json:"expected_length"`
+}
+
+type exporterFile struct {
+	Schema string         `json:"schema"`
+	Cases  []exporterCase `json:"cases"`
+}
+
+func TestVectorTLSExporterParameters(t *testing.T) {
+	path := filepath.Join(vectorsDir(), "tls-exporter", "v0.1", "cases.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Skipf("[skip] tls-exporter vectors absent at %s (%v)", path, err)
+	}
+	var f exporterFile
+	if err := json.Unmarshal(raw, &f); err != nil {
+		t.Fatalf("parse cases.json: %v", err)
+	}
+	if f.Schema != "tls-exporter" {
+		t.Fatalf("unexpected schema %q", f.Schema)
+	}
+	if len(f.Cases) == 0 {
+		t.Fatal("coverage guard: no tls-exporter cases")
+	}
+	for _, c := range f.Cases {
+		if c.CaseKind != "parameters" {
+			t.Fatalf("%s: unexpected case_kind %q", c.VectorID, c.CaseKind)
+		}
+		// Compare the label as BYTES, not as a string: that is how the TLS
+		// stack compares it, and it is why the vector carries hex.
+		if got, want := []byte(ExporterLabel), dh(t, c.LabelHex); !bytes.Equal(got, want) {
+			t.Errorf("%s: ExporterLabel = %q (% x), want % x", c.VectorID, ExporterLabel, got, want)
+		}
+		if ExporterLen != c.LengthVal {
+			t.Errorf("%s: ExporterLen = %d, want %d", c.VectorID, ExporterLen, c.LengthVal)
+		}
+	}
+}
