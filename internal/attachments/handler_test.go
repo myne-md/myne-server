@@ -169,6 +169,101 @@ func TestAttachment_RevokedDeviceGetsDeviceRevokedCode(t *testing.T) {
 	}
 }
 
+// #7: the resume probe is a HEAD, and a HEAD response has no body — Go's
+// net/http discards what the handler writes, and the client's codec does not
+// read one. So `device_revoked` was written into the one place neither side
+// could see, on the one route where the distinction decides whether a client
+// erases its local copy.
+func TestAttachment_RevokedDeviceCodeIsReadableOnHEAD(t *testing.T) {
+	st := NewStore()
+	reg := auth.NewRegistry()
+	ts := auth.NewTokenStore(reg)
+	en := auth.NewEnrollment(reg, ts)
+	var a ids.AccountNumberHash
+	a[0] = 0x42
+	var d ids.DeviceID
+	d[0] = 1
+	res, err := en.Enroll(a, d, auth.PathPassword)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	New(st, ts).Register(mux)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	token := hex.EncodeToString(res.Token)
+	id := strings.Repeat("22", 32)
+
+	if err := reg.Retire(a, d); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, body := req(t, srv, http.MethodHead, "/attachments/"+id, token, "", nil)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("want 401, got %d", resp.StatusCode)
+	}
+	// The body really is empty on HEAD — that is the whole point.
+	if len(body) != 0 {
+		t.Fatalf("HEAD must carry no body, got %d bytes", len(body))
+	}
+	if got := resp.Header.Get("X-Error-Code"); got != "device_revoked" {
+		t.Fatalf("want X-Error-Code device_revoked, got %q", got)
+	}
+}
+
+// #9: uploads precede the push, so a freeze that only gates `/sync/push` let a
+// frozen account keep writing attachment bytes — and those are the bytes GC
+// cannot reclaim, because no head references them.
+func TestAttachment_FrozenAccountCannotUploadButCanStillRead(t *testing.T) {
+	st := NewStore()
+	reg := auth.NewRegistry()
+	ts := auth.NewTokenStore(reg)
+	en := auth.NewEnrollment(reg, ts)
+	var a ids.AccountNumberHash
+	a[0] = 0x42
+	var d ids.DeviceID
+	d[0] = 1
+	res, err := en.Enroll(a, d, auth.PathPassword)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frozen := false
+	mux := http.NewServeMux()
+	New(st, ts).WithFrozenCheck(func(ids.AccountNumberHash) bool { return frozen }).Register(mux)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	token := hex.EncodeToString(res.Token)
+	id := strings.Repeat("33", 32)
+
+	// Unfrozen: the upload lands, so a later refusal is the freeze and not a
+	// broken route.
+	body := []byte("ciphertext")
+	resp, _ := req(t, srv, http.MethodPut, "/attachments/"+id+"?offset=0&total="+strconv.Itoa(len(body)), token, "", body)
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		t.Fatalf("unfrozen upload: want 2xx, got %d", resp.StatusCode)
+	}
+
+	frozen = true
+	id2 := strings.Repeat("44", 32)
+	resp, respBody := req(t, srv, http.MethodPut, "/attachments/"+id2+"?offset=0&total="+strconv.Itoa(len(body)), token, "", body)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("frozen upload: want 403, got %d", resp.StatusCode)
+	}
+	var eb struct {
+		ErrorCode string `json:"error_code"`
+	}
+	_ = json.Unmarshal(respBody, &eb)
+	if eb.ErrorCode != "frozen" {
+		t.Fatalf("want error_code frozen, got %q", eb.ErrorCode)
+	}
+
+	// READS are never gated — freezing must not hold data hostage.
+	resp, _ = req(t, srv, http.MethodGet, "/attachments/"+id, token, "", nil)
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+		t.Fatalf("frozen read: want 2xx, got %d", resp.StatusCode)
+	}
+}
+
 func TestAttachment_Dedup(t *testing.T) {
 	srv, token, st, a := setup(t)
 	defer srv.Close()

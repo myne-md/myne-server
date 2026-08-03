@@ -229,9 +229,7 @@ func runListener(ctx context.Context, ln net.Listener) error {
 	// usedBytes is the unified AS17 stored-byte total the quota gate is defined
 	// against — blobs + attachments. One definition, read by both /account/status and
 	// the operator admin API so the two projections can't drift.
-	usedBytes := func(a ids.AccountNumberHash) uint64 {
-		return blobStore.QuotaBytes(a) + attachStore.AccountBytes(a)
-	}
+	usedBytes := gcquota.UnifiedUsedBytes(blobStore, attachStore)
 	// GET /account/status projection (MYND-506): the caller's own stored bytes +
 	// device count + frozen + EFFECTIVE ceilings. Same sources as the admin API,
 	// scoped to one (token-resolved) account.
@@ -429,7 +427,13 @@ func NewServer(s store.BlobStore, tokens *auth.TokenStore, authHandler *authapi.
 		// F4: record device activity on every authed pull/push so the horizon-GC
 		// soft-retire actually fires (a long-silent device leaves the must-ack set,
 		// unblocking tombstone reclaim). nil when the caller wires no registry.
-		WithActivityTouch(activityTouch)
+		WithActivityTouch(activityTouch).
+		// #8: the push gate resolves "current" from the SAME unified total the
+		// attachment route and /account/status use. It used to read the blob
+		// store alone, so an account whose attachments already filled the quota
+		// kept pushing note blobs past a ceiling its own status endpoint
+		// reported as full.
+		WithUsedBytes(gcquota.UnifiedUsedBytes(s, attachStore))
 	if metrics != nil {
 		syncMux = syncMux.WithMetrics(metrics.ObserveBlobStored)
 	}
@@ -453,6 +457,12 @@ func NewServer(s store.BlobStore, tokens *auth.TokenStore, authHandler *authapi.
 		WithPolicy(rl, qg, func(a ids.AccountNumberHash) uint64 { return s.QuotaBytes(a) })
 	if metrics != nil {
 		attachMux = attachMux.WithMetrics(metrics.ObserveAttachmentStored)
+	}
+	if acctStore != nil {
+		// #9: the same operator freeze the sync push honours. Uploads precede
+		// the push, so gating one route and not the other let a frozen account
+		// keep writing the bytes GC cannot reclaim.
+		attachMux = attachMux.WithFrozenCheck(acctStore.Frozen)
 	}
 	attachMux.Register(mux) // resumable transport (MYND-423)
 

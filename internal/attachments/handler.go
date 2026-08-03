@@ -41,6 +41,22 @@ type Handler struct {
 	// onStored is the aggregate-only metrics hook (SYNC-24): called with the total
 	// byte length when an upload COMPLETES. No account/IP ever crosses it.
 	onStored func(int)
+	// frozen reports whether an account is operator-frozen (MYND-506, #9).
+	//
+	// The freeze was installed on `/sync/push` only, and the client uploads
+	// attachments BEFORE it pushes — so a frozen account kept writing attachment
+	// bytes that only the push would have refused, and those bytes are the ones
+	// GC cannot reclaim (no head references them). PULL is never gated, here as
+	// on the sync route: freezing must not hold data hostage.
+	// nil = no freeze wired.
+	frozen func(account ids.AccountNumberHash) bool
+}
+
+// WithFrozenCheck gates the WRITE route on the operator freeze (#9). Reads are
+// never gated — the "frozen is minimal" invariant.
+func (h *Handler) WithFrozenCheck(fn func(account ids.AccountNumberHash) bool) *Handler {
+	h.frozen = fn
+	return h
 }
 
 // New returns an attachment Handler over any Backend (in-memory or fs).
@@ -107,6 +123,15 @@ func (h *Handler) session(r *http.Request) (auth.Session, string) {
 // code IS the message: it is the only way the client can tell a stale session
 // from a removal it must honour.
 func writeAuthErr(w http.ResponseWriter, code string) {
+	// The code goes in a HEADER as well as the body (#7).
+	//
+	// A HEAD response has no body — Go's net/http discards what a handler
+	// writes, and the client's codec does not read one either. So on the resume
+	// probe, the one route where `device_revoked` decides whether this browser
+	// erases its local copy, the signal was written into a place neither side
+	// could ever see. The body stays for the GET/PUT routes, which do carry one;
+	// the header is what makes the HEAD route able to say the same thing.
+	w.Header().Set("X-Error-Code", code)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusUnauthorized)
 	_, _ = fmt.Fprintf(w, `{"error_code":%q}`, code)
@@ -160,6 +185,21 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request) {
 	sess, authCode := h.session(r)
 	if authCode != "" {
 		writeAuthErr(w, authCode)
+		return
+	}
+	// #9: a frozen account may not WRITE here either.
+	//
+	// The freeze gated `/sync/push` and nothing else, and the client uploads
+	// attachments before it pushes — so a frozen account stored attachment bytes
+	// indefinitely, and they are the bytes GC cannot reclaim: no head references
+	// them, so the horizon sweep never sees them as collectable. Same 403
+	// `frozen` code the sync route answers with, so the client's existing
+	// mapping covers it.
+	if h.frozen != nil && h.frozen(sess.Account) {
+		w.Header().Set("X-Error-Code", "frozen")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = fmt.Fprint(w, `{"error_code":"frozen"}`)
 		return
 	}
 	if h.rl != nil && !h.rl.Allow(sess.Account) {

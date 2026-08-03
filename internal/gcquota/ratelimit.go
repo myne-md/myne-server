@@ -101,6 +101,39 @@ func (q *QuotaGuard) WouldExceedTotalForAccount(account ids.AccountNumberHash, c
 	return currentBytes+addBytes > c
 }
 
+// AccountByteSource is one contributor to an account's stored-byte total.
+// Both the blob store and the attachment store satisfy it.
+type AccountByteSource interface {
+	AccountBytes(account ids.AccountNumberHash) uint64
+}
+
+// BlobByteSource is the blob store's differently-named twin of the above (its
+// method predates the interface).
+type BlobByteSource interface {
+	QuotaBytes(account ids.AccountNumberHash) uint64
+}
+
+// UnifiedUsedBytes is THE definition of an account's stored-byte total: blobs
+// plus attachments (#8).
+//
+// One function, because three places need the same number and they drifted when
+// each resolved it for itself — the push gate counted blobs only, while the
+// attachment gate and GET /account/status counted both. An account whose
+// attachments filled the quota could keep pushing blobs past a ceiling its own
+// status endpoint reported as full.
+func UnifiedUsedBytes(blobs BlobByteSource, attachments AccountByteSource) func(ids.AccountNumberHash) uint64 {
+	return func(a ids.AccountNumberHash) uint64 {
+		var total uint64
+		if blobs != nil {
+			total += blobs.QuotaBytes(a)
+		}
+		if attachments != nil {
+			total += attachments.AccountBytes(a)
+		}
+		return total
+	}
+}
+
 // WouldExceed reports whether storing addBytes more would push the account over its
 // effective ceiling (caller maps true → HTTP 507 "quota"). Uses the dedup'd substrate
 // counter from the blob store (the sync-push path).

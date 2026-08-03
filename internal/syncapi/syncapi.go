@@ -59,8 +59,15 @@ type PreAuthLimiter interface {
 
 // QuotaGuard reports whether storing addBytes would exceed the account ceiling
 // (nil = disabled).
+//
+// Store-AGNOSTIC since #8: the caller supplies the current byte total, because
+// the ceiling is defined against blobs PLUS attachments and only the
+// composition layer can see both. The old `WouldExceed(store, …)` shape took
+// the blob store and resolved "current" from it alone, which is precisely how
+// this route came to enforce a different ceiling than the attachment route and
+// /account/status reported.
 type QuotaGuard interface {
-	WouldExceed(s store.BlobStore, account ids.AccountNumberHash, addBytes uint64) bool
+	WouldExceedTotalForAccount(account ids.AccountNumberHash, currentBytes, addBytes uint64) bool
 }
 
 // Notifier receives a contentless "changed" signal after a successful push (nil =
@@ -98,6 +105,16 @@ type Handler struct {
 	// count, frozen, effective ceilings) for GET /account/status. The account is the
 	// authenticated one; nil = the endpoint reports unavailable.
 	accountStatus func(account ids.AccountNumberHash) any
+	// usedBytes is the UNIFIED per-account stored-byte total — blobs plus
+	// attachments — the AS17 ceiling is defined against (#8).
+	//
+	// The push gate used to resolve "current" from the blob store alone, while
+	// the attachment gate and GET /account/status both counted the unified
+	// figure. So an account whose attachments already filled the quota could
+	// keep pushing note blobs past a ceiling its own status endpoint reported
+	// as full, and the operator's number disagreed with the enforcement.
+	// nil = fall back to the blob-only figure (notes-only tests).
+	usedBytes func(account ids.AccountNumberHash) uint64
 }
 
 // New returns a sync Handler over the given store + token store.
@@ -116,6 +133,17 @@ func (h *Handler) WithFrozenCheck(fn func(account ids.AccountNumberHash) bool) *
 // invoked with the AUTHENTICATED account (never a URL/query value).
 func (h *Handler) WithAccountStatus(fn func(account ids.AccountNumberHash) any) *Handler {
 	h.accountStatus = fn
+	return h
+}
+
+// WithUsedBytes injects the UNIFIED per-account stored-byte total the quota gate
+// is defined against — blobs plus attachments (#8).
+//
+// A closure rather than a second store handle so this package stays decoupled;
+// the composition layer already builds exactly this function once, for
+// /account/status and the operator admin API, so all three read one definition.
+func (h *Handler) WithUsedBytes(fn func(account ids.AccountNumberHash) uint64) *Handler {
+	h.usedBytes = fn
 	return h
 }
 
@@ -424,9 +452,18 @@ func (h *Handler) handlePush(w http.ResponseWriter, r *http.Request) {
 				writeErr(w, http.StatusRequestEntityTooLarge, "too_large")
 				return errPushHandled
 			}
-			if h.qg != nil && h.qg.WouldExceed(h.store, sess.Account, uint64(len(ct))) {
-				writeErr(w, http.StatusInsufficientStorage, "quota")
-				return errPushHandled
+			// #8: gate on the UNIFIED total, the same figure the attachment
+			// route and /account/status use. Without this the ceiling was
+			// per-subsystem in one direction only.
+			if h.qg != nil {
+				current := h.store.QuotaBytes(sess.Account)
+				if h.usedBytes != nil {
+					current = h.usedBytes(sess.Account)
+				}
+				if h.qg.WouldExceedTotalForAccount(sess.Account, current, uint64(len(ct))) {
+					writeErr(w, http.StatusInsufficientStorage, "quota")
+					return errPushHandled
+				}
 			}
 			ver, perr := h.store.PushBlob(sess.Account, id, store.Version(b.BaseVersion), nonce, ct)
 			if errors.Is(perr, store.ErrBlobCASMismatch) {
@@ -630,6 +667,14 @@ func (h *Handler) handleMeta(w http.ResponseWriter, r *http.Request) {
 		}
 		if h.rl != nil && !h.rl.Allow(sess.Account) {
 			writeErr(w, http.StatusTooManyRequests, "rate")
+			return
+		}
+		// #9: the third write route the freeze did not cover. A frozen account
+		// could still overwrite its own `vault.meta` — the blob every other
+		// device bootstraps from — while every note push was refused. The GET
+		// arms below stay ungated: freezing must not hold data hostage.
+		if h.frozen != nil && h.frozen(sess.Account) {
+			writeErr(w, http.StatusForbidden, "frozen")
 			return
 		}
 		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, MaxVaultMetaSize))
