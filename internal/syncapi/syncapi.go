@@ -667,11 +667,23 @@ func (h *Handler) handleBlob(w http.ResponseWriter, r *http.Request) {
 const MaxVaultMetaSize = 64 * 1024
 
 // handleMeta serves the vault.meta blob (MYND-425 enrollment bootstrap):
+//
 //   - PUT /vault.meta            (authed): an enrolled device uploads its meta.
+//
 //   - GET /vault.meta?account=<hex> (PRE-AUTH): a new device fetches the meta by
 //     account_number_hash to derive root_key before it can SCRAM-authenticate.
-//     The bytes are AEAD-protected (useless without the password), so serving by
-//     account# is the accepted A4-equivalent exposure (same as 24-word recovery).
+//     Necessarily pre-auth: the SCRAM secret is derived FROM root_key, so an
+//     authed-only variant is circular.
+//
+//     The bytes are OPAQUE to this server, which is a claim about what the
+//     SERVER learns and not about what a FETCHER gets. This comment used to say
+//     "useless without the password", which inverts the property: they are
+//     useless only for as long as the password holds. What is served is the
+//     complete offline password-cracking target — Argon2id salt, cost
+//     parameters, and both wrapped root_key copies — so anyone holding an
+//     account number can obtain it from anywhere, with no device. That is
+//     accepted, and it is recorded where a reader will look for it:
+//     docs/threat-model.md §7 (technical) and §5 (plain language).
 func (h *Handler) handleMeta(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodPut:
