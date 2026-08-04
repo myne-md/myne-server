@@ -163,6 +163,77 @@ func TestRateLimiter_BucketAndRefill(t *testing.T) {
 	}
 }
 
+func TestRateLimiter_AllowNConsumesExactlyN(t *testing.T) {
+	rl := NewRateLimiter(10, 0)
+	a := acct(0x31)
+	if !rl.AllowN(a, 4) {
+		t.Fatal("4 of 10 should pass")
+	}
+	if !rl.AllowN(a, 6) {
+		t.Fatal("the remaining 6 should pass exactly")
+	}
+	if rl.AllowN(a, 1) {
+		t.Fatal("the bucket should be empty after 4+6 of 10")
+	}
+}
+
+// All-or-nothing: a refused request must not drain what it could not spend, or a
+// batch that is one token short would silently starve the retry behind it.
+func TestRateLimiter_AllowNRefusalConsumesNothing(t *testing.T) {
+	rl := NewRateLimiter(10, 0)
+	a := acct(0x32)
+	if !rl.AllowN(a, 7) {
+		t.Fatal("7 of 10 should pass")
+	}
+	if rl.AllowN(a, 5) {
+		t.Fatal("5 of the remaining 3 must be refused")
+	}
+	if !rl.AllowN(a, 3) {
+		t.Fatal("the refusal consumed tokens it did not get: 3 should still be there")
+	}
+}
+
+// A refused account must still be materialized in the map, or Refill() never
+// finds it and the throttle is permanent.
+func TestRateLimiter_RefusedAccountStillRefills(t *testing.T) {
+	rl := NewRateLimiter(2, 2)
+	a := acct(0x33)
+	if !rl.AllowN(a, 2) {
+		t.Fatal("2 of 2 should pass")
+	}
+	if rl.AllowN(a, 2) {
+		t.Fatal("2 more over an empty bucket must be refused")
+	}
+	rl.Refill()
+	if !rl.AllowN(a, 2) {
+		t.Fatal("a refused account never recovered — it was not materialized for Refill")
+	}
+}
+
+// A cost above burst clamps rather than deadlocking. Without this, a route whose
+// cost scales with request size is permanently 429 on a small-burst operator
+// while every other route works — a broken server, not a throttled one.
+func TestRateLimiter_AllowNAboveBurstClampsNotDeadlocks(t *testing.T) {
+	rl := NewRateLimiter(4, 4)
+	a := acct(0x34)
+	if !rl.AllowN(a, 999) {
+		t.Fatal("a cost above burst should clamp to burst, not refuse forever")
+	}
+	if rl.AllowN(a, 1) {
+		t.Fatal("the clamped charge should have taken the whole bucket")
+	}
+	// ...and burst==0 stays "refuse everything" rather than clamping to free.
+	if NewRateLimiter(0, 0).AllowN(acct(0x35), 3) {
+		t.Fatal("burst=0 must refuse, not clamp the cost to zero")
+	}
+	// n==0 buys nothing free.
+	rl2 := NewRateLimiter(1, 0)
+	b := acct(0x36)
+	if !rl2.AllowN(b, 0) || rl2.AllowN(b, 0) {
+		t.Fatal("n=0 must be charged as 1")
+	}
+}
+
 func TestQuotaGuard_Ceiling(t *testing.T) {
 	st := store.NewMemStore()
 	a := acct(4)

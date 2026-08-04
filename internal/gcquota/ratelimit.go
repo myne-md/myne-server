@@ -29,17 +29,45 @@ func NewRateLimiter(burst, refillPerTick uint64) *RateLimiter {
 // Allow consumes one token for the account, returning false if the bucket is empty
 // (caller maps false → HTTP 429 "rate"). A first-seen account starts full (burst).
 func (r *RateLimiter) Allow(account ids.AccountNumberHash) bool {
+	return r.AllowN(account, 1)
+}
+
+// AllowN consumes n tokens for the account, all-or-nothing: with fewer than n
+// available it consumes NONE and returns false, so a refused request never
+// silently drains the bucket for the retry that follows. A first-seen account
+// starts full (burst).
+//
+// n is CLAMPED to burst. A route whose cost scales with request size (the batch
+// blob fetch charges ceil(ids/BlobFetchIDsPerToken)) would otherwise become
+// permanently unservable on an operator running a small MYNE_RATELIMIT_BURST —
+// 429 forever while the single-blob route works, which reads as a broken server
+// rather than a throttled one. Clamping degrades it to "this costs the whole
+// bucket", which is the honest answer.
+//
+// n == 0 is treated as 1: no route may buy a free request by asking for nothing.
+func (r *RateLimiter) AllowN(account ids.AccountNumberHash, n uint64) bool {
+	if n == 0 {
+		n = 1
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	// burst == 0 is "refuse everything" and must stay that way — clamping to it
+	// would turn every request into a free one.
+	if r.burst > 0 && n > r.burst {
+		n = r.burst
+	}
 	tokens, seen := r.buckets[account]
 	if !seen {
 		tokens = r.burst
 	}
-	if tokens == 0 {
-		r.buckets[account] = 0
+	if tokens < n {
+		// Materialize the bucket even on refusal — that is what puts the account
+		// in the map for Refill() to find, and without it a throttled account
+		// would never recover.
+		r.buckets[account] = tokens
 		return false
 	}
-	r.buckets[account] = tokens - 1
+	r.buckets[account] = tokens - n
 	return true
 }
 
