@@ -110,6 +110,13 @@ type BlobStore interface {
 	// in MYND-422; this is only the substrate counter.
 	QuotaBytes(account ids.AccountNumberHash) uint64
 
+	// BlobQuotaBytes returns the bytes (account, blobID) currently contributes to
+	// QuotaBytes — 0 for an absent or Layer-2 reclaimed blob. A push REPLACES those
+	// bytes rather than adding to them (PushBlob adjusts the counter by the size
+	// delta), so this is what a quota gate must subtract to charge a push its actual
+	// growth instead of its full size.
+	BlobQuotaBytes(account ids.AccountNumberHash, blobID ids.BlobID) uint64
+
 	// SetTombstone records the (note_uuid, final_version, tombstone_marker) triplet
 	// for a deleted blob — the server learns only that a uuid reached a final
 	// version, never "deleted" meaning (AS6). This is the substrate the MYND-422

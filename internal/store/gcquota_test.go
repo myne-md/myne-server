@@ -60,3 +60,40 @@ func TestMemStore_TombstoneRecordRoundTrip(t *testing.T) {
 		t.Fatalf("tombstone record = (%d, %v), want (7, true)", fv, marked)
 	}
 }
+
+// BlobQuotaBytes is the per-blob half of the counter — the bytes a push replaces,
+// which is what the push gate must subtract to charge growth rather than size
+// (myne-server#10). Both backends must report the same figure they net out of
+// QuotaBytes, including 0 for a body horizon-GC already reclaimed.
+func TestBlobQuotaBytes_IsTheBlobsShareOfTheCounter(t *testing.T) {
+	fs, _ := newFS(t)
+	for _, tc := range []struct {
+		name string
+		s    BlobStore
+	}{{"mem", NewMemStore()}, {"fs", fs}} {
+		t.Run(tc.name, func(t *testing.T) {
+			a, id, other := acct(0x07), blob(0x07), blob(0x08)
+			if got := tc.s.BlobQuotaBytes(a, id); got != 0 {
+				t.Fatalf("absent blob = %d, want 0", got)
+			}
+			if _, err := tc.s.PushBlob(a, id, 0, [ContentNonceLen]byte{}, make([]byte, 40)); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tc.s.PushBlob(a, other, 0, [ContentNonceLen]byte{}, make([]byte, 10)); err != nil {
+				t.Fatal(err)
+			}
+			if got, total := tc.s.BlobQuotaBytes(a, id), tc.s.QuotaBytes(a); got != 40 || total != 50 {
+				t.Fatalf("blob = %d, account = %d; want 40 of 50", got, total)
+			}
+			if err := tc.s.SetTombstone(a, id, 1); err != nil {
+				t.Fatal(err)
+			}
+			if err := tc.s.ReclaimTombstone(a, id); err != nil {
+				t.Fatal(err)
+			}
+			if got, total := tc.s.BlobQuotaBytes(a, id), tc.s.QuotaBytes(a); got != 0 || total != 10 {
+				t.Fatalf("after reclaim blob = %d, account = %d; want 0 of 10", got, total)
+			}
+		})
+	}
+}

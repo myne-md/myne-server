@@ -460,7 +460,22 @@ func (h *Handler) handlePush(w http.ResponseWriter, r *http.Request) {
 				if h.usedBytes != nil {
 					current = h.usedBytes(sess.Account)
 				}
-				if h.qg.WouldExceedTotalForAccount(sess.Account, current, uint64(len(ct))) {
+				// #10: charge the push its GROWTH, not its full size. Storing this
+				// blob REPLACES the bytes it holds now, and both backends account
+				// for exactly that delta — charging the whole ciphertext made the
+				// gate stricter than the counter it guards. At the ceiling that
+				// refused a shrink, and refused a deletion too (the tombstone blob
+				// is the note plus a `deleted:` line, so it is LARGER than the
+				// version it replaces); since bytes are freed only by horizon-GC
+				// reclaiming a tombstone, the account could then never free
+				// anything again. Growth past the ceiling is still refused.
+				add := uint64(len(ct))
+				if stored := h.store.BlobQuotaBytes(sess.Account, id); stored < add {
+					add -= stored
+				} else {
+					add = 0
+				}
+				if h.qg.WouldExceedTotalForAccount(sess.Account, current, add) {
 					writeErr(w, http.StatusInsufficientStorage, "quota")
 					return errPushHandled
 				}

@@ -288,6 +288,22 @@ func (m *MemStore) QuotaBytes(account ids.AccountNumberHash) uint64 {
 	return v.quotaBytes
 }
 
+// BlobQuotaBytes returns the blob's own contribution to that total — the exact
+// quantity PushBlob subtracts before adding the incoming ciphertext.
+func (m *MemStore) BlobQuotaBytes(account ids.AccountNumberHash, blobID ids.BlobID) uint64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	v := m.vaults[account]
+	if v == nil {
+		return 0
+	}
+	e := v.blobs[blobID]
+	if e == nil {
+		return 0
+	}
+	return uint64(len(e.ciphertext))
+}
+
 // SetTombstone records the (uuid, final_version, marker) triplet + the blob's
 // current change-sequence (the position a device must ack past). Substrate only —
 // it does not drop ciphertext (L2 reclaim is a separate step).

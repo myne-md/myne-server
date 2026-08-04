@@ -646,6 +646,22 @@ func (s *FSStore) QuotaBytes(account ids.AccountNumberHash) uint64 {
 	return v.quotaBytes
 }
 
+// BlobQuotaBytes answers from the in-memory index — the recorded size is the same
+// figure PushBlob nets out of quotaBytes, so no body read is needed.
+func (s *FSStore) BlobQuotaBytes(account ids.AccountNumberHash, blobID ids.BlobID) uint64 {
+	v := s.lookupVault(account)
+	if v == nil {
+		return 0
+	}
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	m := v.blobs[blobID]
+	if m == nil {
+		return 0
+	}
+	return uint64(m.size)
+}
+
 // ChangedSince selects its window over ALL entries (live + reclaimed) so the
 // cursor advances across reclaimed records, then emits only live ones — a
 // reclaimed uuid is manifest-absent (§11.3), never a size-0 meta. See the
