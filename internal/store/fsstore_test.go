@@ -354,4 +354,56 @@ func TestFSStore_WriteFailureIsCleanReject(t *testing.T) {
 	}
 }
 
+// A live index entry whose body file has gone missing must be a REFUSAL, never
+// a (nil, version, nil) that the API would serve as a 200 with an empty
+// ciphertext. That is the same destructive shape ErrReclaimed's 410 exists to
+// prevent (§11.3) — a blind client cannot tell an empty body from ciphertext,
+// and writes those 0 bytes over a real note.
+func TestFSStore_UnreadableBodyIsRefusedNotServedEmpty(t *testing.T) {
+	s, dir := newFS(t)
+	a, id := acct(0x51), blob(0x51)
+	if _, err := s.PutBlob(a, id, []byte("live-ciphertext")); err != nil {
+		t.Fatalf("PutBlob: %v", err)
+	}
+	// Lose the body while the index entry stays live (a corrupt/partial restore,
+	// a half-deleted vault directory, an fs-level failure).
+	if err := os.Remove(filepath.Join(dir, hex.EncodeToString(a[:]), "blobs", hex.EncodeToString(id[:]))); err != nil {
+		t.Fatalf("remove body: %v", err)
+	}
+	got, v, err := s.GetBlob(a, id)
+	if !errors.Is(err, ErrBodyUnreadable) {
+		t.Fatalf("unreadable body: err=%v want ErrBodyUnreadable (got body %q v=%d)", err, got, v)
+	}
+	if got != nil {
+		t.Fatalf("unreadable body returned bytes: %q", got)
+	}
+	// Distinct from both neighbouring sentinels: the record exists (not
+	// ErrNotFound) and nothing reclaimed it (not ErrReclaimed).
+	if errors.Is(err, ErrNotFound) || errors.Is(err, ErrReclaimed) {
+		t.Fatalf("unreadable body collapsed into a neighbouring sentinel: %v", err)
+	}
+}
+
+// The idempotent re-put fast path skips the body write when it sees equality,
+// so an unreadable body must compare NOT equal. The empty ciphertext is the
+// case that used to slip: readBody flattened its error to nil, and nil compared
+// equal to empty — leaving the index pointing at a file that was never written.
+func TestFSStore_RePutOverUnreadableBodyRewritesIt(t *testing.T) {
+	s, dir := newFS(t)
+	a, id := acct(0x52), blob(0x52)
+	if _, err := s.PutBlob(a, id, nil); err != nil {
+		t.Fatalf("PutBlob empty: %v", err)
+	}
+	path := filepath.Join(dir, hex.EncodeToString(a[:]), "blobs", hex.EncodeToString(id[:]))
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("remove body: %v", err)
+	}
+	if _, err := s.PutBlob(a, id, nil); err != nil {
+		t.Fatalf("re-put over lost body: %v", err)
+	}
+	if _, _, err := s.GetBlob(a, id); err != nil {
+		t.Fatalf("body not restored by the re-put: %v", err)
+	}
+}
+
 var _ BlobStore = (*FSStore)(nil)

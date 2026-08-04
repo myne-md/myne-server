@@ -33,6 +33,16 @@ var ErrNotFound = errors.New("store: not found")
 // "reclaimed, full-reconcile" instead of serving an empty body as if live.
 var ErrReclaimed = errors.New("store: blob reclaimed")
 
+// ErrBodyUnreadable is returned when a blob's index entry is live but its
+// ciphertext body could not be read back from the backing store. Distinct from
+// ErrNotFound (the record does exist) and from ErrReclaimed (nothing reclaimed
+// it — the body is simply gone or unreadable), and NEVER flattened to a nil
+// body: a live zero-byte ciphertext is precisely what the §11.3 fail-closed
+// rule exists to prevent, and a puller would write those 0 bytes over a real
+// note. The underlying path is deliberately not carried in the error — it
+// contains the account hash.
+var ErrBodyUnreadable = errors.New("store: blob body unreadable")
+
 // ErrHeadCASMismatch is returned when an AdvanceHead's prev-hash does not match
 // the current head pointer (a stale base — a fork the server must not accept).
 var ErrHeadCASMismatch = errors.New("store: head CAS mismatch")

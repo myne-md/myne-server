@@ -436,13 +436,32 @@ func decodeDeviceID(s string) (ids.DeviceID, bool) {
 	return d, true
 }
 
-// readBody returns the on-disk ciphertext for a blob, or nil if absent/reclaimed.
-func (s *FSStore) readBody(a ids.AccountNumberHash, b ids.BlobID) []byte {
+// readBody returns the on-disk ciphertext for a blob. A read error is REPORTED
+// as ErrBodyUnreadable, never flattened to nil: a live index entry whose body
+// file is missing or unreadable must not read as a live zero-byte ciphertext.
+// That is exactly the shape ErrReclaimed's 410 exists to prevent (§11.3) — an
+// empty 200 is indistinguishable from ciphertext to a blind client, and was
+// observed destroying live local notes.
+func (s *FSStore) readBody(a ids.AccountNumberHash, b ids.BlobID) ([]byte, error) {
 	data, err := os.ReadFile(s.blobPath(a, b))
 	if err != nil {
-		return nil
+		return nil, ErrBodyUnreadable
 	}
-	return data
+	return data, nil
+}
+
+// bodyEquals reports whether the on-disk body for a blob is byte-identical to
+// `ciphertext`. An unreadable body is NOT equal — the idempotent re-put paths
+// skip the write when they see equality, so answering "equal" for a body we
+// could not read would leave the index pointing at a file that never got
+// written. Before readBody reported its errors that was reachable for an EMPTY
+// ciphertext, where the flattened nil compared equal.
+func (s *FSStore) bodyEquals(a ids.AccountNumberHash, b ids.BlobID, ciphertext []byte) bool {
+	data, err := s.readBody(a, b)
+	if err != nil {
+		return false
+	}
+	return bytesEqual(data, ciphertext)
 }
 
 // --- BlobStore implementation ----------------------------------------------
@@ -455,7 +474,7 @@ func (s *FSStore) PutBlob(account ids.AccountNumberHash, blobID ids.BlobID, ciph
 		return 0, ErrNotFound
 	}
 	m := v.blobs[blobID]
-	if m != nil && !m.reclaimed && bytesEqual(s.readBody(account, blobID), ciphertext) {
+	if m != nil && !m.reclaimed && s.bodyEquals(account, blobID, ciphertext) {
 		return m.version, nil // idempotent re-put
 	}
 	// Write the body FIRST: a failed write (e.g. ENOSPC) returns cleanly and leaves
@@ -493,7 +512,7 @@ func (s *FSStore) PushBlob(account ids.AccountNumberHash, blobID ids.BlobID, bas
 	}
 	if baseVersion != cur {
 		if m != nil && m.version == baseVersion+1 && !m.reclaimed &&
-			m.contentNonce == contentNonce && bytesEqual(s.readBody(account, blobID), ciphertext) {
+			m.contentNonce == contentNonce && s.bodyEquals(account, blobID, ciphertext) {
 			return m.version, nil // idempotent replay
 		}
 		return 0, ErrBlobCASMismatch
@@ -504,7 +523,7 @@ func (s *FSStore) PushBlob(account ids.AccountNumberHash, blobID ids.BlobID, bas
 	// its tombstone, and absorbing the nonce change would hide the deletion
 	// from every other device's change feed.
 	if m != nil && m.version != 0 && !m.reclaimed && m.contentNonce == contentNonce &&
-		bytesEqual(s.readBody(account, blobID), ciphertext) {
+		s.bodyEquals(account, blobID, ciphertext) {
 		return m.version, nil
 	}
 	// Write the body FIRST (graceful ENOSPC, SYNC-23): a failed write leaves the
@@ -550,7 +569,15 @@ func (s *FSStore) GetBlob(account ids.AccountNumberHash, blobID ids.BlobID) ([]b
 	if m.reclaimed {
 		return nil, m.version, ErrReclaimed
 	}
-	return s.readBody(account, blobID), m.version, nil
+	// A live index entry whose body is unreadable is a refusal, not a 200 with
+	// an empty ciphertext — same fail-closed reason as the reclaimed arm above,
+	// arrived at through a different door (a lost or corrupt file rather than a
+	// deliberate Layer-2 reclaim).
+	body, err := s.readBody(account, blobID)
+	if err != nil {
+		return nil, m.version, err
+	}
+	return body, m.version, nil
 }
 
 func (s *FSStore) BlobVersion(account ids.AccountNumberHash, blobID ids.BlobID) (Version, error) {
