@@ -521,14 +521,16 @@ func (m *MemStore) ListAccounts() []ids.AccountNumberHash {
 var _ BlobStore = (*MemStore)(nil)
 
 // SetMeta stores the opaque AEAD vault.meta blob for an account (MYND-425
-// enrollment bootstrap). Called by an enrolled device's authed upload.
-func (m *MemStore) SetMeta(account ids.AccountNumberHash, meta []byte) {
+// enrollment bootstrap). Called by an enrolled device's authed upload. Nothing
+// here can fail — the error is the seam's, for the backends that touch a disk.
+func (m *MemStore) SetMeta(account ids.AccountNumberHash, meta []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	v := m.vault(account)
 	buf := make([]byte, len(meta))
 	copy(buf, meta)
 	v.meta = buf
+	return nil
 }
 
 // GetMeta returns the stored vault.meta blob, or ErrNotFound when the account has

@@ -612,15 +612,17 @@ func (s *FSStore) AdvanceHead(account ids.AccountNumberHash, prevHeadHash [HeadI
 	return newID, nil
 }
 
-func (s *FSStore) SetMeta(account ids.AccountNumberHash, meta []byte) {
+func (s *FSStore) SetMeta(account ids.AccountNumberHash, meta []byte) error {
 	v := s.vaultFor(account)
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	if v.deleted {
-		return
+		return ErrNotFound
 	}
-	_ = atomicWrite(filepath.Join(s.vaultDir(account), "meta"), meta)
-	_ = s.persist(account, v) // ensure the vault dir/index exists
+	if err := atomicWrite(filepath.Join(s.vaultDir(account), "meta"), meta); err != nil {
+		return err
+	}
+	return s.persist(account, v) // ensure the vault dir/index exists
 }
 
 func (s *FSStore) GetMeta(account ids.AccountNumberHash) ([]byte, error) {

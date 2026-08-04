@@ -682,7 +682,15 @@ func (h *Handler) handleMeta(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusRequestEntityTooLarge, "too_large")
 			return
 		}
-		h.store.SetMeta(sess.Account, body)
+		// The 200 is what the device acts on: it clears the dirty marker and pins
+		// this meta as its baseline. Answering ok for a meta the store never
+		// wrote does not just lose the upload — the next cycle reads the stale
+		// server copy as an authoritative remote change and rolls a password
+		// change back. Report the failure so the client retries instead.
+		if err := h.store.SetMeta(sess.Account, body); err != nil {
+			writeErr(w, http.StatusInternalServerError, "internal")
+			return
+		}
 		writeJSON(w, map[string]bool{"ok": true})
 
 	case http.MethodGet:

@@ -87,7 +87,14 @@ type BlobStore interface {
 	// SetMeta stores the opaque AEAD vault.meta blob (MYND-425 enrollment
 	// bootstrap); GetMeta returns it (ErrNotFound if absent). Served pre-auth by
 	// account_number_hash so a new device can derive root_key before SCRAM-auth.
-	SetMeta(account ids.AccountNumberHash, meta []byte)
+	//
+	// It returns its write error like every other durable mutation on this seam,
+	// because the PUT's success is what the client acts on: it clears the dirty
+	// marker and pins the uploaded meta as its baseline. A swallowed failure
+	// therefore costs more than the upload — the next cycle reads the stale
+	// server meta as an authoritative remote change and reverts a password
+	// change on the very device that made it.
+	SetMeta(account ids.AccountNumberHash, meta []byte) error
 	GetMeta(account ids.AccountNumberHash) ([]byte, error)
 
 	// AdvanceHead atomically compare-and-swaps the current-head pointer. prevHeadHash
