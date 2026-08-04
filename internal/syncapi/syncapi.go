@@ -44,9 +44,46 @@ const MaxPullLimit = 1024
 // §AS17) and re-sent on every pull's GetHead.
 const MaxHeadRecordSize = 64 * 1024
 
+// MaxBlobFetchIDs is the hard ceiling on the ids one POST /sync/blobs may carry.
+// Unlike MaxPullLimit this REFUSES (413) rather than clamping: a clamped pull
+// page still advances a cursor, so the client makes progress and comes back for
+// the rest, whereas a silently truncated fetch would let a client believe it
+// asked about ids it never heard back on. The client knows its own id count
+// exactly, so exceeding this is a client bug and deserves to be loud.
+const MaxBlobFetchIDs = 256
+
+// MaxBlobFetchBytes bounds the raw ciphertext ONE batch response carries, measured
+// before base64 (the wire body is ~4/3 of this plus ~60 B of JSON framing per
+// entry, ≈11 MiB, comfortably inside the client's 64 MiB response cap). Exceeding
+// it is not an error: the server serves the prefix that fits and the client
+// re-requests the rest. The client cannot always plan correctly — the `size` it
+// windows on is advertised by the server and untrusted, and an older server
+// omits it entirely — so this bound has to be forgiving where the id count is not.
+const MaxBlobFetchBytes = 8 * 1024 * 1024
+
+// MaxBlobFetchRequestBytes bounds the batch REQUEST body. It is a list of 32-char
+// hex strings, so 64 KiB holds MaxBlobFetchIDs of them with ~8× headroom — the
+// push path's MaxBlobSize*4 reader would be four orders of magnitude too generous
+// for a body that carries no ciphertext.
+const MaxBlobFetchRequestBytes = 64 * 1024
+
+// BlobFetchIDsPerToken is how many batched ids one rate-limit token buys, so a
+// batch costs ceil(len(ids)/BlobFetchIDsPerToken) — a full MaxBlobFetchIDs window
+// costs 8, and a one-id batch still costs exactly 1 (the single-blob fallback
+// path's budget is unchanged). Pricing a batch at one flat token would multiply
+// the per-account egress ceiling by MaxBlobFetchIDs with nothing behind it: 507
+// bounds STORED bytes and has no path on a read route, so this bucket is the only
+// egress bound there is. Pricing it per-id would reproduce exactly the throughput
+// ceiling the batch route exists to remove. Deliberately a constant, not a config
+// knob — the derivation is the documentation.
+const BlobFetchIDsPerToken = 32
+
 // RateLimiter gates requests per account (nil = disabled).
 type RateLimiter interface {
 	Allow(account ids.AccountNumberHash) bool
+	// AllowN charges n tokens all-or-nothing, for a route whose cost scales with
+	// the request rather than being flat.
+	AllowN(account ids.AccountNumberHash, n uint64) bool
 }
 
 // PreAuthLimiter gates the ONE pre-auth (session-less) route this package serves —
@@ -206,6 +243,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/sync/push", h.handlePush)
 	mux.HandleFunc("/sync/pull", h.handlePull)
 	mux.HandleFunc("/sync/blob", h.handleBlob)
+	mux.HandleFunc("/sync/blobs", h.handleBlobs)
 	mux.HandleFunc("/vault.meta", h.handleMeta)
 	mux.HandleFunc("/account/status", h.handleAccountStatus)
 }
@@ -276,6 +314,42 @@ type pullResp struct {
 type blobResp struct {
 	CiphertextB64 string `json:"ciphertext_b64"`
 	Version       uint64 `json:"version"`
+}
+
+// blobsReq is the POST /sync/blobs body: the ids to fetch, in the order the
+// client wants them accounted for.
+type blobsReq struct {
+	BlobIDsHex []string `json:"blob_ids_hex"`
+}
+
+// blobEntry is one served ciphertext. No `version` field, deliberately: the
+// single-blob route carries one and no client reads it, because the version a
+// puller adopts comes from the pull meta whose content_nonce it verified.
+// Shipping a second, differently-sourced version here would invite a future
+// reader to adopt it and silently move the CAS base.
+type blobEntry struct {
+	BlobIDHex     string `json:"blob_id_hex"`
+	CiphertextB64 string `json:"ciphertext_b64"`
+}
+
+// blobOmitted is one id the server accounted for but did not serve, carrying the
+// SAME error_code strings the single-blob route emits as statuses. This array is
+// load-bearing, not cosmetic: a reclaimed record must never come back as an entry
+// with an empty ciphertext_b64, because a blind client cannot tell that from real
+// bytes and would write 0 bytes over a live note (§11.3, the reason the single
+// route is 410 rather than an empty 200).
+type blobOmitted struct {
+	BlobIDHex string `json:"blob_id_hex"`
+	ErrorCode string `json:"error_code"`
+}
+
+// blobsResp accounts for a PREFIX of the requested ids, in request order: every
+// id it reached appears in exactly one of the two arrays, and an id in neither
+// was not served — the client re-requests it. That is what lets the byte budget
+// truncate safely without the client having to guess right.
+type blobsResp struct {
+	Blobs   []blobEntry   `json:"blobs"`
+	Omitted []blobOmitted `json:"omitted"`
 }
 
 // errBody is the thin machine-readable error envelope (SYNC-6). The HTTP status is
@@ -660,6 +734,114 @@ func (h *Handler) handleBlob(w http.ResponseWriter, r *http.Request) {
 		CiphertextB64: base64.StdEncoding.EncodeToString(ct),
 		Version:       uint64(ver),
 	})
+}
+
+// handleBlobs serves POST /sync/blobs: up to MaxBlobFetchIDs opaque ciphertexts
+// in ONE request, the read-path twin of the chunked push (myne-md/myne#240). The
+// pull path was one HTTP request per blob, so a first sync of a large vault spent
+// its whole cost in round-trips against the per-account bucket rather than in
+// bandwidth. Blind relay throughout — the server never inspects a ciphertext.
+//
+// The spine is handleBlob's, in the same order (method → session → rate limit →
+// parse → store), with two deliberate divergences:
+//
+//   - No frozen gate. Reads are never refused; handleBlob and handlePull both
+//     omit it and this must match them, not handlePush.
+//   - No touchActivity. handleBlob does not touch either, and a batch fetch
+//     always follows a pull in the same cycle, which already did.
+//
+// Per-id outcomes are fail-closed the way §11.3 requires: a reclaimed or unknown
+// id is reported by OMISSION FROM THE PAYLOAD plus an explicit code, never as an
+// entry with empty bytes.
+func (h *Handler) handleBlobs(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeErr(w, http.StatusMethodNotAllowed, "bad_request")
+		return
+	}
+	sess, authCode := h.sessionWithCode(r)
+	if authCode != "" {
+		writeErr(w, http.StatusUnauthorized, authCode)
+		return
+	}
+	// Charge one token BEFORE the body is read, so an unparseable request costs
+	// exactly what it costs on every other route. The rest of the batch's cost
+	// depends on len(ids) and can only be charged after decoding — but it is
+	// charged before any store work, so a large batch can never run free.
+	if h.rl != nil && !h.rl.AllowN(sess.Account, 1) {
+		writeErr(w, http.StatusTooManyRequests, "rate")
+		return
+	}
+	var req blobsReq
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, MaxBlobFetchRequestBytes)).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "bad_request")
+		return
+	}
+	if len(req.BlobIDsHex) > MaxBlobFetchIDs {
+		writeErr(w, http.StatusRequestEntityTooLarge, "too_large")
+		return
+	}
+	if cost := uint64(len(req.BlobIDsHex)+BlobFetchIDsPerToken-1) / BlobFetchIDsPerToken; h.rl != nil && cost > 1 {
+		if !h.rl.AllowN(sess.Account, cost-1) {
+			writeErr(w, http.StatusTooManyRequests, "rate")
+			return
+		}
+	}
+	// A malformed id fails the WHOLE request rather than becoming a per-id
+	// omission: it is a client bug, and answering it per-id would let a client
+	// mistake "you sent me garbage" for "the server does not have this".
+	fetch := make([]ids.BlobID, 0, len(req.BlobIDsHex))
+	for _, s := range req.BlobIDsHex {
+		id, ok := parseBlobID(s)
+		if !ok {
+			writeErr(w, http.StatusBadRequest, "bad_request")
+			return
+		}
+		fetch = append(fetch, id)
+	}
+
+	resp := blobsResp{Blobs: []blobEntry{}, Omitted: []blobOmitted{}}
+	bytesSoFar := 0
+	for i, id := range fetch {
+		// Echo the CANONICAL lowercase hex of the parsed id, not the client's raw
+		// string: hex decoding accepts either case, and a response that mirrors
+		// the request's casing would make the client's id lookup depend on what
+		// it happened to send.
+		idHex := hex.EncodeToString(id[:])
+		ct, _, err := h.store.GetBlob(sess.Account, id)
+		switch {
+		case errors.Is(err, store.ErrReclaimed):
+			// Never an entry with empty bytes — see the type doc on blobOmitted.
+			resp.Omitted = append(resp.Omitted, blobOmitted{BlobIDHex: idHex, ErrorCode: "blob_reclaimed"})
+		case errors.Is(err, store.ErrNotFound):
+			// Also the answer for an id belonging to ANOTHER account: the store is
+			// namespaced per account, so a cross-account id is simply absent here.
+			// It must not be blob_reclaimed, which would confirm the id exists
+			// somewhere.
+			resp.Omitted = append(resp.Omitted, blobOmitted{BlobIDHex: idHex, ErrorCode: "not_found"})
+		case err != nil:
+			// Deliberately NOT the 500 the single-blob route returns. A 500 here
+			// poisons the whole window, which kills the client's cycle, which
+			// means one unreadable file wedges that account's sync permanently.
+			// As a per-id omission the client skips the record without adopting a
+			// baseline, so the next cycle re-lists it and it self-heals.
+			resp.Omitted = append(resp.Omitted, blobOmitted{BlobIDHex: idHex, ErrorCode: "internal"})
+		default:
+			// Close the response BEFORE the entry that would overrun the byte
+			// budget, and stop entirely — the response must describe a clean
+			// prefix, so nothing may be appended past the cut. `i > 0` is what
+			// lets a lone oversized blob through rather than looping on it
+			// forever; the client always gets at least one id accounted for.
+			if i > 0 && bytesSoFar+len(ct) > MaxBlobFetchBytes {
+				break
+			}
+			bytesSoFar += len(ct)
+			resp.Blobs = append(resp.Blobs, blobEntry{
+				BlobIDHex:     idHex,
+				CiphertextB64: base64.StdEncoding.EncodeToString(ct),
+			})
+		}
+	}
+	writeJSON(w, resp)
 }
 
 // MaxVaultMetaSize bounds an uploaded vault.meta (the v0.1 meta is 345 bytes;

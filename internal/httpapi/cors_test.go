@@ -28,6 +28,7 @@ var browserRoutes = []struct {
 	{"POST", "/sync/push", false},
 	{"POST", "/sync/pull", false},
 	{"GET", "/sync/blob", false},
+	{"POST", "/sync/blobs", false},
 	{"GET", "/sync/poke", false},
 	{"GET", "/account/status", false},
 	{"HEAD", "/attachments/aa", false},

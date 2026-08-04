@@ -80,6 +80,33 @@ func FuzzPushBody(f *testing.F) {
 	})
 }
 
+func FuzzBlobsBody(f *testing.F) {
+	mux, token := fuzzServer(f)
+	id := strings.Repeat("aa", 16)
+	for _, s := range []string{
+		``,
+		`{}`,
+		`{"blob_ids_hex":[]}`,
+		`{"blob_ids_hex":null}`,
+		`{"blob_ids_hex":["` + id + `"]}`,
+		`{"blob_ids_hex":["zz"]}`,
+		`{"blob_ids_hex":[""]}`,
+		`{"blob_ids_hex":[` + strings.Repeat(`"`+id+`",`, 99) + `"` + id + `"]}`,
+		// Far above MaxBlobFetchIDs: the count cap must refuse before the handler
+		// allocates a slice sized by the attacker.
+		`{"blob_ids_hex":[` + strings.Repeat(`"`+id+`",`, 99_999) + `"` + id + `"]}`,
+		`{"blob_ids_hex":"not-an-array"}`,
+		`[[[[[[[[`,
+	} {
+		f.Add(s)
+	}
+	f.Fuzz(func(t *testing.T, body string) {
+		req := httptest.NewRequest(http.MethodPost, "/sync/blobs", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+token)
+		assertNo5xx(t, mux, req)
+	})
+}
+
 func FuzzBlobIDParam(f *testing.F) {
 	mux, token := fuzzServer(f)
 	for _, s := range []string{"", "aa", strings.Repeat("aa", 16), "zz", "00", strings.Repeat("f", 1000), "%zz", "../../etc"} {
