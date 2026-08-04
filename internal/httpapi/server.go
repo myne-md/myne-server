@@ -9,6 +9,7 @@ package httpapi
 import (
 	"context"
 	"errors"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -52,11 +53,31 @@ const (
 // newHTTPServer builds an http.Server with the hardened connection timeouts applied.
 // Both the public edge and the internal metrics listener route through it so neither
 // is left with Go's unlimited defaults.
+//
+// ErrorLog is discarded, and that is a privacy control rather than tidiness.
+// `net/http` writes its own connection-level lines there, and they embed
+// `http.conn.remoteAddr` — the address captured at accept time, NOT
+// `http.Request.RemoteAddr`. The `noIP` middleware blanks the latter and cannot
+// reach the former: it is a request-struct mutation and these lines are emitted
+// above the handler chain entirely. With ErrorLog nil they default to the `log`
+// package, i.e. stderr, i.e. the container's log stream — which is precisely the
+// persistent record `threat-model.md` AS14 and `server-protocol.md` §5.2 say does
+// not exist.
+//
+// Two stdlib sites reach it. A handler panic logs "http: panic serving %v" with
+// the address, and a failed TLS handshake logs "http: TLS handshake error from
+// %s" — the second never passes through any middleware at all, so no amount of
+// handler-level care would have covered it.
+//
+// Discarding does not make a panic invisible: `recoverPanic` (see noip.go) logs
+// a bounded, IP-free line and returns 500. Discarding without that would trade an
+// IP leak for silence.
 func newHTTPServer(h http.Handler) *http.Server {
 	return &http.Server{
 		Handler:           h,
 		ReadHeaderTimeout: readHeaderTimeout,
 		IdleTimeout:       idleTimeout,
+		ErrorLog:          log.New(io.Discard, "", 0),
 	}
 }
 
@@ -474,6 +495,10 @@ func NewServer(s store.BlobStore, tokens *auth.TokenStore, authHandler *authapi.
 		h = metrics.middleware(h)
 	}
 	h = accessLog(nil, h)
+	// Panic recovery sits INSIDE noIP and outside the router, so a panic in any
+	// handler becomes a bounded IP-free log line plus a 500 rather than a
+	// stdlib line carrying the client address (see newHTTPServer's ErrorLog).
+	h = recoverPanic(h)
 	// CORS for the browser client (main repo phase3-web-client task 34) sits
 	// directly INSIDE noIP and outside everything else: preflights must be
 	// answered before any router or token check runs, because the routes the
