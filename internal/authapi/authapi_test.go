@@ -367,3 +367,89 @@ func TestScramInit_RejectsNonCanonicalUsernameUniformly(t *testing.T) {
 		}
 	}
 }
+
+// A client-side whole-vault re-key changes `derive_subkey(root_key, ServerAuth)`,
+// so the account's SCRAM verifier has to change with it (`protocol.md` §10.4,
+// myne-md/myne#429). `/auth/register` is first-write-only and must stay that way,
+// so the replace lives behind the bearer token — and the account comes from the
+// SESSION, never from the body.
+//
+// Each assertion below is a separate way this could be wrong: unauthenticated
+// must not replace, an authenticated replace must actually take effect (the OLD
+// secret stops working AND the new one starts), and an account with no verifier
+// must not be created through this route.
+func TestReplaceVerifier(t *testing.T) {
+	c := newEnv(t)
+	c.register(t)
+	fr := c.scramEnroll(t, devID(0x01), "password")
+	if fr.TokenHex == "" {
+		t.Fatal("enrolment must yield a token to authenticate the replace with")
+	}
+
+	newSecret := bytes.Repeat([]byte{0xcd}, 32)
+	newSalt := bytes.Repeat([]byte{0x22}, 16)
+	newCred, err := scram.MakeCredential(newSecret, newSalt, c.iters)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := replaceVerifierReq{
+		Username: c.username, SaltHex: hex.EncodeToString(newSalt),
+		Iterations: c.iters, StoredKeyHex: hex.EncodeToString(newCred.StoredKey),
+		ServerKeyHex: hex.EncodeToString(newCred.ServerKey),
+	}
+
+	// (1) No token → refused. Otherwise this route would be a weaker
+	//     /auth/register rather than a stronger one.
+	resp, _ := postJSON(t, c.srv.URL+"/auth/verifier", "", body)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated replace must 401, got %d", resp.StatusCode)
+	}
+
+	// (2) With the device's own token → accepted.
+	resp, _ = postJSON(t, c.srv.URL+"/auth/verifier", fr.TokenHex, body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("authed replace must 200, got %d", resp.StatusCode)
+	}
+
+	// (3) It actually TOOK. Asserting only the 200 above would pass against a
+	//     handler that parsed the body and dropped it, which is the whole failure
+	//     mode worth testing here. `/auth/scram/init` echoes the stored salt, so
+	//     it is a direct read of the credential the server now holds.
+	_, initBody := postJSON(t, c.srv.URL+"/auth/scram/init", "", scramInitReq{
+		AccountHashHex: c.account, Username: c.username, ClientNonce: "cn-check",
+	})
+	var got scramInitResp
+	if err := json.Unmarshal(initBody, &got); err != nil {
+		t.Fatalf("scram/init body: %v", err)
+	}
+	if got.SaltHex != hex.EncodeToString(newSalt) {
+		t.Fatalf("the stored verifier was not replaced: salt is %q, want %q",
+			got.SaltHex, hex.EncodeToString(newSalt))
+	}
+
+	// …and a full handshake under the NEW secret completes, which the old one
+	// could not.
+	c.secret = newSecret
+	c.salt = newSalt
+	_ = c.scramEnroll(t, devID(0x02), "password")
+}
+
+// The replace route must not be a way to create an account's credential — that
+// is /auth/register's job, and its first-write-only rule plus the capacity cap
+// are what bound an unauthenticated flood.
+func TestReplaceVerifier_UnregisteredAccountIsNotCreated(t *testing.T) {
+	c := newEnv(t)
+	c.register(t)
+	fr := c.scramEnroll(t, devID(0x01), "password")
+
+	// A well-formed body whose username is NOT this session's account.
+	cred, _ := scram.MakeCredential(c.secret, c.salt, c.iters)
+	resp, _ := postJSON(t, c.srv.URL+"/auth/verifier", fr.TokenHex, replaceVerifierReq{
+		Username: strings.Repeat("99", 16), SaltHex: hex.EncodeToString(c.salt),
+		Iterations: c.iters, StoredKeyHex: hex.EncodeToString(cred.StoredKey),
+		ServerKeyHex: hex.EncodeToString(cred.ServerKey),
+	})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("a username that is not the session's account must 400, got %d", resp.StatusCode)
+	}
+}

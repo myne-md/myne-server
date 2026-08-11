@@ -218,6 +218,7 @@ func (h *Handler) WithClock(now func() time.Time) *Handler {
 // Register wires the auth routes onto a mux.
 func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/auth/register", h.handleRegister)
+	mux.HandleFunc("/auth/verifier", h.handleReplaceVerifier)
 	mux.HandleFunc("/auth/scram/init", h.handleScramInit)
 	mux.HandleFunc("/auth/scram/final", h.handleScramFinal)
 	mux.HandleFunc("/auth/devices", h.handleDevices)
@@ -319,6 +320,98 @@ func (h *Handler) handleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.creds[account] = storedCredential{
+		username: req.Username,
+		cred: scram.Credential{
+			Salt:       salt,
+			Iterations: req.Iterations,
+			StoredKey:  storedKey,
+			ServerKey:  serverKey,
+		},
+	}
+	doSave = true
+	writeJSON(w, map[string]bool{"ok": true})
+}
+
+// --- POST /auth/verifier: REPLACE the SCRAM verifier (authed) ---
+//
+// `/auth/register` is first-write-only by design: an unauthenticated caller must
+// not be able to overwrite an account's credential. That leaves no path at all
+// for the one case where the verifier legitimately changes — a client-side
+// whole-vault re-key (`protocol.md` §10.4, myne-md/myne#429). The SCRAM secret is
+// `derive_subkey(root_key, ServerAuth)`, so a new `root_key` means a new
+// verifier; without this route the account keeps the old one, an already-enrolled
+// device keeps working only until its bearer token expires, and then every
+// handshake — including a new device's enrolment — fails 401 forever.
+//
+// The authorization is the bearer token itself: only a device that has ALREADY
+// authenticated against the account may replace its verifier, and it may replace
+// only its OWN account's (the account comes from the session, never from the
+// body). So this is not a weaker `/auth/register`; it is a strictly stronger one,
+// and the unauthenticated route keeps its first-write-only rule unchanged.
+//
+// The server learns nothing new: a verifier is opaque to it either way, and it
+// already stores one.
+
+type replaceVerifierReq struct {
+	Username     string `json:"username"`
+	SaltHex      string `json:"salt_hex"`
+	Iterations   int    `json:"iterations"`
+	StoredKeyHex string `json:"stored_key_hex"`
+	ServerKeyHex string `json:"server_key_hex"`
+}
+
+func (h *Handler) handleReplaceVerifier(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeErr(w, http.StatusMethodNotAllowed, "bad_request")
+		return
+	}
+	// The account is taken from the SESSION, never from the body: a device may
+	// replace only the verifier of the account it authenticated against.
+	authz := r.Header.Get("Authorization")
+	const pfx = "Bearer "
+	if !strings.HasPrefix(authz, pfx) {
+		writeErr(w, http.StatusUnauthorized, "unauthenticated")
+		return
+	}
+	tok, err := hex.DecodeString(strings.TrimPrefix(authz, pfx))
+	if err != nil {
+		writeErr(w, http.StatusUnauthorized, "unauthenticated")
+		return
+	}
+	sess, err := h.tokens.AuthenticateSession(ids.DeviceToken(tok))
+	if err != nil {
+		writeErr(w, http.StatusUnauthorized, auth.FailureCode(err))
+		return
+	}
+	var req replaceVerifierReq
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, MaxAuthBodySize)).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "bad_request")
+		return
+	}
+	salt, e1 := hex.DecodeString(req.SaltHex)
+	storedKey, e2 := hex.DecodeString(req.StoredKeyHex)
+	serverKey, e3 := hex.DecodeString(req.ServerKeyHex)
+	// Same AS9 door as /auth/register: the SCRAM username MUST be the canonical
+	// lowercase hex of the account hash, so persisted auth state structurally
+	// cannot come to contain a raw account number.
+	if e1 != nil || e2 != nil || e3 != nil || req.Iterations < 1 ||
+		req.Username != canonicalUsername(sess.Account) {
+		writeErr(w, http.StatusBadRequest, "bad_request")
+		return
+	}
+
+	var doSave bool
+	defer h.maybeSave(&doSave)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if _, exists := h.creds[sess.Account]; !exists {
+		// Nothing to replace. Not a capacity insert either — an authenticated
+		// device implies a registered account, so this is a client bug rather
+		// than a route to grow `creds` through.
+		writeErr(w, http.StatusNotFound, "not_registered")
+		return
+	}
+	h.creds[sess.Account] = storedCredential{
 		username: req.Username,
 		cred: scram.Credential{
 			Salt:       salt,
