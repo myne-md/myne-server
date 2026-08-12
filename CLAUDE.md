@@ -42,7 +42,19 @@ When Phase 2 begins, document these in the main repo `design notes.md`:
 
 ## Vector verification
 
-Every server-side primitive (Argon2id, HKDF-SHA-256, XChaCha20-Poly1305+CTX) must be validated against the `myne-test-vectors/` companion. CI gates merge on green vectors.
+Every server-side primitive must be validated against the `myne-test-vectors/` companion, and **CI really does gate on it** — `the CI configuration` clones the companion with the `vectors_token` secret, pins it to an explicit SHA, and fails the step outright when the secret is missing rather than skipping. This repo is currently the *only* one in the project where the vector gate runs in CI; the main repo's `vector-verification` step and mobile's `protocol-vectors` step are both commented out (see the main repo's `the CI configuration`, MYND-635).
+
+**Which primitives, precisely** — this list used to read "Argon2id, HKDF-SHA-256, XChaCha20-Poly1305+CTX", and none of those three exist in this codebase. They cannot: the server is zero-knowledge, never holds `root_key` and never decrypts vault content, so it has no KEK derivation and no AEAD. Naming them here described a client and invited someone to "restore" crypto the trust boundary forbids. What the server actually implements, and what the vectors pin:
+
+| Surface | Primitive | Vector category |
+|---|---|---|
+| Device enrolment / auth | SCRAM-SHA-256-PLUS over **PBKDF2**-HMAC-SHA-256 (`internal/auth/scram`) | `scram-auth` |
+| Channel binding | the RFC 9266 `tls-exporter` label + length constants | `tls-exporter` |
+| Fork-consistency head | canonical head encoding + head-id (`internal/headid`) | `vault-head` |
+
+Three categories, not the whole companion — the other 49 are client-side surfaces this server never touches. The Go runners **skip with a message** when the companion is absent (`t.Skipf`), which is why the CI step clones it explicitly instead of relying on a checkout that might not be there: a skipped vector test is a green test that verified nothing.
+
+The companion is pinned to a **fixed SHA** rather than tracking `develop`, deliberately — bump it in its own commit when the three categories above change, so a vector edit and a server change never land as one indistinguishable green run.
 
 ## Gotchas
 
