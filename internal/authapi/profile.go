@@ -71,6 +71,31 @@ func parseProfileID(s string) (profiles.ProfileID, bool) {
 	return id, true
 }
 
+// ownProfile parses the path profile id and refuses one that is not the
+// caller's own. The id is a pure function of `(person, vault)`, so the server
+// recomputes it and compares: a member may never address another member's
+// profile, which the sealed-blob opacity alone does NOT prevent (a peer's
+// person_id_hash is visible in the roster, so the id is derivable by anyone
+// bound to the vault). A mismatch is the same `403` a non-member gets, so the
+// route does not confirm that some other profile exists.
+func (h *Handler) ownProfile(
+	w http.ResponseWriter,
+	raw string,
+	vault ids.AccountNumberHash,
+	person membership.PersonID,
+) (profiles.ProfileID, bool) {
+	profile, ok := parseProfileID(raw)
+	if !ok {
+		writeErr(w, http.StatusBadRequest, "bad_request")
+		return profiles.ProfileID{}, false
+	}
+	if profile != profiles.DeriveProfileID(vault, person) {
+		writeErr(w, http.StatusForbidden, "forbidden")
+		return profiles.ProfileID{}, false
+	}
+	return profile, true
+}
+
 // profileAuth resolves the vault and the calling person, refusing an unknown
 // bearer (401) and a person who is not bound to the vault (403).
 func (h *Handler) profileAuth(w http.ResponseWriter, r *http.Request) (ids.AccountNumberHash, membership.PersonID, bool) {
@@ -102,9 +127,8 @@ func (h *Handler) handlePutProfile(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	profile, ok := parseProfileID(r.PathValue("profile_id"))
+	profile, ok := h.ownProfile(w, r.PathValue("profile_id"), vault, person)
 	if !ok {
-		writeErr(w, http.StatusBadRequest, "bad_request")
 		return
 	}
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxProfileBytes))
@@ -117,13 +141,12 @@ func (h *Handler) handlePutProfile(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleGetProfile(w http.ResponseWriter, r *http.Request) {
-	vault, _, ok := h.profileAuth(w, r)
+	vault, person, ok := h.profileAuth(w, r)
 	if !ok {
 		return
 	}
-	profile, ok := parseProfileID(r.PathValue("profile_id"))
+	profile, ok := h.ownProfile(w, r.PathValue("profile_id"), vault, person)
 	if !ok {
-		writeErr(w, http.StatusBadRequest, "bad_request")
 		return
 	}
 	row, found := h.profs.Get(vault, profile)

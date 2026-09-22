@@ -13,6 +13,7 @@
 package profiles
 
 import (
+	"crypto/sha256"
 	"sync"
 	"time"
 
@@ -24,6 +25,27 @@ import (
 // client-side as SHA-256("myne.person-profile-id v1|" || person_id_hash ||
 // account_number_hash)[:16].
 type ProfileID [16]byte
+
+// personProfileIDPrefix is the frozen domain string the id is derived under
+// (`protocol.md` §9.28; `decisions/protocol/0608`). The server recomputes the
+// id from the authenticated (person, vault) so a caller can only ever act on
+// its OWN profile: the id is a pure function of two values the session already
+// binds, so nothing else needs to be stored to enforce it.
+const personProfileIDPrefix = "myne.person-profile-id v1|"
+
+// DeriveProfileID recomputes the profile id for `(person, vault)` from the
+// frozen domain. A route MUST compare the caller-supplied id against this, or
+// one member could address any other member's profile (the profile namespace is
+// separated from the group manifest, but the id is not a secret).
+func DeriveProfileID(vault ids.AccountNumberHash, person membership.PersonID) ProfileID {
+	h := sha256.New()
+	h.Write([]byte(personProfileIDPrefix))
+	h.Write(person[:])
+	h.Write(vault[:])
+	var id ProfileID
+	copy(id[:], h.Sum(nil)[:len(id)])
+	return id
+}
 
 type key struct {
 	vault   ids.AccountNumberHash
