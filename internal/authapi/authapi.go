@@ -46,6 +46,9 @@ import (
 	"github.com/myne-md/myne-server/internal/auth"
 	"github.com/myne-md/myne-server/internal/auth/scram"
 	"github.com/myne-md/myne-server/internal/ids"
+	"github.com/myne-md/myne-server/internal/membership"
+	"github.com/myne-md/myne-server/internal/profiles"
+	"github.com/myne-md/myne-server/internal/relay"
 )
 
 // PreAuthLimiter gates the pre-auth (session-less) /auth/* surface with a single
@@ -86,6 +89,20 @@ type Handler struct {
 	reg    *auth.Registry
 	tokens *auth.TokenStore
 	enroll *auth.Enrollment
+
+	// members is the person↔vault access table and memberTks the per-vault
+	// bearer tokens it issues (myne-md/myne#711, decisions/protocol/0599). They
+	// are created in New so the B2B routes are always registered — self-host and
+	// hosted run the identical route set — and are exposed so the sync surface's
+	// owner-only vault.meta refusal (task 9) can consume the same authority
+	// rather than re-deriving it.
+	members   *membership.Table
+	memberTks *membership.TokenStore
+	relay     *relay.Store
+	profs     *profiles.Store
+	// profileDeleteGrace is how long a removed member's profiles survive before
+	// reclamation (0 or negative = DefaultProfileDeleteGrace).
+	profileDeleteGrace time.Duration
 
 	mu    sync.Mutex
 	creds map[ids.AccountNumberHash]storedCredential
@@ -163,13 +180,18 @@ func (h *Handler) maybeSave(do *bool) {
 
 // New wires the auth primitives onto the HTTP surface.
 func New(reg *auth.Registry, tokens *auth.TokenStore) *Handler {
+	table := membership.New()
 	return &Handler{
-		reg:    reg,
-		tokens: tokens,
-		enroll: auth.NewEnrollment(reg, tokens),
-		creds:  make(map[ids.AccountNumberHash]storedCredential),
-		hs:     make(map[string]handshake),
-		now:    time.Now,
+		reg:       reg,
+		tokens:    tokens,
+		enroll:    auth.NewEnrollment(reg, tokens),
+		members:   table,
+		memberTks: membership.NewTokenStore(table),
+		relay:     relay.NewStore(),
+		profs:     profiles.NewStore(),
+		creds:     make(map[ids.AccountNumberHash]storedCredential),
+		hs:        make(map[string]handshake),
+		now:       time.Now,
 	}
 }
 
@@ -224,7 +246,25 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/auth/devices", h.handleDevices)
 	mux.HandleFunc("/auth/devices/approve", h.handleApprove)
 	mux.HandleFunc("/auth/devices/revoke", h.handleRevoke)
+	// B2B person↔vault membership (myne-md/myne#711, decisions/protocol/0599).
+	// Person accounts themselves use the /auth/* routes above with their
+	// person_id_hash as the account id (see b2b.go's header).
+	mux.HandleFunc("POST /b2b/vaults/{account_hash}/members", h.handleBindMember)
+	mux.HandleFunc("DELETE /b2b/vaults/{account_hash}/members/{person_id}", h.handleRemoveMember)
+	mux.HandleFunc("POST /b2b/invites", h.handleCreateInvite)
+	mux.HandleFunc("GET /b2b/invites", h.handleListInvites)
+	mux.HandleFunc("GET /b2b/vaults/{account_hash}/invites", h.handleListVaultInvites)
+	mux.HandleFunc("POST /b2b/invites/{invite_id}/claim", h.handleClaimInvite)
+	// Person-private AI profiles (myne-md/myne#711 task 16): a vault-scoped,
+	// person-authorized namespace, separate from the shared group manifest.
+	mux.HandleFunc("PUT /b2b/vaults/{account_hash}/profiles/{profile_id}", h.handlePutProfile)
+	mux.HandleFunc("GET /b2b/vaults/{account_hash}/profiles/{profile_id}", h.handleGetProfile)
 }
+
+// Relay returns the sealed-invite store for a caller that needs it (the client
+// acceptance flow and the operator surfaces read it through the routes; this is
+// here for tests and for the removal path's cleanup).
+func (h *Handler) Relay() *relay.Store { return h.relay }
 
 func writeErr(w http.ResponseWriter, status int, code string) {
 	w.Header().Set("Content-Type", "application/json")

@@ -454,7 +454,13 @@ func NewServer(s store.BlobStore, tokens *auth.TokenStore, authHandler *authapi.
 		// store alone, so an account whose attachments already filled the quota
 		// kept pushing note blobs past a ceiling its own status endpoint
 		// reported as full.
-		WithUsedBytes(gcquota.UnifiedUsedBytes(s, attachStore))
+		WithUsedBytes(gcquota.UnifiedUsedBytes(s, attachStore)).
+		// B2B (myne-md/myne#711): the owner's per-vault membership token gates
+		// the vault.meta write, and the retirement registry refuses writes to a
+		// retired namespace. authHandler is the membership authority; both are
+		// nil-safe (a B2B-less deployment behaves as before).
+		WithMembership(authHandler).
+		WithRetirements(store.NewRetirements(0))
 	if metrics != nil {
 		syncMux = syncMux.WithMetrics(metrics.ObserveBlobStored)
 	}

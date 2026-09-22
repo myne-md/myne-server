@@ -152,6 +152,36 @@ type Handler struct {
 	// as full, and the operator's number disagreed with the enforcement.
 	// nil = fall back to the blob-only figure (notes-only tests).
 	usedBytes func(account ids.AccountNumberHash) uint64
+	// membership authorizes the B2B vault-scoped routes and gates the vault.meta
+	// write (myne-md/myne#711): a vault that has an owner binding requires the
+	// owner's per-vault token. nil = B2B not wired, so vault.meta keeps the
+	// pre-B2B device-token path and the retire route is refused.
+	membership MembershipAuth
+	// retirements is the namespace-retirement registry (nil = not wired).
+	retirements *store.Retirements
+}
+
+// MembershipAuth is the B2B membership authority as the sync surface needs it.
+// It is an interface so this package does not import the HTTP auth surface; the
+// handler is wired in the composition layer. ResolveMember answers "is this
+// per-vault bearer token valid, for which vault, and is it the owner's".
+type MembershipAuth interface {
+	ResolveMember(bearerHex string) (vault ids.AccountNumberHash, owner bool, ok bool)
+	HasOwner(vault ids.AccountNumberHash) bool
+}
+
+// WithMembership installs the B2B membership seam (myne-md/myne#711). It gates
+// the vault.meta write on the owner's per-vault token and authorizes retire.
+func (h *Handler) WithMembership(m MembershipAuth) *Handler {
+	h.membership = m
+	return h
+}
+
+// WithRetirements installs the namespace-retirement registry. Without it the
+// retire route reports unauthenticated and no push is refused for retirement.
+func (h *Handler) WithRetirements(r *store.Retirements) *Handler {
+	h.retirements = r
+	return h
 }
 
 // New returns a sync Handler over the given store + token store.
@@ -246,6 +276,8 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/sync/blobs", h.handleBlobs)
 	mux.HandleFunc("/vault.meta", h.handleMeta)
 	mux.HandleFunc("/account/status", h.handleAccountStatus)
+	// Owner-only namespace retirement (myne-md/myne#711, decisions/protocol/0599).
+	mux.HandleFunc("POST /b2b/vaults/{account_hash}/retire", h.handleRetire)
 }
 
 // --- wire types ---
@@ -410,33 +442,33 @@ func (h *Handler) sessionWithCode(r *http.Request) (auth.Session, string) {
 	if !strings.HasPrefix(authz, pfx) {
 		return auth.Session{}, "unauthenticated"
 	}
-	tok, err := hex.DecodeString(strings.TrimPrefix(authz, pfx))
+	hexTok := strings.TrimPrefix(authz, pfx)
+	tok, err := hex.DecodeString(hexTok)
 	if err != nil {
 		return auth.Session{}, "unauthenticated"
 	}
 	sess, err := h.auth.AuthenticateSession(ids.DeviceToken(tok))
-	if err != nil {
-		return auth.Session{}, auth.FailureCode(err)
+	if err == nil {
+		return sess, ""
 	}
-	return sess, ""
+	// B2B member (myne-md/myne#711): a per-vault MEMBERSHIP token authorizes the
+	// vault's sync namespace, so a member with no account of its own can read and
+	// write shared content. The vault.meta write gate (retire.go) still refuses a
+	// member token for the credential blob. The membership token carries no
+	// device id, so member cursors share the zero device slot; that only costs a
+	// re-pull and never a wrong read.
+	if h.membership != nil {
+		if vault, _, ok := h.membership.ResolveMember(hexTok); ok {
+			return auth.Session{Account: vault}, ""
+		}
+	}
+	return auth.Session{}, auth.FailureCode(err)
 }
 
 // session extracts + validates the bearer token, returning the bound session.
 func (h *Handler) session(r *http.Request) (auth.Session, bool) {
-	authz := r.Header.Get("Authorization")
-	const pfx = "Bearer "
-	if !strings.HasPrefix(authz, pfx) {
-		return auth.Session{}, false
-	}
-	tok, err := hex.DecodeString(strings.TrimPrefix(authz, pfx))
-	if err != nil {
-		return auth.Session{}, false
-	}
-	sess, err := h.auth.AuthenticateSession(ids.DeviceToken(tok))
-	if err != nil {
-		return auth.Session{}, false
-	}
-	return sess, true
+	sess, code := h.sessionWithCode(r)
+	return sess, code == ""
 }
 
 func parseBlobID(s string) (ids.BlobID, bool) {
@@ -503,6 +535,13 @@ func (h *Handler) handlePush(w http.ResponseWriter, r *http.Request) {
 			ct, err := base64.StdEncoding.DecodeString(b.CiphertextB64)
 			if !idOK || !nOK || err != nil {
 				writeErr(w, http.StatusBadRequest, "bad_request")
+				return errPushHandled
+			}
+			// A retired namespace may not be written again (myne-md/myne#711):
+			// the owner rotated away from it, and a stale device must not
+			// resurrect it. Reclamation is separate and grace-bounded.
+			if h.retirements != nil && h.retirements.IsRetired(sess.Account, id) {
+				writeErr(w, http.StatusConflict, "retired")
 				return errPushHandled
 			}
 			// An attachment record (MYND-468): validate the full id and its prefix
@@ -869,12 +908,11 @@ const MaxVaultMetaSize = 64 * 1024
 func (h *Handler) handleMeta(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodPut:
-		sess, authCode := h.sessionWithCode(r)
-		if authCode != "" {
-			writeErr(w, http.StatusUnauthorized, authCode)
+		account, ok := h.vaultMetaWriteAccount(w, r)
+		if !ok {
 			return
 		}
-		if h.rl != nil && !h.rl.Allow(sess.Account) {
+		if h.rl != nil && !h.rl.Allow(account) {
 			writeErr(w, http.StatusTooManyRequests, "rate")
 			return
 		}
@@ -882,7 +920,7 @@ func (h *Handler) handleMeta(w http.ResponseWriter, r *http.Request) {
 		// could still overwrite its own `vault.meta` — the blob every other
 		// device bootstraps from — while every note push was refused. The GET
 		// arms below stay ungated: freezing must not hold data hostage.
-		if h.frozen != nil && h.frozen(sess.Account) {
+		if h.frozen != nil && h.frozen(account) {
 			writeErr(w, http.StatusForbidden, "frozen")
 			return
 		}
@@ -896,7 +934,7 @@ func (h *Handler) handleMeta(w http.ResponseWriter, r *http.Request) {
 		// wrote does not just lose the upload — the next cycle reads the stale
 		// server copy as an authoritative remote change and rolls a password
 		// change back. Report the failure so the client retries instead.
-		if err := h.store.SetMeta(sess.Account, body); err != nil {
+		if err := h.store.SetMeta(account, body); err != nil {
 			writeErr(w, http.StatusInternalServerError, "internal")
 			return
 		}
