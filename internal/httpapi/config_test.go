@@ -117,3 +117,39 @@ func TestConfig_QuotaZeroIsUnlimited(t *testing.T) {
 		t.Fatalf("non-zero ceiling (100) should flag a 1000-byte write as over-quota")
 	}
 }
+
+// MYNE_ADMIN_PANEL_ADDR is the browser console's switch. Empty must mean OFF, so an
+// upgrade never silently opens a new port, and it must be read independently of
+// MYNE_ADMIN_SOCKET so one variable is genuinely sufficient.
+func TestConfig_PanelAddrIsOffByDefaultAndIndependent(t *testing.T) {
+	t.Setenv("MYNE_ADMIN_PANEL_ADDR", "")
+	t.Setenv("MYNE_ADMIN_SOCKET", "")
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PanelAddr != "" {
+		t.Errorf("PanelAddr = %q with the var unset, want \"\" (panel off by default)", cfg.PanelAddr)
+	}
+
+	t.Setenv("MYNE_ADMIN_PANEL_ADDR", "127.0.0.1:8081")
+	cfg, err = loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PanelAddr != "127.0.0.1:8081" {
+		t.Errorf("PanelAddr = %q, want 127.0.0.1:8081", cfg.PanelAddr)
+	}
+	if cfg.AdminSocket != "" {
+		t.Errorf("AdminSocket = %q: the panel address must not imply or require the socket", cfg.AdminSocket)
+	}
+
+	t.Setenv("MYNE_ADMIN_SOCKET", "/tmp/a.sock")
+	cfg, err = loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PanelAddr != "127.0.0.1:8081" || cfg.AdminSocket != "/tmp/a.sock" {
+		t.Errorf("the two operator addresses must not interfere: got panel %q socket %q", cfg.PanelAddr, cfg.AdminSocket)
+	}
+}

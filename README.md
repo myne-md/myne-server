@@ -46,9 +46,50 @@ Cross-implementation byte-level agreement is enforced by the [`myne-test-vectors
 
 See `CLAUDE.md` for the deferred design decisions and the gotchas that protect these commitments.
 
+## Configuration
+
+The server is configured entirely through `MYNE_*` environment variables. Read in
+`internal/httpapi/config.go` (`loadConfig`), which fails fast on an invalid value so a
+misconfigured server never starts in a surprising state.
+
+| Group | Variables | Default |
+|---|---|---|
+| Storage | `MYNE_STORAGE_BACKEND` (`mem` or `fs`), `MYNE_STORAGE_PATH` | `mem` |
+| Rate limit | `MYNE_RATELIMIT_BURST`, `MYNE_RATELIMIT_REFILL` | `256` / `16` per second |
+| Quota | `MYNE_QUOTA_CEILING_BYTES` | `0` = unlimited |
+| Retention | `MYNE_HORIZON_MARKERS`, `MYNE_EXTENDED_RETENTION` | `120` markers / `false` |
+| Pre-auth bounds | `MYNE_PREAUTH_RATELIMIT_BURST`, `MYNE_PREAUTH_RATELIMIT_REFILL`, `MYNE_MAX_HANDSHAKES`, `MYNE_HANDSHAKE_TTL_SECONDS`, `MYNE_MAX_ATTACHMENTS_PER_VAULT` | `64` / `8` / `16384` / `60` s / `100000` |
+| Account cap | `MYNE_MAX_ACCOUNTS`, `MYNE_MAX_DEVICES_PER_ACCOUNT` | `1000000` / `0` = unlimited |
+| Web client | `MYNE_ALLOWED_ORIGINS` | `` = CORS off |
+| Backup | `MYNE_BACKUP_ENABLED` plus `_REPOSITORY`, `_PASSWORD_FILE`, `_INTERVAL_SECONDS`, `_RETENTION_DAYS`, `_RCLONE_CONFIG`, `_RESTIC_BIN`, `_CACHE_DIR` | off; `86400` s, `14` days |
+| Operator console | `MYNE_ADMIN_SOCKET` (CLI API), `MYNE_ADMIN_PANEL_ADDR` (read-only browser panel) | both disabled |
+| Metrics | `MYNE_METRICS_ADDR` | `""` = disabled |
+| Listener | `MYNE_SERVER_ADDR`, `MYNE_SERVER_PORTFILE` | `:8080` / unset |
+
+Four of these need a sentence rather than a default:
+
+- **`MYNE_PREAUTH_RATELIMIT_BURST` refuses `0`.** Every other ceiling in the table treats
+  `0` as unlimited. Here it would reject every pre-auth request and lock out enrolment, so
+  the server refuses to start instead of coming up unable to enrol anything.
+- **`MYNE_ADMIN_PANEL_ADDR` has no authentication.** It is the one operator surface you can
+  put on a network, and anything reaching it reads the account roster: hashes, stored bytes,
+  device counts, freeze state. It shows no account numbers, because the server never receives
+  them, and it logs nothing at all. A non-loopback address prints a warning and is not refused.
+- **`MYNE_METRICS_ADDR`** is the ordinary exception to that: a non-loopback bind is usually
+  correct, because Prometheus scraping from another host is the normal deployment.
+- **`MYNE_EXTENDED_RETENTION`** keeps deleted ciphertext past the horizon, which weakens a
+  user's expectation that deletion means gone.
+
+**The `why` is not here.** What each knob obliges an operator to do, and what it costs, is
+normative and lives in `docs/self-host-policy.md` in the `myne` repo (sections 3 and 4); this
+file is the AGPL implementation and does not restate a CC-BY contract. The annotated,
+per-knob copy an operator actually edits is `the operations repository/bundle/bundle.env.example`, and the two
+are compared on every commit by `scripts/check-server-env-roster.mjs` in the `myne` repo, so
+this table cannot drift from the server silently.
+
 ## Development
 
-The repo currently has no build or test commands — there is no application code yet. The only local tooling is the commit-hook baseline:
+Run `go test ./...`. The repo has no application packaging yet; the only other local tooling is the commit-hook baseline:
 
 ```bash
 brew install lefthook && lefthook install   # one-time per clone; activates git hooks

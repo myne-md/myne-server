@@ -20,19 +20,31 @@ import (
 	"os"
 
 	"github.com/myne-md/myne-server/internal/accounts"
+	"github.com/myne-md/myne-server/internal/console"
 	"github.com/myne-md/myne-server/internal/ids"
+)
+
+// The row and aggregate types now live in internal/console, which is the single
+// place a field becomes a row so this API and the operator panel cannot drift.
+// These aliases keep the names (and this package's tests) referring to the same
+// types rather than to look-alike copies.
+type (
+	accountView = console.AccountView
+	statsView   = console.StatsView
 )
 
 // Handler owns the admin API routes. It depends on the rest of the server only via
 // closures + the accounts store, so it stays decoupled from store/auth/attachments.
 type Handler struct {
-	mux         *http.ServeMux
-	listAccts   func() []ids.AccountNumberHash
-	usedBytes   func(ids.AccountNumberHash) uint64 // stored ciphertext bytes (blobs + attachments; the AS17 total)
-	deviceCount func(ids.AccountNumberHash) uint64
-	policy      *accounts.Store
-	maxAccounts uint64                            // 0 = unlimited
-	del         func(ids.AccountNumberHash) error // irreversible account delete (nil = disabled)
+	mux *http.ServeMux
+	// proj is the shared READ projection, and the operator panel depends on the same
+	// one so the two surfaces cannot drift.
+	proj *console.Projection
+	// policy and del are the write side, held here and deliberately NOT on the
+	// projection: internal/console exposes no writable reference, so a package that
+	// imports only the projection (the panel) cannot reach either one.
+	policy *accounts.Store
+	del    func(ids.AccountNumberHash) error // irreversible account delete (nil = disabled)
 }
 
 // WithDelete installs the irreversible account-delete path (MYND-506): the caller's
@@ -48,12 +60,9 @@ func (h *Handler) WithDelete(fn func(ids.AccountNumberHash) error) *Handler {
 // read routes report zeros (used by the transport-only skeleton test).
 func New(listAccts func() []ids.AccountNumberHash, usedBytes, deviceCount func(ids.AccountNumberHash) uint64, policy *accounts.Store, maxAccounts uint64) *Handler {
 	h := &Handler{
-		mux:         http.NewServeMux(),
-		listAccts:   listAccts,
-		usedBytes:   usedBytes,
-		deviceCount: deviceCount,
-		policy:      policy,
-		maxAccounts: maxAccounts,
+		mux:    http.NewServeMux(),
+		proj:   console.NewProjection(listAccts, usedBytes, deviceCount, policy, maxAccounts),
+		policy: policy,
 	}
 	h.mux.HandleFunc("GET /admin/ping", h.handlePing)
 	h.mux.HandleFunc("GET /admin/accounts", h.handleListAccounts)
@@ -87,54 +96,14 @@ func (h *Handler) handleDelete(w http.ResponseWriter, r *http.Request) {
 // Mux returns the admin HTTP handler (served over the Unix socket).
 func (h *Handler) Mux() http.Handler { return h.mux }
 
-// accountView is the merged live-stats + operator-policy projection of one account.
-// It carries NO timestamp / activity / request-history field (MYND-440 aggregate-only).
-type accountView struct {
-	AccountHash        string `json:"account_hash"`
-	StoredBytes        uint64 `json:"stored_bytes"`
-	DeviceCount        uint64 `json:"device_count"`
-	Frozen             bool   `json:"frozen"`
-	QuotaOverrideBytes uint64 `json:"quota_override_bytes,omitempty"`
-	MaxDevicesOverride uint64 `json:"max_devices_override,omitempty"`
-}
-
-type statsView struct {
-	TotalAccounts    uint64 `json:"total_accounts"`
-	TotalStoredBytes uint64 `json:"total_stored_bytes"`
-	MaxAccounts      uint64 `json:"max_accounts"` // 0 = unlimited
-}
-
 func (h *Handler) handlePing(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-func (h *Handler) view(a ids.AccountNumberHash) accountView {
-	v := accountView{AccountHash: hex.EncodeToString(a[:])}
-	if h.usedBytes != nil {
-		v.StoredBytes = h.usedBytes(a)
-	}
-	if h.deviceCount != nil {
-		v.DeviceCount = h.deviceCount(a)
-	}
-	if h.policy != nil {
-		p := h.policy.Get(a)
-		v.Frozen = p.Frozen
-		v.QuotaOverrideBytes = p.QuotaOverrideBytes
-		v.MaxDevicesOverride = p.MaxDevicesOverride
-	}
-	return v
-}
+func (h *Handler) view(a ids.AccountNumberHash) accountView { return h.proj.Account(a) }
 
 func (h *Handler) handleListAccounts(w http.ResponseWriter, _ *http.Request) {
-	var accts []ids.AccountNumberHash
-	if h.listAccts != nil {
-		accts = h.listAccts()
-	}
-	out := make([]accountView, 0, len(accts))
-	for _, a := range accts {
-		out = append(out, h.view(a))
-	}
-	writeJSON(w, http.StatusOK, out)
+	writeJSON(w, http.StatusOK, h.proj.Accounts())
 }
 
 func (h *Handler) handleShowAccount(w http.ResponseWriter, r *http.Request) {
@@ -147,17 +116,9 @@ func (h *Handler) handleShowAccount(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleStats(w http.ResponseWriter, _ *http.Request) {
-	var accts []ids.AccountNumberHash
-	if h.listAccts != nil {
-		accts = h.listAccts()
-	}
-	s := statsView{TotalAccounts: uint64(len(accts)), MaxAccounts: h.maxAccounts}
-	if h.usedBytes != nil {
-		for _, a := range accts {
-			s.TotalStoredBytes += h.usedBytes(a)
-		}
-	}
-	writeJSON(w, http.StatusOK, s)
+	// FrozenAccounts is a Go-side count on the projection and is tagged out of the
+	// wire shape, so this body is unchanged from before the panel existed.
+	writeJSON(w, http.StatusOK, h.proj.Stats())
 }
 
 // setReq is the body for the value-carrying enforcement writes (quota / max-devices).

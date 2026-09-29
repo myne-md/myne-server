@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/myne-md/myne-server/internal/accounts"
+	"github.com/myne-md/myne-server/internal/console"
 	"github.com/myne-md/myne-server/internal/ids"
 )
 
@@ -352,5 +353,63 @@ func TestDelete_MalformedHash400(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("malformed hash delete → %d, want 400", resp.StatusCode)
+	}
+}
+
+// The panel and this API must render the same row. Both read internal/console, so
+// they cannot drift by construction; this pins that, because a future refactor that
+// gave the panel its own row builder would drift silently and could put a field past
+// the aggregate-only denylist above.
+func TestRead_PanelProjectionAndThisAPIAgree(t *testing.T) {
+	a1, a2 := acct(1), acct(2)
+	policy := accounts.New(filepath.Join(t.TempDir(), "accounts.json"))
+	policy.Update(a1, func(p *accounts.Policy) {
+		p.Frozen = true
+		p.QuotaOverrideBytes = 500
+		p.MaxDevicesOverride = 3
+	})
+	list := func() []ids.AccountNumberHash { return []ids.AccountNumberHash{a1, a2} }
+	used := func(a ids.AccountNumberHash) uint64 {
+		if a == a1 {
+			return 100
+		}
+		return 200
+	}
+	devs := func(a ids.AccountNumberHash) uint64 {
+		if a == a1 {
+			return 2
+		}
+		return 1
+	}
+
+	// What the admin API serves.
+	srv := httptest.NewServer(New(list, used, devs, policy, 100).Mux())
+	defer srv.Close()
+	var viaAPI []accountView
+	getJSON(t, srv.URL+"/admin/accounts", &viaAPI)
+
+	// What the panel would render, from the identical projection inputs.
+	viaPanel := console.NewProjection(list, used, devs, policy, 100).Accounts()
+
+	if len(viaAPI) != len(viaPanel) {
+		t.Fatalf("row count: API %d, panel %d", len(viaAPI), len(viaPanel))
+	}
+	for i := range viaAPI {
+		if viaAPI[i] != viaPanel[i] {
+			t.Errorf("row %d diverged:\n  admin API: %+v\n  panel:     %+v", i, viaAPI[i], viaPanel[i])
+		}
+	}
+
+	// And the same for the aggregate the panel's summary row reads.
+	var viaAPIStats statsView
+	getJSON(t, srv.URL+"/admin/stats", &viaAPIStats)
+	viaPanelStats := console.NewProjection(list, used, devs, policy, 100).Stats()
+	if viaAPIStats.TotalAccounts != viaPanelStats.TotalAccounts ||
+		viaAPIStats.TotalStoredBytes != viaPanelStats.TotalStoredBytes ||
+		viaAPIStats.MaxAccounts != viaPanelStats.MaxAccounts {
+		t.Errorf("stats diverged:\n  admin API: %+v\n  panel:     %+v", viaAPIStats, viaPanelStats)
+	}
+	if viaPanelStats.FrozenAccounts != 1 {
+		t.Errorf("panel frozen count = %d, want 1: it must come from the same policy read", viaPanelStats.FrozenAccounts)
 	}
 }

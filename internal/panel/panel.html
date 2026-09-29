@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Myne sync server</title>
+<link rel="stylesheet" href="/panel.css">
+</head>
+<body>
+<main class="wrap">
+  <header class="head">
+    <h1>Myne sync server</h1>
+    <p class="sub">Read-only operator console. Enforcement stays in the
+      <code>myne-server admin</code> command line.</p>
+  </header>
+
+  <section class="tiles" aria-label="Deployment totals">
+    <div class="tile">
+      <span class="k">Accounts</span>
+      <span class="v">{{.Accounts}}</span>
+    </div>
+    <div class="tile">
+      <span class="k">Stored ciphertext</span>
+      <span class="v">{{.BytesHuman}}</span>
+    </div>
+    <div class="tile{{if .HasFrozen}} tile-warn{{end}}">
+      <span class="k">Frozen</span>
+      <span class="v">{{.Frozen}}</span>
+    </div>
+    <div class="tile">
+      <span class="k">Account cap</span>
+      <span class="v">{{.MaxAccounts}}</span>
+    </div>
+  </section>
+
+  {{if not .HasAccounts}}
+  <p class="empty">No accounts on this backend. The in-memory backend does not
+    enumerate accounts, so an empty roster here means the server is running on
+    <code>mem</code>, not that anything is wrong.</p>
+  {{else}}
+  <table class="roster">
+    <caption class="sr">Accounts, stored bytes, device count and operator policy</caption>
+    <thead>
+      <tr>
+        <th scope="col">Account hash</th>
+        <th scope="col" class="num">Stored</th>
+        <th scope="col" class="num">Devices</th>
+        <th scope="col">Status</th>
+        <th scope="col">Overrides</th>
+      </tr>
+    </thead>
+    <tbody>
+    {{range .Rows}}
+      <tr{{if .Frozen}} class="row-frozen"{{end}}>
+        <td class="hash">
+          <code class="hash-abbrev">{{.Hash}}</code>
+          <button type="button" class="copy" data-full="{{.FullHash}}" title="Copy the full account hash">copy</button>
+          <code class="hash-full" hidden>{{.FullHash}}</code>
+        </td>
+        <td class="num" data-bytes="{{.Bytes}}">{{.Bytes}}</td>
+        <td class="num">{{.Devices}}</td>
+        <td>{{if .Frozen}}<span class="badge badge-frozen">frozen</span>{{else}}<span class="badge">active</span>{{end}}</td>
+        <td class="ovr">
+          {{if .QuotaSet}}<span class="tag">quota override</span>{{end}}
+          {{if .MaxDevsSet}}<span class="tag">device cap override</span>{{end}}
+          {{if and (not .QuotaSet) (not .MaxDevsSet)}}<span class="muted">none, defaults apply</span>{{end}}
+        </td>
+      </tr>
+    {{end}}
+    </tbody>
+  </table>
+  {{end}}
+
+  <footer class="foot">
+    <p>Every figure above is read live from the server on this page load. Nothing
+      is stored between visits and nothing about who connected is recorded.</p>
+  </footer>
+</main>
+<script>
+// Copy the full account hash. The abbreviated form in the cell is for reading; the
+// full value is what a command needs, so it is one click away and never truncated
+// away.
+document.querySelectorAll('.copy').forEach(function (b) {
+  b.addEventListener('click', function () {
+    var full = b.getAttribute('data-full');
+    var done = function () { b.textContent = 'copied'; };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(full).then(done, reveal);
+    } else {
+      reveal();
+    }
+    function reveal() {
+      var cell = b.closest('.hash').querySelector('.hash-full');
+      cell.hidden = false;
+    }
+  });
+});
+</script>
+</body>
+</html>

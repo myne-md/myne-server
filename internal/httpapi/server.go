@@ -9,6 +9,7 @@ package httpapi
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -25,8 +26,10 @@ import (
 	"github.com/myne-md/myne-server/internal/authapi"
 	"github.com/myne-md/myne-server/internal/authpersist"
 	"github.com/myne-md/myne-server/internal/backup"
+	"github.com/myne-md/myne-server/internal/console"
 	"github.com/myne-md/myne-server/internal/gcquota"
 	"github.com/myne-md/myne-server/internal/ids"
+	"github.com/myne-md/myne-server/internal/panel"
 	"github.com/myne-md/myne-server/internal/poke"
 	"github.com/myne-md/myne-server/internal/store"
 	"github.com/myne-md/myne-server/internal/syncapi"
@@ -79,6 +82,58 @@ func newHTTPServer(h http.Handler) *http.Server {
 		IdleTimeout:       idleTimeout,
 		ErrorLog:          log.New(io.Discard, "", 0),
 	}
+}
+
+// operatorPanelHandler is the panel's whole HTTP chain, named so a test can pin it.
+//
+// recoverPanic is not optional decoration here. server-protocol.md 5.2 pairs the
+// DISCARDED error log with a recovery of its own, because the standard library's
+// per-connection panic log carries the peer address; discarding without recovering
+// trades a privacy leak for silence, and a silent panic on the roster is exactly the
+// failure an operator would report as "the panel just goes blank". The public mux gets
+// the same middleware; the panel is the surface most likely to be on a network.
+func operatorPanelHandler(mux http.Handler) http.Handler { return recoverPanic(mux) }
+
+// listenInternal binds an operator-only TCP listener, and says so when the resolved
+// address is reachable from the network rather than only from this machine.
+//
+// It WARNS and does not REFUSE, and the distinction is measured rather than preferred.
+// A non-loopback metrics bind is frequently the CORRECT configuration, because
+// Prometheus scraping from another host is the ordinary deployment, so a refusal would
+// break working setups and turn an opt-in variable into noise. The panel is not in that
+// position (off by default, and no legitimate reason to want an account roster
+// readable from a network) but goes through this same function for consistency and
+// because it costs nothing.
+//
+// Both operator surfaces bind here rather than each doing its own thing, so the rule is
+// one function and not two ad-hoc prints that can drift apart.
+func listenInternal(what, addr string) (net.Listener, error) {
+	if addr == "" {
+		return nil, nil
+	}
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("cannot bind %s on %s: %w", what, addr, err)
+	}
+	if !isLoopbackAddr(ln.Addr().String()) {
+		log.Printf("myne-server: WARN %s is bound to %s, reachable from your network and not only from this machine", what, ln.Addr())
+	}
+	return ln, nil
+}
+
+// isLoopbackAddr reports whether a resolved host:port is confined to this machine. An
+// empty host means every interface, so it is not loopback. The literal loopback name is
+// honoured because it is what an operator actually types.
+func isLoopbackAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // boundPort returns the resolved TCP port a listener is bound to (0 if the
@@ -273,11 +328,14 @@ func runListener(ctx context.Context, ln net.Listener) error {
 	// Aggregate-only metrics on a SEPARATE listener (SYNC-24) — never the public edge.
 	// Disabled unless MYNE_METRICS_ADDR is set; bind it to localhost/internal only.
 	var metricsSrv *http.Server
-	if cfg.MetricsAddr != "" {
+	metricsLn, err := listenInternal("metrics listener", cfg.MetricsAddr)
+	if err != nil {
+		return err
+	}
+	if metricsLn != nil {
 		metricsSrv = newHTTPServer(metrics.MetricsHandler())
-		metricsSrv.Addr = cfg.MetricsAddr
 		go func() {
-			if err := metricsSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			if err := metricsSrv.Serve(metricsLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				log.Printf("myne-server: metrics listener: %v", err)
 			}
 		}()
@@ -331,45 +389,86 @@ func runListener(ctx context.Context, ln net.Listener) error {
 		log.Printf("backup: scheduled encrypted off-box backup every %ds (retention %dd)", cfg.BackupIntervalSeconds, cfg.BackupRetentionDays)
 	}
 
-	// Operator console admin API (MYND-506) on a LOCAL Unix domain socket — never a
-	// TCP port / public edge; access is filesystem permissions on the socket. Disabled
-	// unless MYNE_ADMIN_SOCKET is set. A bind failure fails startup; it serves until
-	// ctx cancel.
+	// Shared READ projection of enforcement state, built ONCE and unconditionally
+	// (myne-md/myne#787). Both operator surfaces attach to it: the admin API on a
+	// local Unix domain socket, and the browser panel on its own TCP listener. Neither
+	// one's environment variable gates the other's construction, which is what makes
+	// MYNE_ADMIN_PANEL_ADDR alone sufficient to bring the panel up.
+	//
+	// Live values only: accounts from the store, stored bytes = blobs + attachments
+	// (the unified AS17 total), device count from the registry, policy from the
+	// accounts store (nil on the mem backend, so reads report defaults). No wall-clock
+	// / activity / time-series is exposed (MYND-440 aggregate-only).
+	listAccounts := func() []ids.AccountNumberHash {
+		if l, ok := blobStore.(interface {
+			ListAccounts() []ids.AccountNumberHash
+		}); ok {
+			return l.ListAccounts()
+		}
+		return nil
+	}
+	// Irreversible account delete (MYND-506), remove-then-forget: blob + attachment
+	// data first, then auth + policy, so no half-deleted account is served if a later
+	// step fails. This is the write side and is never handed to the projection.
+	deleteAccount := func(a ids.AccountNumberHash) error {
+		if err := blobStore.DeleteAccount(a); err != nil {
+			return err
+		}
+		attachStore.DeleteAccount(a)
+		authHandler.DeleteAccount(a)
+		if acctStore != nil {
+			acctStore.Delete(a)
+		}
+		return nil
+	}
+	operatorState := console.NewProjection(listAccounts, usedBytes, reg.CountActiveDevices, acctStore, cfg.MaxAccounts)
+
+	// Operator console admin API (MYND-506) on a LOCAL Unix domain socket. Access is
+	// filesystem permissions on the socket, never a TCP port or the public edge.
+	// Disabled unless MYNE_ADMIN_SOCKET is set. A bind failure fails startup; it
+	// serves until ctx cancel.
 	adminLn, err := adminapi.Listen(cfg.AdminSocket)
 	if err != nil {
 		return err
 	}
 	if adminLn != nil {
-		// Live enforcement-state projection: accounts from the store, stored bytes =
-		// blobs + attachments (the unified AS17 total), device count from the registry,
-		// policy from the accounts store (nil on mem backend → defaults). No wall-clock
-		// / activity / time-series is exposed (MYND-440 aggregate-only).
-		listAccounts := func() []ids.AccountNumberHash {
-			if l, ok := blobStore.(interface {
-				ListAccounts() []ids.AccountNumberHash
-			}); ok {
-				return l.ListAccounts()
-			}
-			return nil
-		}
-		// Irreversible account delete (MYND-506) — remove-then-forget: blob +
-		// attachment data first, then auth + policy, so no half-deleted account is
-		// served if a later step fails.
-		deleteAccount := func(a ids.AccountNumberHash) error {
-			if err := blobStore.DeleteAccount(a); err != nil {
-				return err
-			}
-			attachStore.DeleteAccount(a)
-			authHandler.DeleteAccount(a)
-			if acctStore != nil {
-				acctStore.Delete(a)
-			}
-			return nil
-		}
 		adminMux := adminapi.New(listAccounts, usedBytes, reg.CountActiveDevices, acctStore, cfg.MaxAccounts).
 			WithDelete(deleteAccount).Mux()
 		go adminapi.Serve(ctx, adminLn, adminMux)
 		log.Printf("myne-server: operator admin API on unix socket %s", cfg.AdminSocket)
+	}
+
+	// Operator panel (myne-md/myne#787): the browser console, READ-ONLY, on its own
+	// listener. Disabled unless MYNE_ADMIN_PANEL_ADDR is set, and independent of the
+	// socket above. It gets the hardened server constructor, so the standard library's
+	// connection-level error log (which carries the peer address) is discarded, and NO
+	// access-log middleware is added: self-host-policy 3 prohibits IP logging anywhere
+	// in an operator's stack, so a request log here would make a deployment violate
+	// its own contract.
+	panelLn, err := listenInternal("operator panel", cfg.PanelAddr)
+	if err != nil {
+		return err
+	}
+	if panelLn != nil {
+		// recoverPanic, not just newHTTPServer: server-protocol.md 5.2 pairs the
+		// DISCARDED error log with a recovery of its own, because a stdlib panic log
+		// carries the peer address. Discarding without recovering trades a privacy
+		// leak for silence, and the panel is the surface most likely to be on a
+		// network. No surfaceBoundAddr here: it writes MYNE_SERVER_PORTFILE, and
+		// calling it twice would make the PANEL's port overwrite the main server's in
+		// the same file, which is precisely the ephemeral-port deployment that file
+		// exists for.
+		panelSrv := newHTTPServer(operatorPanelHandler(panel.New(operatorState, cfg.PanelHosts).Mux()))
+		log.Printf("myne-server: operator panel (read-only) bound to %s", panelLn.Addr())
+		go func() {
+			<-ctx.Done()
+			_ = panelSrv.Shutdown(context.Background())
+		}()
+		go func() {
+			if err := panelSrv.Serve(panelLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Printf("myne-server: operator panel: %v", err)
+			}
+		}()
 	}
 
 	// Migrations already ran (pre-listen, above) and the store is open → ready to serve.

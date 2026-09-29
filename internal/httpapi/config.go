@@ -64,6 +64,25 @@ type Config struct {
 	// access, no bearer secret (MYND-506). Never a TCP port / public edge.
 	AdminSocket string
 
+	// PanelAddr is the operator panel's (read-only) listen address
+	// (MYNE_ADMIN_PANEL_ADDR; "" = panel disabled). It is the browser counterpart to
+	// AdminSocket and is independent of it: a deployment may run the CLI without the
+	// page, or the page without the socket, and MYNE_ADMIN_PANEL_ADDR alone is
+	// sufficient to bring the panel up.
+	//
+	// PanelHosts is the comma-separated set of Host header values the panel answers
+	// to (MYNE_ADMIN_PANEL_HOSTS; "" = loopback names only). This is the panel's
+	// DNS-rebinding defense, and it has to be a Host allowlist: a rebound hostname is
+	// same-origin to the hostile page, and browsers omit Origin on a GET, so neither
+	// the same-origin policy nor an Origin check survives a rebind. An operator who
+	// binds a LAN address must name the host they will browse to.
+	PanelHosts string
+
+	// It is a TCP port, which the metrics-endpoint discipline says operator surfaces
+	// must not put on the public edge, so it is never added to the bundle's reverse
+	// proxy. The address is not validated; see internal/panel.Listen.
+	PanelAddr string
+
 	// AllowedOrigins is the comma-separated CORS allowlist for the Phase 3 web
 	// client (MYNE_ALLOWED_ORIGINS; "" = CORS off = the pre-web behaviour, which
 	// is what every native-only deployment wants). Exact origins, never `*` —
@@ -166,6 +185,8 @@ func loadConfig() (Config, error) {
 	cfg.BackupResticBin = envOr("MYNE_BACKUP_RESTIC_BIN", cfg.BackupResticBin)
 	cfg.BackupCacheDir = os.Getenv("MYNE_BACKUP_CACHE_DIR")
 	cfg.AdminSocket = os.Getenv("MYNE_ADMIN_SOCKET")
+	cfg.PanelAddr = os.Getenv("MYNE_ADMIN_PANEL_ADDR")
+	cfg.PanelHosts = os.Getenv("MYNE_ADMIN_PANEL_HOSTS")
 	cfg.AllowedOrigins = os.Getenv("MYNE_ALLOWED_ORIGINS")
 	if cfg.BackupIntervalSeconds, err = uintEnv("MYNE_BACKUP_INTERVAL_SECONDS", cfg.BackupIntervalSeconds); err != nil {
 		return Config{}, err
