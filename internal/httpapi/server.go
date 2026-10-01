@@ -212,6 +212,7 @@ func runListener(ctx context.Context, ln net.Listener) error {
 	tokens := auth.NewTokenStore(reg)
 	authHandler := authapi.New(reg, tokens).
 		WithPreAuthLimiter(preAuthAuth).
+		WithInviteCode(cfg.InviteCode).
 		WithLimits(int(cfg.MaxAccounts), int(cfg.MaxHandshakes), time.Duration(cfg.HandshakeTTLSeconds)*time.Second)
 
 	// Persist device-auth state (registry + per-device tokens + per-account SCRAM

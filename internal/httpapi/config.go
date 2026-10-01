@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/myne-md/myne-server/internal/authapi"
 	"github.com/myne-md/myne-server/internal/gcquota"
 	"github.com/myne-md/myne-server/internal/store"
 )
@@ -90,6 +91,17 @@ type Config struct {
 	// origin and each self-hoster's own origin are different strings, and TB5
 	// says both deployments run the same protocol with the same model.
 	AllowedOrigins string
+
+	// InviteCode gates NEW-account registration (MYNE_INVITE_CODE). "" = open
+	// registration, the self-host and fresh-clone default. When set, POST
+	// /auth/register refuses an account it has never seen unless the request
+	// carries a matching invite_code; an account that already exists is
+	// unaffected (a later device enrols through the normal approval flow and
+	// needs no code). The code is a shared admission door word, not a per-user
+	// credential: it is never logged, never stored, and never associated with
+	// the account, so the server learns nothing new (AS9 stays its only
+	// identifier; no change under A2 or TB5).
+	InviteCode string
 }
 
 // loadConfig reads the MYNE_* env vars and fails fast on any invalid value, so a
@@ -188,6 +200,14 @@ func loadConfig() (Config, error) {
 	cfg.PanelAddr = os.Getenv("MYNE_ADMIN_PANEL_ADDR")
 	cfg.PanelHosts = os.Getenv("MYNE_ADMIN_PANEL_HOSTS")
 	cfg.AllowedOrigins = os.Getenv("MYNE_ALLOWED_ORIGINS")
+	// Closed-beta admission gate. A short code is brute-forceable and the
+	// pre-auth limiter is a single global bucket that cannot key on source, so
+	// the code's own entropy is the primary defence; refuse to start below the
+	// minimum rather than serve a weak gate.
+	cfg.InviteCode = os.Getenv("MYNE_INVITE_CODE")
+	if cfg.InviteCode != "" && len(cfg.InviteCode) < authapi.MinInviteCodeLen {
+		return Config{}, fmt.Errorf("MYNE_INVITE_CODE must be at least %d characters (a short code is guessable)", authapi.MinInviteCodeLen)
+	}
 	if cfg.BackupIntervalSeconds, err = uintEnv("MYNE_BACKUP_INTERVAL_SECONDS", cfg.BackupIntervalSeconds); err != nil {
 		return Config{}, err
 	}
