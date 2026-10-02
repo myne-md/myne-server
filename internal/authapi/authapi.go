@@ -33,6 +33,8 @@ package authapi
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
@@ -66,6 +68,12 @@ type PreAuthLimiter interface {
 // giant JSON string field to exhaust memory (the syncapi/attachments handlers
 // already gate their bodies with http.MaxBytesReader — these did not).
 const MaxAuthBodySize = 8 * 1024
+
+// MinInviteCodeLen is the shortest invite code a server will accept. A code
+// shorter than this is refused at startup (httpapi.loadConfig), because the
+// pre-auth limiter is a single global bucket that cannot key on source: the
+// code's own entropy is the primary defence against guessing.
+const MinInviteCodeLen = 32
 
 // storedCredential is the per-account SCRAM verifier + its username.
 type storedCredential struct {
@@ -117,6 +125,14 @@ type Handler struct {
 	maxHandshakes int
 	hsTTL         time.Duration
 	now           func() time.Time
+
+	// inviteCode, when non-empty, gates NEW-account registration behind a shared
+	// invite code (MYNE_INVITE_CODE). "" = open registration. It is compared in
+	// constant time and is never logged, stored, or associated with an account;
+	// an account that already exists is unaffected (a later device enrols through
+	// the normal approval flow), which is why the check sits after the
+	// already-registered branch in handleRegister.
+	inviteCode string
 
 	// requireChannelBinding, when non-nil, is asked whether an account refuses
 	// unbound sessions (MYND-577's per-account opt-out). nil = no account
@@ -217,6 +233,15 @@ func (h *Handler) WithPreAuthLimiter(g PreAuthLimiter) *Handler {
 	return h
 }
 
+// WithInviteCode gates new-account registration behind a shared invite code
+// ("" = open registration, the self-host default). The code is compared in
+// constant time at POST /auth/register and is never logged, stored, or
+// associated with an account.
+func (h *Handler) WithInviteCode(code string) *Handler {
+	h.inviteCode = code
+	return h
+}
+
 // WithLimits sets the pre-auth resource ceilings: maxCreds bounds the registered-
 // account map, maxHandshakes bounds the in-flight SCRAM handshake map, and ttl is
 // how long an init-without-final handshake survives before it is swept. A value of
@@ -272,6 +297,16 @@ func writeErr(w http.ResponseWriter, status int, code string) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"error_code": code})
 }
 
+// inviteCodeMatches compares the presented invite code against the configured
+// one in constant time with respect to BOTH content and length: it hashes both
+// (SHA-256, so both inputs are 32 bytes) before the constant-time compare, so a
+// length mismatch cannot leak the configured code's length through timing.
+func inviteCodeMatches(presented, configured string) bool {
+	p := sha256.Sum256([]byte(presented))
+	c := sha256.Sum256([]byte(configured))
+	return subtle.ConstantTimeCompare(p[:], c[:]) == 1
+}
+
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
@@ -312,6 +347,10 @@ type registerReq struct {
 	Iterations     int    `json:"iterations"`
 	StoredKeyHex   string `json:"stored_key_hex"`
 	ServerKeyHex   string `json:"server_key_hex"`
+	// InviteCode is the shared admission code for a gated server. Absent from an
+	// older client and ignored by an ungated server, so the field is forward and
+	// backward compatible at the wire shape level.
+	InviteCode string `json:"invite_code"`
 }
 
 func (h *Handler) handleRegister(w http.ResponseWriter, r *http.Request) {
@@ -350,6 +389,19 @@ func (h *Handler) handleRegister(w http.ResponseWriter, r *http.Request) {
 		// First-write only — replacing a verifier requires an authed flow (not v0.1).
 		writeErr(w, http.StatusConflict, "already_registered")
 		return
+	}
+	// Closed-beta admission gate. Only a NEW account is asked for the code: an
+	// account that already exists returned above, so a later device enrols
+	// without one. Constant-time compare; the presented code is never logged.
+	if h.inviteCode != "" {
+		switch {
+		case req.InviteCode == "":
+			writeErr(w, http.StatusForbidden, "invite_code_required")
+			return
+		case !inviteCodeMatches(req.InviteCode, h.inviteCode):
+			writeErr(w, http.StatusForbidden, "invite_code_invalid")
+			return
+		}
 	}
 	// Cap the registered-account map so an unauthenticated register flood cannot grow
 	// creds (and the persisted auth.json) without bound (503 = server at capacity,
