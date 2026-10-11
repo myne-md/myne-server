@@ -25,6 +25,7 @@ import (
 	"github.com/myne-md/myne-server/internal/auth"
 	"github.com/myne-md/myne-server/internal/authapi"
 	"github.com/myne-md/myne-server/internal/authpersist"
+	"github.com/myne-md/myne-server/internal/awareness"
 	"github.com/myne-md/myne-server/internal/backup"
 	"github.com/myne-md/myne-server/internal/console"
 	"github.com/myne-md/myne-server/internal/gcquota"
@@ -250,6 +251,10 @@ func runListener(ctx context.Context, ln net.Listener) error {
 	// 0 = unlimited until set (SYNC-23; hosted value lands with MYND-430). The
 	// clamped horizon policy (cfg.Policy) is consumed by the GC scheduler (MYND-440).
 	rl := gcquota.NewRateLimiter(cfg.RateLimitBurst, cfg.RateLimitRefill)
+	// The live-awareness relay's OWN account-keyed bucket (live-collab,
+	// decisions/sync/0657): separate from the shared sync bucket so awareness
+	// traffic can neither starve nor be starved by push/pull (server-protocol §3.5).
+	awarenessRL := gcquota.NewRateLimiter(cfg.AwarenessRateLimitBurst, cfg.AwarenessRateLimitRefill)
 	qg := gcquota.NewQuotaGuard(cfg.Policy.QuotaCeilingBytes)
 	if acctStore != nil {
 		// A per-account quota override wins over the global ceiling; the enroll gate
@@ -271,6 +276,7 @@ func runListener(ctx context.Context, ln net.Listener) error {
 				return
 			case <-t.C:
 				rl.Refill()
+				awarenessRL.Refill()
 				preAuthAuth.Refill()
 				preAuthMeta.Refill()
 			}
@@ -324,7 +330,7 @@ func runListener(ctx context.Context, ln net.Listener) error {
 		}
 		return v
 	}
-	srv := newHTTPServer(NewServer(blobStore, tokens, authHandler, rl, qg, ready, metrics, preAuthMeta, attachStore, activityTouch, acctStore, accountStatus, cfg.AllowedOrigins))
+	srv := newHTTPServer(NewServer(blobStore, tokens, authHandler, rl, qg, ready, metrics, preAuthMeta, attachStore, activityTouch, acctStore, accountStatus, cfg.AllowedOrigins, awarenessRL, int(cfg.AwarenessMaxSubscribers)))
 
 	// Aggregate-only metrics on a SEPARATE listener (SYNC-24) — never the public edge.
 	// Disabled unless MYNE_METRICS_ADDR is set; bind it to localhost/internal only.
@@ -527,7 +533,7 @@ type accountStatusView struct {
 	MaxDevices  uint64 `json:"max_devices"`
 }
 
-func NewServer(s store.BlobStore, tokens *auth.TokenStore, authHandler *authapi.Handler, rl syncapi.RateLimiter, qg *gcquota.QuotaGuard, ready *Readiness, metrics *Metrics, preAuthMeta syncapi.PreAuthLimiter, attachStore attachments.Backend, activityTouch func(ids.AccountNumberHash, ids.DeviceID), acctStore *accounts.Store, accountStatus func(ids.AccountNumberHash) any, allowedOrigins string) http.Handler {
+func NewServer(s store.BlobStore, tokens *auth.TokenStore, authHandler *authapi.Handler, rl syncapi.RateLimiter, qg *gcquota.QuotaGuard, ready *Readiness, metrics *Metrics, preAuthMeta syncapi.PreAuthLimiter, attachStore attachments.Backend, activityTouch func(ids.AccountNumberHash, ids.DeviceID), acctStore *accounts.Store, accountStatus func(ids.AccountNumberHash) any, allowedOrigins string, awarenessRL awareness.RateLimiter, awarenessMaxSubs int) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", healthz)
 	if ready != nil {
@@ -577,6 +583,23 @@ func NewServer(s store.BlobStore, tokens *auth.TokenStore, authHandler *authapi.
 	// and a heartbeat keep-alive — the low-latency layer clients keep open while
 	// unlocked (sync-protocol §8.3 as amended).
 	poke.NewHandler(notifier, tokens).WithPolicy(rl).Register(mux)
+	// Live-awareness relay (live-collab, decisions/sync/0657): a separate SSE-down
+	// + POST-up pair carrying opaque frames, on its own account-keyed rate bucket,
+	// with its own (larger) subscriber cap, accepting a device token or a per-vault
+	// membership token. The relay reads no frame byte (server-protocol §3.5).
+	awarenessRelay := awareness.NewRelay()
+	awarenessHandler := awareness.NewHandler(awarenessRelay, tokens).
+		WithPolicy(awarenessRL).
+		WithMembership(authHandler).
+		WithCaps(awarenessMaxSubs, awareness.MaxFrameSize, awareness.MaxFramesPerPost)
+	// Member removal closes the removed member's open awareness streams at once:
+	// the membership token store reports each revoked token, and the relay
+	// terminates the streams registered under it (it keys on the token, not a
+	// person, so it stays person-agnostic). server-protocol §3.5.
+	if mt := authHandler.MemberTokens(); mt != nil {
+		mt.SetOnRevoke(awarenessRelay.TerminateToken)
+	}
+	awarenessHandler.Register(mux)
 	// Attachment transport: same per-account rate-limit + a UNIFIED quota — attachment
 	// bytes are added to the blob store's per-account total against one AS17 ceiling
 	// (no separate, bypassable budget), plus a per-vault id cap (OOM bound).

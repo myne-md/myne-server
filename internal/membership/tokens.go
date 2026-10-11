@@ -22,9 +22,19 @@ const tokenLen = 32
 // one vault for exactly one person, so removing a member revokes that person's
 // access to that vault and nothing else (decisions/protocol/0599).
 type TokenStore struct {
-	mu      sync.RWMutex
-	byToken map[string]Binding
-	table   *Table
+	mu       sync.RWMutex
+	byToken  map[string]Binding
+	table    *Table
+	onRevoke func(tokenHex string)
+}
+
+// SetOnRevoke installs an observer called with each revoked token's hex when
+// Revoke removes it. The live-awareness relay uses it to close a removed
+// member's open streams at once, keying on the token so it stays person-agnostic.
+func (s *TokenStore) SetOnRevoke(fn func(tokenHex string)) {
+	s.mu.Lock()
+	s.onRevoke = fn
+	s.mu.Unlock()
 }
 
 // NewTokenStore returns a token store whose tokens are validated against the
@@ -79,10 +89,20 @@ func (s *TokenStore) Resolve(token ids.DeviceToken) (Binding, error) {
 // person, never the person's other vaults.
 func (s *TokenStore) Revoke(vault VaultID, person PersonID) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	var revoked []string
 	for tok, b := range s.byToken {
 		if b.Vault == vault && b.Person == person {
 			delete(s.byToken, tok)
+			revoked = append(revoked, tok)
+		}
+	}
+	onRevoke := s.onRevoke
+	s.mu.Unlock()
+	// Report after releasing the lock: the observer (the awareness relay) takes
+	// its own locks and must never run under the token store's.
+	if onRevoke != nil {
+		for _, tok := range revoked {
+			onRevoke(tok)
 		}
 	}
 }

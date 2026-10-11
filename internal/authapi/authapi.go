@@ -47,6 +47,7 @@ import (
 
 	"github.com/myne-md/myne-server/internal/auth"
 	"github.com/myne-md/myne-server/internal/auth/scram"
+	"github.com/myne-md/myne-server/internal/grouppkg"
 	"github.com/myne-md/myne-server/internal/ids"
 	"github.com/myne-md/myne-server/internal/membership"
 	"github.com/myne-md/myne-server/internal/profiles"
@@ -108,6 +109,10 @@ type Handler struct {
 	memberTks *membership.TokenStore
 	relay     *relay.Store
 	profs     *profiles.Store
+	// groupPkgs is the blind relay for per-member group-rotation packages
+	// (collab-b2b-sessions task 1). Like the invite relay it stores opaque
+	// bytes; unlike it, a package is not one-shot consumed.
+	groupPkgs *grouppkg.Store
 	// profileDeleteGrace is how long a removed member's profiles survive before
 	// reclamation (0 or negative = DefaultProfileDeleteGrace).
 	profileDeleteGrace time.Duration
@@ -205,6 +210,7 @@ func New(reg *auth.Registry, tokens *auth.TokenStore) *Handler {
 		memberTks: membership.NewTokenStore(table),
 		relay:     relay.NewStore(),
 		profs:     profiles.NewStore(),
+		groupPkgs: grouppkg.NewStore(),
 		creds:     make(map[ids.AccountNumberHash]storedCredential),
 		hs:        make(map[string]handshake),
 		now:       time.Now,
@@ -284,12 +290,21 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	// person-authorized namespace, separate from the shared group manifest.
 	mux.HandleFunc("PUT /b2b/vaults/{account_hash}/profiles/{profile_id}", h.handlePutProfile)
 	mux.HandleFunc("GET /b2b/vaults/{account_hash}/profiles/{profile_id}", h.handleGetProfile)
+	// Per-member group-rotation delivery (collab-b2b-sessions task 1): the owner
+	// writes each remaining member's package under its per-vault token; a member
+	// reads its own under its person session plus membership binding.
+	mux.HandleFunc("PUT /b2b/vaults/{account_hash}/group-packages/{person_id}", h.handlePutGroupPackage)
+	mux.HandleFunc("GET /b2b/vaults/{account_hash}/group-packages/{person_id}", h.handleGetGroupPackage)
 }
 
 // Relay returns the sealed-invite store for a caller that needs it (the client
 // acceptance flow and the operator surfaces read it through the routes; this is
 // here for tests and for the removal path's cleanup).
 func (h *Handler) Relay() *relay.Store { return h.relay }
+
+// GroupPackages returns the group-rotation package relay (for tests and for a
+// caller that needs to inspect or seed it).
+func (h *Handler) GroupPackages() *grouppkg.Store { return h.groupPkgs }
 
 func writeErr(w http.ResponseWriter, status int, code string) {
 	w.Header().Set("Content-Type", "application/json")

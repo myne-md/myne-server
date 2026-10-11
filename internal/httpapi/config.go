@@ -27,6 +27,14 @@ type Config struct {
 	Policy          gcquota.Policy // QuotaCeilingBytes (0=unlimited) + HorizonMarkers (clamped) + ExtendedRetention
 	MetricsAddr     string         // MYNE_METRICS_ADDR; "" = disabled. Bind to localhost/internal only — NEVER the public edge.
 
+	// Live-awareness relay (live-collab, decisions/sync/0657). Its OWN account-keyed
+	// rate bucket, SEPARATE from RateLimitBurst/Refill so awareness can neither
+	// starve sync nor be starved by it (server-protocol.md §3.5). Its OWN concurrent
+	// subscriber cap: the poke's single-user 8 is too small for a shared vault.
+	AwarenessRateLimitBurst  uint64 // MYNE_AWARENESS_RATELIMIT_BURST
+	AwarenessRateLimitRefill uint64 // MYNE_AWARENESS_RATELIMIT_REFILL
+	AwarenessMaxSubscribers  uint64 // MYNE_AWARENESS_MAX_SUBSCRIBERS
+
 	// Pre-auth abuse bounds (DoS hardening). PreAuthBurst/Refill drive the single
 	// global pre-auth token bucket (account/IP-independent by construction, C4/AS14).
 	// MaxAccounts/MaxHandshakes/HandshakeTTLSeconds cap + expire the auth maps.
@@ -110,11 +118,14 @@ type Config struct {
 // 120-marker horizon).
 func loadConfig() (Config, error) {
 	cfg := Config{
-		StorageBackend:  strings.ToLower(envOr("MYNE_STORAGE_BACKEND", "mem")),
-		StoragePath:     os.Getenv("MYNE_STORAGE_PATH"),
-		MetricsAddr:     os.Getenv("MYNE_METRICS_ADDR"),
-		RateLimitBurst:  256,
-		RateLimitRefill: 16,
+		StorageBackend:           strings.ToLower(envOr("MYNE_STORAGE_BACKEND", "mem")),
+		StoragePath:              os.Getenv("MYNE_STORAGE_PATH"),
+		MetricsAddr:              os.Getenv("MYNE_METRICS_ADDR"),
+		RateLimitBurst:           256,
+		RateLimitRefill:          16,
+		AwarenessRateLimitBurst:  64,
+		AwarenessRateLimitRefill: 16,
+		AwarenessMaxSubscribers:  64,
 		Policy: gcquota.Policy{
 			HorizonMarkers:    gcquota.DefaultHorizonMarkers,
 			QuotaCeilingBytes: 0, // unlimited until set (SYNC-23)
@@ -142,6 +153,15 @@ func loadConfig() (Config, error) {
 		return Config{}, err
 	}
 	if cfg.RateLimitRefill, err = uintEnv("MYNE_RATELIMIT_REFILL", cfg.RateLimitRefill); err != nil {
+		return Config{}, err
+	}
+	if cfg.AwarenessRateLimitBurst, err = uintEnv("MYNE_AWARENESS_RATELIMIT_BURST", cfg.AwarenessRateLimitBurst); err != nil {
+		return Config{}, err
+	}
+	if cfg.AwarenessRateLimitRefill, err = uintEnv("MYNE_AWARENESS_RATELIMIT_REFILL", cfg.AwarenessRateLimitRefill); err != nil {
+		return Config{}, err
+	}
+	if cfg.AwarenessMaxSubscribers, err = uintEnv("MYNE_AWARENESS_MAX_SUBSCRIBERS", cfg.AwarenessMaxSubscribers); err != nil {
 		return Config{}, err
 	}
 	if cfg.Policy.QuotaCeilingBytes, err = uintEnv("MYNE_QUOTA_CEILING_BYTES", cfg.Policy.QuotaCeilingBytes); err != nil {
