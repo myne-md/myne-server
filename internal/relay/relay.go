@@ -13,8 +13,18 @@
 // carry it were moved INSIDE the sealed payload when the frame was reduced
 // (decisions/protocol/0599, Grill 4 Q10).
 //
-// An invite is a postbox slot, not a queue: claiming it consumes it, so a
-// claimed invite is not re-claimable.
+// An invite is a postbox slot, not a queue: it retains its sealed payload, and
+// the Claimed flag records that it has been claimed at least once rather than
+// consuming the slot. A re-claim is idempotent only for the invite's OWN
+// recipient whose binding to the vault still stands: Claim returns the stored
+// invite again (payload included, alongside ErrClaimed) so the caller can check
+// that binding and, if it holds, let a member's second device obtain its own
+// per-vault token without the owner. A recipient the owner has since removed
+// must NOT be able to re-claim the retained invite back into the vault, and
+// every other caller still sees the same ErrNotFound an unknown id gives, so the
+// rule widens no enumeration signal. Meta, the recipient projection, still
+// deliberately excludes the payload: a list cannot be used to drain a slot, and
+// the Claimed flag is what the owner's view reads.
 package relay
 
 import (
@@ -59,9 +69,10 @@ type VaultMeta struct {
 	Claimed   bool
 }
 
-// Store errors. ErrNotFound is returned both for an unknown id and for an id
-// addressed to a DIFFERENT person, so the caller cannot enumerate another
-// person's invites or confirm that one exists.
+// ErrNotFound is returned both for an unknown id and for an id addressed to a
+// DIFFERENT person, so the caller cannot enumerate another person's invites or
+// confirm that one exists. A re-claim by the invite's own recipient is signalled
+// with ErrClaimed instead, which carries the stored invite (see Claim).
 var (
 	ErrNotFound = errors.New("relay: invite not found")
 	ErrClaimed  = errors.New("relay: invite already claimed")
@@ -132,9 +143,15 @@ func (s *Store) ListByVault(vault membership.VaultID) []VaultMeta {
 	return out
 }
 
-// Claim releases an invite addressed to the caller and consumes it. A wrong
-// recipient is ErrNotFound (not a distinct refusal, so no enumeration signal);
-// a second claim by the recipient is ErrClaimed.
+// Claim releases an invite addressed to the caller. A wrong recipient or an
+// unknown id is ErrNotFound (not a distinct refusal, so no enumeration signal).
+// A first claim marks the invite claimed and returns it with a nil error. A
+// later claim by the SAME recipient returns the stored invite (payload
+// included) TOGETHER WITH ErrClaimed: the value is meaningful on that path. The
+// relay holds no membership state, so it cannot itself judge that re-claim: the
+// caller checks that the recipient's binding to the vault still stands
+// (member-devices), which is what stops a removed member from re-claiming a
+// retained invite back into the vault.
 func (s *Store) Claim(recipient membership.PersonID, id InviteID) (Invite, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -143,7 +160,9 @@ func (s *Store) Claim(recipient membership.PersonID, id InviteID) (Invite, error
 		return Invite{}, ErrNotFound
 	}
 	if inv.Claimed {
-		return Invite{}, ErrClaimed
+		// Already claimed: hand the stored invite back with the signal, so the
+		// caller has the payload and the vault to check the binding against.
+		return inv, ErrClaimed
 	}
 	inv.Claimed = true
 	s.byID[id] = inv

@@ -204,19 +204,25 @@ func (h *Handler) handleClaimInvite(w http.ResponseWriter, r *http.Request) {
 	person := personFromSession(sess)
 	inv, err := h.relay.Claim(person, inviteID)
 	if err != nil {
-		switch {
-		case errors.Is(err, relay.ErrClaimed):
-			writeErr(w, http.StatusConflict, "already_claimed")
-		default:
-			// Unknown id and wrong recipient are the SAME 404: a different
-			// account must not be able to confirm that an invite exists.
+		// A re-claim by the invite's own recipient is idempotent ONLY while that
+		// person's binding to the vault still stands (member-devices). The relay
+		// retains the invite, so without this check a member the owner removed
+		// could re-claim the stored invite and re-acquire access. A removed
+		// recipient therefore gets the same 404, which also keeps the route from
+		// being an oracle. Unknown id and wrong recipient are the same 404 too: a
+		// different account must not be able to confirm that an invite exists.
+		if !errors.Is(err, relay.ErrClaimed) {
 			writeErr(w, http.StatusNotFound, "not_found")
+			return
 		}
-		return
+		if _, bound := h.members.Role(inv.Vault, person); !bound {
+			writeErr(w, http.StatusNotFound, "not_found")
+			return
+		}
 	}
-	// Acceptance binds the member. A person already bound (a re-issued invite,
-	// or the vault's own owner) is not an error here: the binding already exists
-	// and the token below is what the claim is for.
+	// Acceptance binds the member. On a first claim the binding is absent and this
+	// creates it; on an allowed re-claim it already exists, so ErrAlreadyBound is
+	// tolerated and the token below is what the claim is for.
 	if err := h.members.BindMember(inv.Vault, person); err != nil &&
 		!errors.Is(err, membership.ErrAlreadyBound) {
 		writeErr(w, http.StatusInternalServerError, "internal")
