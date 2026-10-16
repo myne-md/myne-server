@@ -82,8 +82,9 @@ var (
 // material and no content it can read; persistence is a separate concern (the
 // same residual the membership table carries).
 type Store struct {
-	mu   sync.Mutex
-	byID map[InviteID]Invite
+	mu       sync.Mutex
+	byID     map[InviteID]Invite
+	onChange func()
 }
 
 // NewStore returns an empty relay store.
@@ -102,6 +103,7 @@ func (s *Store) Put(recipient membership.PersonID, vault membership.VaultID, pay
 	copy(buf, payload)
 	s.mu.Lock()
 	s.byID[id] = Invite{ID: id, Recipient: recipient, Vault: vault, Payload: buf}
+	s.changed()
 	s.mu.Unlock()
 	return id, nil
 }
@@ -166,5 +168,6 @@ func (s *Store) Claim(recipient membership.PersonID, id InviteID) (Invite, error
 	}
 	inv.Claimed = true
 	s.byID[id] = inv
+	s.changed()
 	return inv, nil
 }

@@ -98,6 +98,14 @@ func (h *Handler) handleRetire(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusForbidden, "forbidden")
 		return
 	}
+	// The sync routes' per-account bucket, consulted here like every other write on this mux
+	// (myne-md/myne-server#18). The key is the VAULT, which is the binding the owner's
+	// membership token authorises against, and the bucket is the same one the rest of the
+	// surface uses rather than a second, unbounded path into the store.
+	if h.rl != nil && !h.rl.Allow(vault) {
+		writeErr(w, http.StatusTooManyRequests, "rate")
+		return
+	}
 	var req retireReq
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, MaxVaultMetaSize)).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, "bad_request")

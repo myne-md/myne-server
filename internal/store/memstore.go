@@ -392,6 +392,47 @@ func (m *MemStore) ReclaimTombstone(account ids.AccountNumberHash, blobID ids.Bl
 	return nil
 }
 
+// ReclaimRetired drops a RETIRED namespace's blob body (myne-md/myne-server#17). It is
+// ReclaimTombstone without the tombstone requirement: a retired id is not tombstoned, so the
+// old path could not touch it and the grace-bounded reclamation had nothing to call.
+//
+// The record is kept, so the id is absent from the manifest and GetBlob reports ErrReclaimed
+// rather than a live empty body; the CALLER (the retirement registry) is what keeps refusing
+// writes to the id. Idempotent, and a blob this store does not hold is ErrNotFound — the
+// caller must treat that as "nothing to reclaim" rather than as a retry signal, since a
+// namespace can be retired before a blob arrives.
+func (m *MemStore) ReclaimRetired(account ids.AccountNumberHash, blobID ids.BlobID) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	v := m.vaults[account]
+	if v == nil {
+		return ErrNotFound
+	}
+	e := v.blobs[blobID]
+	if e == nil {
+		return ErrNotFound
+	}
+	if e.reclaimed {
+		return nil
+	}
+	v.quotaBytes -= uint64(e.size)
+	e.ciphertext = nil
+	e.size = 0
+	e.reclaimed = true
+	// The reclaim floor is raised from the TOMBSTONE's change-sequence when one exists (a
+	// reader whose cursor predates it must full-reconcile, §11.2/§11.3); otherwise from the
+	// blob's own, which is the sequence a reader would have seen it in.
+	if rec, ok := v.tombstones[blobID]; ok {
+		rec.reclaimed = true
+		if rec.changeSeq > v.reclaimFloor {
+			v.reclaimFloor = rec.changeSeq
+		}
+	} else if e.changeSeq > v.reclaimFloor {
+		v.reclaimFloor = e.changeSeq
+	}
+	return nil
+}
+
 // GCFloor returns the highest change-sequence whose tombstone has been L2-reclaimed.
 // A pull with a non-zero cursor below this has missed reclaimed history and must
 // full-reconcile (the server returns cursor-expired / 410).

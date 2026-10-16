@@ -113,6 +113,9 @@ type Handler struct {
 	// (collab-b2b-sessions task 1). Like the invite relay it stores opaque
 	// bytes; unlike it, a package is not one-shot consumed.
 	groupPkgs *grouppkg.Store
+	// b2bLimiter bounds the /b2b/* routes (myne-md/myne-server#18). Nil = unmetered,
+	// which the mem-backend tests use.
+	b2bLimiter B2BRateLimiter
 	// profileDeleteGrace is how long a removed member's profiles survive before
 	// reclamation (0 or negative = DefaultProfileDeleteGrace).
 	profileDeleteGrace time.Duration
@@ -280,21 +283,81 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	// B2B person↔vault membership (myne-md/myne#711, decisions/protocol/0599).
 	// Person accounts themselves use the /auth/* routes above with their
 	// person_id_hash as the account id (see b2b.go's header).
-	mux.HandleFunc("POST /b2b/vaults/{account_hash}/members", h.handleBindMember)
-	mux.HandleFunc("DELETE /b2b/vaults/{account_hash}/members/{person_id}", h.handleRemoveMember)
-	mux.HandleFunc("POST /b2b/invites", h.handleCreateInvite)
-	mux.HandleFunc("GET /b2b/invites", h.handleListInvites)
-	mux.HandleFunc("GET /b2b/vaults/{account_hash}/invites", h.handleListVaultInvites)
-	mux.HandleFunc("POST /b2b/invites/{invite_id}/claim", h.handleClaimInvite)
+	//
+	// EVERY route below goes through h.limitB2B (myne-md/myne-server#18). They were the one
+	// part of the API with no bound of any kind: the sync routes carry a per-account bucket
+	// and the pre-auth surface carries global ones, while an authenticated member could drive
+	// unlimited profile writes, invites and membership changes. The bucket is keyed on the
+	// resolved account (never an IP — the no-IP commitment), and an unauthenticated request
+	// lands in one shared bucket rather than going unbounded.
+	mux.HandleFunc("POST /b2b/vaults/{account_hash}/members", h.limitB2B(h.handleBindMember))
+	mux.HandleFunc("DELETE /b2b/vaults/{account_hash}/members/{person_id}", h.limitB2B(h.handleRemoveMember))
+	mux.HandleFunc("POST /b2b/invites", h.limitB2B(h.handleCreateInvite))
+	mux.HandleFunc("GET /b2b/invites", h.limitB2B(h.handleListInvites))
+	mux.HandleFunc("GET /b2b/vaults/{account_hash}/invites", h.limitB2B(h.handleListVaultInvites))
+	mux.HandleFunc("POST /b2b/invites/{invite_id}/claim", h.limitB2B(h.handleClaimInvite))
 	// Person-private AI profiles (myne-md/myne#711 task 16): a vault-scoped,
 	// person-authorized namespace, separate from the shared group manifest.
-	mux.HandleFunc("PUT /b2b/vaults/{account_hash}/profiles/{profile_id}", h.handlePutProfile)
-	mux.HandleFunc("GET /b2b/vaults/{account_hash}/profiles/{profile_id}", h.handleGetProfile)
+	mux.HandleFunc("PUT /b2b/vaults/{account_hash}/profiles/{profile_id}", h.limitB2B(h.handlePutProfile))
+	mux.HandleFunc("GET /b2b/vaults/{account_hash}/profiles/{profile_id}", h.limitB2B(h.handleGetProfile))
 	// Per-member group-rotation delivery (collab-b2b-sessions task 1): the owner
 	// writes each remaining member's package under its per-vault token; a member
 	// reads its own under its person session plus membership binding.
-	mux.HandleFunc("PUT /b2b/vaults/{account_hash}/group-packages/{person_id}", h.handlePutGroupPackage)
-	mux.HandleFunc("GET /b2b/vaults/{account_hash}/group-packages/{person_id}", h.handleGetGroupPackage)
+	mux.HandleFunc("PUT /b2b/vaults/{account_hash}/group-packages/{person_id}", h.limitB2B(h.handlePutGroupPackage))
+	mux.HandleFunc("GET /b2b/vaults/{account_hash}/group-packages/{person_id}", h.limitB2B(h.handleGetGroupPackage))
+}
+
+// B2BRateLimiter bounds one caller's rate on the person-to-vault routes.
+//
+// It is keyed on `account_number_hash` and never on an IP: the no-IP commitment is a
+// property of the whole surface, and the sync routes' bucket is keyed the same way
+// (`server-protocol.md` §3.5, §1.3). The type is declared here rather than borrowed from
+// `syncapi` because the dependency runs the other way: syncapi consumes this Handler.
+type B2BRateLimiter interface {
+	Allow(account ids.AccountNumberHash) bool
+}
+
+// WithB2BRateLimiter installs the bucket for the /b2b/* routes (myne-md/myne-server#18).
+// Nil (the default) leaves them unmetered, which is what the mem-backend tests use.
+func (h *Handler) WithB2BRateLimiter(l B2BRateLimiter) *Handler {
+	h.b2bLimiter = l
+	return h
+}
+
+// limitB2B wraps one B2B handler in that bucket. The nil check is at REQUEST time, not at
+// registration time: a wrapper that decided once, when the route was registered, would make
+// the bucket's installation order matter, and "I installed it and nothing changed" is exactly
+// the failure this file is about.
+func (h *Handler) limitB2B(fn http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if h.b2bLimiter != nil && !h.b2bLimiter.Allow(h.b2bKey(r)) {
+			// The same refusal the sync routes use, so a client has one shape to handle.
+			writeErr(w, http.StatusTooManyRequests, "rate")
+			return
+		}
+		fn(w, r)
+	}
+}
+
+// b2bKey resolves which bucket a request is charged to: the VAULT for a per-vault membership
+// token, the ACCOUNT for a device token, and the zero hash (one shared bucket) for anything
+// else — an unauthenticated attempt is still work the server does, and leaving it unbounded
+// would make the bound depend on presenting the right credentials.
+//
+// A request that carries BOTH is charged to the vault, because that is the binding every one
+// of these routes authorises against.
+func (h *Handler) b2bKey(r *http.Request) ids.AccountNumberHash {
+	tok, ok := bearerToken(r)
+	if !ok {
+		return ids.AccountNumberHash{}
+	}
+	if vault, _, ok := h.ResolveMember(hex.EncodeToString(tok)); ok {
+		return vault
+	}
+	if b, err := h.tokens.Authenticate(tok); err == nil {
+		return b
+	}
+	return ids.AccountNumberHash{}
 }
 
 // Relay returns the sealed-invite store for a caller that needs it (the client

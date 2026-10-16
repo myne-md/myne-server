@@ -1,0 +1,52 @@
+{{/* SPDX-License-Identifier: AGPL-3.0 */}}
+{{- if .Values.ingress.enabled }}
+{{/*
+READ THIS BEFORE ENABLING.
+
+The Compose bundle ships a Caddy edge whose access log DELETES every IP-bearing
+field, because "no persistent server-side IP logging" is a commitment the server
+makes to its users and the operator inherits it (docs/self-host-policy.md §3).
+
+An Ingress replaces that edge. Whatever your ingress controller logs is now YOUR
+log: ingress-nginx, Traefik and most others write the client address and the
+X-Forwarded-For chain by default. Two things follow, and both are on you:
+
+  * turn the controller's access log off, or configure it to drop the IP fields
+     (ingress-nginx: `disable-access-log: "true"` in the controller ConfigMap,
+     or an access-log-format template that omits $remote_addr / $http_x_forwarded_for);
+  * strip/normalise the forwarding headers on the way in, so the server itself
+     never receives one it might echo.
+
+Enabling this chart's Ingress with a default-configured controller silently
+reintroduces the very logging the sync server is built not to do.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "myne-server.fullname" . }}
+  labels:
+    {{- include "myne-server.labels" . | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- with .Values.ingress.tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    - host: {{ required "ingress.host is required when ingress.enabled is true" .Values.ingress.host | quote }}
+      http:
+        paths:
+          - path: {{ .Values.ingress.path }}
+            pathType: {{ .Values.ingress.pathType }}
+            backend:
+              service:
+                name: {{ include "myne-server.fullname" . }}
+                port:
+                  number: {{ .Values.service.port }}
+{{- end }}

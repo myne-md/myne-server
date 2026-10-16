@@ -1,0 +1,30 @@
+{{/* SPDX-License-Identifier: AGPL-3.0 */}}
+Myne's browser client is installed.
+
+  Service:  {{ include "myne-web.fullname" . }}.{{ .Release.Namespace }}:{{ .Values.service.port }}
+  Image:    {{ include "myne-web.image" . }}
+  Talks to: {{ .Values.syncOrigin }}
+
+TWO THINGS HAVE TO AGREE BEFORE ANYONE CAN SIGN IN.
+
+1. The sync server must allow this deployment's ORIGIN. On the sync-server side set:
+
+     MYNE_ALLOWED_ORIGINS={{ if .Values.ingress.host }}https://{{ .Values.ingress.host }}{{ else }}https://<the address you serve this from>{{ end }}
+
+   (scheme + host + optional port, no path, no trailing slash). Setting only one of the
+   two fails in opposite directions: this container refuses to start without a sync
+   origin, and the sync server refuses a cross-origin request it was not told about.
+
+2. Serve this over HTTPS with a certificate the BROWSER trusts. The container speaks
+   plain HTTP and expects a TLS terminator in front{{ if not .Values.ingress.enabled }}, and no Ingress
+   is enabled here, so there is nothing in front yet{{ end }}.
+
+There is nothing to back up: the bundle is baked into the image, the container writes
+nothing to persistent storage, and the only user state lives in the browser. Losing
+this pod loses nothing.
+
+Check the served build and health (cluster-internal):
+
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "myne-web.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
+  curl http://127.0.0.1:{{ .Values.service.port }}/healthz        # ok
+  curl http://127.0.0.1:{{ .Values.service.port }}/version.json   # the build being served

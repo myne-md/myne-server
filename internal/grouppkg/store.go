@@ -61,8 +61,9 @@ type key struct {
 // relay it holds no payload of its own beyond the opaque bytes and does not
 // survive a restart (persistence is a separate concern).
 type Store struct {
-	mu    sync.Mutex
-	byKey map[key]Record
+	mu       sync.Mutex
+	byKey    map[key]Record
+	onChange func()
 }
 
 func NewStore() *Store {
@@ -82,6 +83,7 @@ func (s *Store) Put(vault membership.VaultID, person membership.PersonID, epoch 
 	buf := make([]byte, len(pkg))
 	copy(buf, pkg)
 	s.byKey[k] = Record{Vault: vault, Person: person, Epoch: epoch, Package: buf}
+	s.changed()
 }
 
 // Get returns the current package for (vault, person). ErrNotFound when none has

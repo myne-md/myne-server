@@ -1,0 +1,30 @@
+{{/* SPDX-License-Identifier: AGPL-3.0 */}}
+{{- if .Values.serviceMonitor.enabled }}
+{{- if not .Values.metrics.enabled }}
+{{- fail "serviceMonitor.enabled requires metrics.enabled: there is no metrics listener to scrape" }}
+{{- end }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "myne-server.fullname" . }}
+  labels:
+    {{- include "myne-server.labels" . | nindent 4 }}
+    {{- with .Values.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "myne-server.selectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: metrics
+      interval: {{ .Values.serviceMonitor.interval }}
+      {{- with .Values.serviceMonitor.relabelings }}
+      relabelings:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.serviceMonitor.metricRelabelings }}
+      metricRelabelings:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

@@ -65,9 +65,10 @@ type Row struct {
 // key material it can read; persistence is a separate concern (the same
 // residual the membership and relay tables carry).
 type Store struct {
-	mu      sync.Mutex
-	rows    map[key]Row
-	pending map[key]time.Time
+	mu       sync.Mutex
+	rows     map[key]Row
+	pending  map[key]time.Time
+	onChange func()
 }
 
 // NewStore returns an empty profile store.
@@ -82,6 +83,7 @@ func (s *Store) Put(vault ids.AccountNumberHash, profile ProfileID, writer membe
 	copy(buf, bytes)
 	s.mu.Lock()
 	s.rows[key{vault, profile}] = Row{Vault: vault, Profile: profile, Writer: writer, Bytes: buf}
+	s.changed()
 	s.mu.Unlock()
 }
 
@@ -111,6 +113,9 @@ func (s *Store) deleteByPersonLocked(vault ids.AccountNumberHash, person members
 			n++
 		}
 	}
+	if n > 0 {
+		s.changed()
+	}
 	return n
 }
 
@@ -131,6 +136,9 @@ func (s *Store) ScheduleDeletionByPerson(vault ids.AccountNumberHash, person mem
 			n++
 		}
 	}
+	if n > 0 {
+		s.changed()
+	}
 	return n
 }
 
@@ -147,6 +155,9 @@ func (s *Store) SweepDue(now time.Time) int {
 			delete(s.pending, k)
 			n++
 		}
+	}
+	if n > 0 {
+		s.changed()
 	}
 	return n
 }

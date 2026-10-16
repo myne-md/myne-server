@@ -1,0 +1,231 @@
+# SPDX-License-Identifier: AGPL-3.0
+#
+# myne-server Helm values.
+#
+# Read README.md before enabling ingress, the operator panel or backup: each of
+# those moves an obligation onto you that the Compose bundle carries for you.
+#
+# Every `MYNE_*` name this chart sets in templates/ is a documented member of the
+# server's environment roster (the operations repository/bundle/bundle.env.example). Adding one that
+# is not on that roster fails `scripts/check-server-env-roster.mjs` in the myne
+# repo, so the chart cannot quietly grow a knob the server does not read.
+
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  repository: ghcr.io/myne-md/myne-server
+  # DIGEST, not a tag, and deliberately so. This is the reproducible multi-arch
+  # manifest list (linux/amd64 + linux/arm64) that the operations repository/bundle and the user
+  # guide pin, so a chart install resolves to bytes somebody published on purpose.
+  #
+  # The TAG path is the weaker one today: the tagged builds in the registry
+  # (`0.8.0`, `v0.8.1`) resolve to a single amd64 manifest, so on an arm64 node a
+  # tag-pinned install either needs emulation or fails outright. Bump this digest
+  # when a release publishes a new manifest list; set `tag` only to test a local
+  # build.
+  digest: sha256:32991521946c9c29c8c5c4e2ea452729d9eb299cca87be07fe22f83fc3a3a4ce
+  tag: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+replicaCount: 1
+
+# Recreate, not RollingUpdate. The store is a filesystem on a ReadWriteOnce volume
+# and the server is a single writer, so a rolling update would leave the new pod
+# Pending on AttachVolume while the old one still holds the PVC: the rollout hangs
+# rather than restarts. There is no supported way to run more than one replica
+# today (see README "One replica, one writer").
+strategy: Recreate
+
+service:
+  type: ClusterIP
+  port: 8080
+
+storage:
+  # `fs` is the only backend a self-hoster should run; `mem` is the dev/E2E
+  # reference and loses every blob on restart.
+  backend: fs
+  path: /data
+  # ReadWriteOnce + one writer.
+  accessModes:
+    - ReadWriteOnce
+  # Empty means the cluster's default StorageClass.
+  storageClassName: ""
+  size: 10Gi
+  # Keep the PVC across `helm uninstall` and `helm upgrade --uninstall`. Deleting the
+  # volume takes every vault on the server with it; each device would have to push its
+  # notes back up. Turn this off only if you mean that.
+  keepOnDelete: true
+  # Use an existing claim instead of creating one (overrides the three fields above).
+  existingClaim: ""
+
+# Server policy knobs. These are the same knobs as the Compose bundle's .env, with
+# the same defaults; see the operations repository/bundle/bundle.env.example for what each one
+# obliges you to do, and docs/self-host-policy.md in the myne repo for the
+# normative half.
+config:
+  MYNE_MAX_ACCOUNTS: "1000000"
+  # Empty means open registration. Set it (min 32 chars) to close new accounts to a
+  # group you gave the code to. Never logged, never stored, never tied to an account.
+  MYNE_INVITE_CODE: ""
+  # 0 = unlimited, which is the right default when the disk is yours.
+  MYNE_QUOTA_CEILING_BYTES: "0"
+  MYNE_RATELIMIT_BURST: "256"
+  MYNE_RATELIMIT_REFILL: "16"
+  # The live-collaboration awareness relay has its OWN bucket, so awareness traffic
+  # can neither starve sync nor be starved by it. Burst 0 disables it.
+  MYNE_AWARENESS_RATELIMIT_BURST: "64"
+  MYNE_AWARENESS_RATELIMIT_REFILL: "16"
+  MYNE_AWARENESS_MAX_SUBSCRIBERS: "64"
+  # Tombstone horizon. The server clamps it to >= 30; configuration cannot weaken it.
+  MYNE_HORIZON_MARKERS: "120"
+  # LEAVE IT OFF. On, it stops the server reclaiming deleted ciphertext once the
+  # horizon passes, which keeps it on your disk past the point your users expect a
+  # deletion to be permanent.
+  MYNE_EXTENDED_RETENTION: "false"
+  # Pre-auth bounds. NOTE: a burst of 0 is REFUSED at startup here (unlike every
+  # other 0-means-unlimited knob), because 0 would reject every enrolment.
+  MYNE_PREAUTH_RATELIMIT_BURST: "64"
+  MYNE_PREAUTH_RATELIMIT_REFILL: "8"
+  MYNE_MAX_HANDSHAKES: "16384"
+  MYNE_HANDSHAKE_TTL_SECONDS: "60"
+  MYNE_MAX_ATTACHMENTS_PER_VAULT: "100000"
+  MYNE_MAX_DEVICES_PER_ACCOUNT: "0"
+  # CORS allowlist for a browser client. Empty = off, which is correct for a
+  # native-only deployment. Set it to the web client's ORIGIN (scheme + host +
+  # optional port, no path, no trailing slash) if you also run myne-web.
+  MYNE_ALLOWED_ORIGINS: ""
+  # The read-only operator panel. KEEP IT EMPTY. It has no authentication and it
+  # reads the account roster; use `kubectl port-forward` when you need it (README).
+  MYNE_ADMIN_PANEL_ADDR: ""
+  MYNE_ADMIN_PANEL_HOSTS: ""
+
+metrics:
+  # Prometheus text on its own listener, off by default. Aggregate-only: no
+  # per-account label, no time series. NEVER put it on the public edge.
+  enabled: false
+  port: 9090
+  # The single-container case: Prometheus scrapes the pod on the cluster network.
+  addr: "0.0.0.0:9090"
+  service:
+    enabled: true
+    annotations: {}
+serviceMonitor:
+  # Requires the Prometheus Operator CRDs. A plain Prometheus can scrape the metrics
+  # Service instead, or use pod annotations via `podAnnotations`.
+  enabled: false
+  interval: 30s
+  labels: {}
+  relabelings: []
+  metricRelabelings: []
+
+backup:
+  # The image bundles restic + rclone. Off unless enabled here, and it needs a
+  # repository plus a password file (a Secret you create). See README "Backup".
+  enabled: false
+  repository: ""
+  # Name of an existing Secret holding the restic repository password under key
+  # `restic-password`. Create it yourself; this chart never generates or stores it.
+  existingSecret: ""
+  passwordFile: /etc/myne/secrets/restic-password
+  intervalSeconds: 86400
+  # Disclosed retention window. Widening it past what you tell your users re-creates
+  # the hoarding docs/self-host-policy.md forbids.
+  retentionDays: 14
+  # Optional: an existing Secret holding `rclone.conf`, for an rclone-backed target.
+  rcloneConfigSecret: ""
+  rcloneConfigFile: /etc/myne/secrets/rclone.conf
+  volumes: []
+
+admin:
+  # The admin API rides a Unix socket INSIDE the pod. The distroless image has no
+  # shell, but the binary itself is the client:
+  #   kubectl exec deploy/<release> -- myne-server admin list
+  # It is never a TCP port and never the public edge. Empty disables it.
+  socketPath: /tmp/myne-admin.sock
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  host: ""
+  path: /
+  pathType: Prefix
+  # Keep this true unless you terminate TLS somewhere else in front of the chart.
+  # Native clients verify the certificate against the PUBLIC authorities the app
+  # bundles: a private CA or a self-signed certificate is refused, so a cluster
+  # certificate from your own CA will not let a desktop or phone client connect.
+  tls: []
+  #  - secretName: myne-sync-tls
+  #    hosts:
+  #      - sync.example.org
+
+networkPolicy:
+  # Off by default: whether a NetworkPolicy restricts anything depends on your CNI,
+  # and a policy that is silently ineffective reads like protection. Turn it on and
+  # check that your CNI enforces it.
+  enabled: false
+  # Extra ingress sources besides the ingress-controller namespace below.
+  extraIngressFrom: []
+  ingressControllerNamespaceSelector:
+    kubernetes.io/metadata.name: ingress-nginx
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: "1"
+    memory: 512Mi
+
+# httpGet probes, never exec: the runtime image is distroless with no shell, so an
+# exec probe cannot run. The image's Dockerfile HEALTHCHECK is ignored by k8s.
+livenessProbe:
+  path: /healthz
+  initialDelaySeconds: 2
+  periodSeconds: 10
+  timeoutSeconds: 3
+  failureThreshold: 3
+readinessProbe:
+  # /readyz stays unready until migrations finish, so it is the honest gate.
+  path: /readyz
+  initialDelaySeconds: 2
+  periodSeconds: 10
+  timeoutSeconds: 3
+  failureThreshold: 3
+
+# The server flushes coalesced auth state synchronously on SIGTERM (auth.json), so
+# the default window is generous rather than tight.
+terminationGracePeriodSeconds: 30
+revisionHistoryLimit: 3
+
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []
+priorityClassName: ""
+automountServiceAccountToken: false
+
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  # Needed for the volume to be writable by the distroless nonroot UID.
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  # The only writable paths are the store (a PVC) and /tmp (an emptyDir), both
+  # below. The image never writes anywhere else.
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+extraEnv: []
+extraVolumes: []
+extraVolumeMounts: []

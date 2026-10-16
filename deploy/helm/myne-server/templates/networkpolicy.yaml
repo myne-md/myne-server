@@ -1,0 +1,43 @@
+{{/* SPDX-License-Identifier: AGPL-3.0 */}}
+{{- if .Values.networkPolicy.enabled }}
+{{/*
+Ingress-only. Egress is deliberately left unrestricted: the server is inbound-only
+EXCEPT for the built-in backup (restic to an off-box target), and a default-deny
+egress would break that silently, at the time of night the backup runs.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "myne-server.fullname" . }}
+  labels:
+    {{- include "myne-server.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "myne-server.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    {{- if .Values.ingress.enabled }}
+    - from:
+        - namespaceSelector:
+            {{- toYaml .Values.networkPolicy.ingressControllerNamespaceSelector | nindent 12 }}
+      ports:
+        - port: http
+          protocol: TCP
+    {{- end }}
+    {{- with .Values.networkPolicy.extraIngressFrom }}
+    - from:
+        {{- toYaml . | nindent 8 }}
+      ports:
+        - port: http
+          protocol: TCP
+    {{- end }}
+    {{- if .Values.metrics.enabled }}
+    {{/* The metrics listener is scraped from elsewhere in the cluster; it has no
+         authentication, so this rule is the only thing bounding it. */}}
+    - ports:
+        - port: metrics
+          protocol: TCP
+    {{- end }}
+{{- end }}

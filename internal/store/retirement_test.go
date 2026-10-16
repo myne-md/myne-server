@@ -43,22 +43,31 @@ func TestRetirements_ReclaimOnlyAfterGrace(t *testing.T) {
 		t.Fatal("an unrecorded sync id must not be retired")
 	}
 
-	if due := r.DueReclaims(); len(due) != 0 {
+	if due := r.DueRetirements(); len(due) != 0 {
 		t.Fatalf("reclaim due before the grace: %v", due)
 	}
 	now = now.Add(59 * time.Minute)
-	if due := r.DueReclaims(); len(due) != 0 {
+	if due := r.DueRetirements(); len(due) != 0 {
 		t.Fatalf("reclaim due 59 minutes into a 1 hour grace: %v", due)
 	}
 	now = now.Add(2 * time.Minute)
-	due := r.DueReclaims()
+	due := r.DueRetirements()
 	if len(due[acct]) != 1 || due[acct][0] != id {
 		t.Fatalf("reclaim after the grace = %v, want [%v]", due, id)
 	}
-	// Reported exactly once: a second sweep does not reclaim a missing blob.
-	if due := r.DueReclaims(); len(due) != 0 {
-		t.Fatalf("reclaim reported twice: %v", due)
+	// Reported until it is ACKED, not consumed on the way out: the caller's next step is a
+	// storage write that can fail, and a peek that consumed would lose a failed reclaim
+	// permanently (myne-md/myne-server#17).
+	if again := r.DueRetirements(); len(again[acct]) != 1 {
+		t.Fatalf("an unacked reclamation must stay due for a retry, got %v", again)
 	}
+	r.Reclaimed(acct, id)
+	// Reported exactly once AFTER the ack: a second sweep does not reclaim a missing blob.
+	if done := r.DueRetirements(); len(done) != 0 {
+		t.Fatalf("reclaim reported again after being acked: %v", done)
+	}
+	// Acking twice is not an error: the reclaim it acknowledges is itself idempotent.
+	r.Reclaimed(acct, id)
 	// The id stays retired even after its blob is gone, so a stale push cannot
 	// resurrect the namespace.
 	if !r.IsRetired(acct, id) {

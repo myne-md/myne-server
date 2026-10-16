@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: AGPL-3.0
+apiVersion: v2
+name: myne-server
+description: >
+  Myne's zero-knowledge sync server (blind blob store) on Kubernetes. The server
+  stores and relays opaque ciphertext blobs and never holds a key that could
+  decrypt anything, so running it on a cluster changes who operates it and not
+  what it can see.
+type: application
+
+# Both numbers track the SERVER release, because this chart's job is to deploy one
+# known server build. The image is pinned by DIGEST in values.yaml (see the note
+# there): a tag alone is a moving or, today, a single-architecture reference.
+version: 0.9.0
+appVersion: "0.9.0"
+
+keywords:
+  - myne
+  - sync
+  - e2ee
+  - zero-knowledge
+  - notes
+  - self-host
+home: https://myne.md
+sources:
+  - https://github.com/myne-md/myne-server
+  - https://github.com/myne-md/myne
+maintainers:
+  - name: Myne
+    url: https://myne.md

@@ -1,0 +1,29 @@
+{{/* SPDX-License-Identifier: AGPL-3.0 */}}
+{{- if not .Values.storage.existingClaim }}
+{{/*
+One volume holds everything the server has: blobs, account metadata, the chain of
+record heads AND auth.json (device registrations, tokens, SCRAM verifiers). That is
+what makes a volume snapshot one consistent backup unit, and it is why this chart
+keeps the claim on uninstall by default: deleting it destroys every vault on the
+server, and every device would have to push its notes back up.
+*/}}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "myne-server.pvcName" . }}
+  labels:
+    {{- include "myne-server.labels" . | nindent 4 }}
+  {{- if .Values.storage.keepOnDelete }}
+  annotations:
+    helm.sh/resource-policy: keep
+  {{- end }}
+spec:
+  accessModes:
+    {{- toYaml .Values.storage.accessModes | nindent 4 }}
+  {{- if .Values.storage.storageClassName }}
+  storageClassName: {{ .Values.storage.storageClassName | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.storage.size | quote }}
+{{- end }}

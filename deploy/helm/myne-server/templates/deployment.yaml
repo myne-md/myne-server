@@ -1,0 +1,170 @@
+{{/* SPDX-License-Identifier: AGPL-3.0 */}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "myne-server.fullname" . }}
+  labels:
+    {{- include "myne-server.labels" . | nindent 4 }}
+  {{- with .Values.podAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  revisionHistoryLimit: {{ .Values.revisionHistoryLimit }}
+  strategy:
+    type: {{ .Values.strategy }}
+  selector:
+    matchLabels:
+      {{- include "myne-server.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "myne-server.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      automountServiceAccountToken: {{ .Values.automountServiceAccountToken }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.securityContext | nindent 8 }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      containers:
+        - name: server
+          image: {{ include "myne-server.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+            {{- if .Values.metrics.enabled }}
+            - name: metrics
+              containerPort: {{ .Values.metrics.port }}
+              protocol: TCP
+            {{- end }}
+          env:
+            {{- include "myne-server.configEnv" . | nindent 12 }}
+            # Listener, store and admin socket come from their own sections so the
+            # value has ONE home. The chart pins the storage backend to fs: a mem
+            # backend on a cluster loses every blob on the next restart.
+            - name: MYNE_SERVER_ADDR
+              value: ":8080"
+            - name: MYNE_STORAGE_BACKEND
+              value: {{ .Values.storage.backend | quote }}
+            - name: MYNE_STORAGE_PATH
+              value: {{ .Values.storage.path | quote }}
+            - name: MYNE_ADMIN_SOCKET
+              value: {{ .Values.admin.socketPath | quote }}
+            {{- if .Values.metrics.enabled }}
+            - name: MYNE_METRICS_ADDR
+              value: {{ .Values.metrics.addr | quote }}
+            {{- end }}
+            {{- if .Values.backup.enabled }}
+            - name: MYNE_BACKUP_ENABLED
+              value: "true"
+            - name: MYNE_BACKUP_REPOSITORY
+              value: {{ required "backup.repository is required when backup.enabled is true" .Values.backup.repository | quote }}
+            - name: MYNE_BACKUP_PASSWORD_FILE
+              value: {{ .Values.backup.passwordFile | quote }}
+            - name: MYNE_BACKUP_INTERVAL_SECONDS
+              value: {{ .Values.backup.intervalSeconds | quote }}
+            - name: MYNE_BACKUP_RETENTION_DAYS
+              value: {{ .Values.backup.retentionDays | quote }}
+            {{- if .Values.backup.rcloneConfigSecret }}
+            - name: MYNE_BACKUP_RCLONE_CONFIG
+              value: {{ .Values.backup.rcloneConfigFile | quote }}
+            {{- end }}
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.livenessProbe.path }}
+              port: http
+            initialDelaySeconds: {{ .Values.livenessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.livenessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.livenessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.livenessProbe.failureThreshold }}
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.readinessProbe.path }}
+              port: http
+            initialDelaySeconds: {{ .Values.readinessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.readinessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.readinessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.readinessProbe.failureThreshold }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: {{ .Values.storage.path }}
+            # /tmp holds the admin Unix socket and restic's cache dir. It is an
+            # emptyDir because the root filesystem is read-only.
+            - name: tmp
+              mountPath: /tmp
+            {{- if and .Values.backup.enabled .Values.backup.existingSecret }}
+            - name: restic-password
+              mountPath: {{ .Values.backup.passwordFile }}
+              subPath: restic-password
+              readOnly: true
+            {{- end }}
+            {{- if and .Values.backup.enabled .Values.backup.rcloneConfigSecret }}
+            - name: rclone-config
+              mountPath: {{ .Values.backup.rcloneConfigFile }}
+              subPath: rclone.conf
+              readOnly: true
+            {{- end }}
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ include "myne-server.pvcName" . }}
+        - name: tmp
+          emptyDir: {}
+        {{- if and .Values.backup.enabled .Values.backup.existingSecret }}
+        - name: restic-password
+          secret:
+            secretName: {{ .Values.backup.existingSecret }}
+            defaultMode: 0400
+        {{- end }}
+        {{- if and .Values.backup.enabled .Values.backup.rcloneConfigSecret }}
+        - name: rclone-config
+          secret:
+            secretName: {{ .Values.backup.rcloneConfigSecret }}
+            defaultMode: 0400
+        {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

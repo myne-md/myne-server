@@ -1,0 +1,23 @@
+{{/* SPDX-License-Identifier: AGPL-3.0 */}}
+{{/*
+An ORIGIN, not a URL: scheme + host + optional port, no path, no trailing slash. The
+container refuses a malformed value at start-up anyway; failing at install time says
+so earlier and with a better message.
+
+Also checks the scheme against the TLS requirement: a browser refuses to hand a page
+your master password over cleartext, so an http:// origin is a deployment that cannot
+work rather than a weaker one. It is allowed only for a loopback host, which is how
+one tests the chart locally.
+*/}}
+{{- if not .Values.syncOrigin }}
+{{- fail "syncOrigin is required: the origin of the sync server this deployment talks to, e.g. https://sync.example.org" }}
+{{- end }}
+{{- if hasSuffix "/" .Values.syncOrigin }}
+{{- fail "syncOrigin must not end with a slash: it is an ORIGIN, not a URL (e.g. https://sync.example.org)" }}
+{{- end }}
+{{- if not (regexMatch "^https?://[A-Za-z0-9.-]+(:[0-9]+)?$" .Values.syncOrigin) }}
+{{- fail "syncOrigin must be scheme://host[:port] with no path, e.g. https://sync.example.org" }}
+{{- end }}
+{{- if and (eq (printf "%.5s" .Values.syncOrigin) "http:") (not (regexMatch "^http://(localhost|127\\.0\\.0\\.1)" .Values.syncOrigin)) }}
+{{- fail "syncOrigin over plain http is only accepted for a loopback host: a browser will not hand the page your master password over cleartext, so a public http origin cannot work" }}
+{{- end }}

@@ -175,6 +175,20 @@ type BlobStore interface {
 	// (uuid, final_version, marker). The server never learns "deleted" meaning (AS6).
 	ReclaimTombstone(account ids.AccountNumberHash, blobID ids.BlobID) error
 
+	// ReclaimRetired drops the ciphertext body of a blob in a namespace the owner has
+	// RETIRED, once the retirement grace has elapsed (myne-md/myne-server#17). It is a
+	// separate operation because ReclaimTombstone requires a tombstone record and a retired
+	// namespace's blobs are not tombstoned: without it the grace-bounded reclamation had no
+	// mechanism behind it at all, so retired ciphertext was retained forever while the
+	// documentation promised a window.
+	//
+	// Like ReclaimTombstone it drops the body and keeps the record — GetBlob returns
+	// ErrReclaimed, the id is omitted from ChangedSince, the reclaim floor covers a reader
+	// whose cursor predates the drop — and the CALLER keeps refusing writes to the id, which
+	// is what makes the retirement permanent (that refusal lives in the retirement registry,
+	// not here). Idempotent: a second call on an already-reclaimed blob is a no-op.
+	ReclaimRetired(account ids.AccountNumberHash, blobID ids.BlobID) error
+
 	// GCFloor returns the highest change-sequence whose tombstone has been reclaimed.
 	// A non-zero pull cursor below this missed reclaimed history → cursor-expired.
 	GCFloor(account ids.AccountNumberHash) uint64

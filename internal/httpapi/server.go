@@ -26,6 +26,7 @@ import (
 	"github.com/myne-md/myne-server/internal/authapi"
 	"github.com/myne-md/myne-server/internal/authpersist"
 	"github.com/myne-md/myne-server/internal/awareness"
+	"github.com/myne-md/myne-server/internal/b2bpersist"
 	"github.com/myne-md/myne-server/internal/backup"
 	"github.com/myne-md/myne-server/internal/console"
 	"github.com/myne-md/myne-server/internal/gcquota"
@@ -216,6 +217,15 @@ func runListener(ctx context.Context, ln net.Listener) error {
 		WithInviteCode(cfg.InviteCode).
 		WithLimits(int(cfg.MaxAccounts), int(cfg.MaxHandshakes), time.Duration(cfg.HandshakeTTLSeconds)*time.Second)
 
+	// B2B surface rate limit (myne-md/myne-server#18): its OWN bucket, the same shape and the
+	// same numbers as the sync routes, kept separate so neither can starve the other — the
+	// awareness relay's reasoning one surface over. No new env knob: these are the existing
+	// per-account budget's numbers, and a knob nobody asked for is a roster row nobody asked
+	// for (the roster guard would demand an entry for it, which is the right price only when
+	// the number is really operator policy).
+	b2bRL := gcquota.NewRateLimiter(cfg.RateLimitBurst, cfg.RateLimitRefill)
+	authHandler.WithB2BRateLimiter(b2bRL)
+
 	// Persist device-auth state (registry + per-device tokens + per-account SCRAM
 	// verifiers) so a restart does not de-enroll every device (clients would otherwise
 	// 401 after every deploy/reboot/crash). fs-backend only — the mem backend stays
@@ -232,6 +242,36 @@ func runListener(ctx context.Context, ln net.Listener) error {
 		// at most once per debounce window (kills the O(N²) save-per-mutation), and
 		// flushes a final time on ctx cancel (below, synchronously) so nothing is lost.
 		go authCoord.Start(ctx)
+	}
+
+	// Namespace-retirement registry (myne-md/myne#711): hoisted out of the sync
+	// surface's constructor so the B2B persistence coordinator can own it. It was
+	// created inline at the `WithRetirements` call, which is why nothing could
+	// persist it — and why a retired namespace became writable again after a
+	// restart, the availability regression it exists to prevent.
+	retirements := store.NewRetirements(0)
+
+	// Persist the B2B surface (person↔vault bindings, per-vault member tokens, the
+	// invite relay, the person-private profile store, the group-package relay and the
+	// retirement registry) so a restart does not drop pending invites, lose the only
+	// copy of a member's sealed profile, revoke every member token, or reopen a retired
+	// namespace. fs-backend only (mem is the dev/E2E reference); load BEFORE listen so
+	// a corrupt/too-new b2b.json fails closed rather than silently coming up with no
+	// members and a writable retired namespace. An ABSENT file is first boot.
+	var b2bCoord *b2bpersist.Coordinator
+	if cfg.StorageBackend == "fs" {
+		b2bCoord, err = b2bpersist.Wire(b2bpersist.Stores{
+			Membership:    authHandler.Membership(),
+			MemberTokens:  authHandler.MemberTokens(),
+			Invites:       authHandler.Relay(),
+			Profiles:      authHandler.Profiles(),
+			GroupPackages: authHandler.GroupPackages(),
+			Retirements:   retirements,
+		}, filepath.Join(cfg.StoragePath, b2bpersist.FileName))
+		if err != nil {
+			return err
+		}
+		go b2bCoord.Start(ctx)
 	}
 
 	// Per-account operator enforcement policy (MYND-506): freeze + quota/device-cap
@@ -279,6 +319,7 @@ func runListener(ctx context.Context, ln net.Listener) error {
 				awarenessRL.Refill()
 				preAuthAuth.Refill()
 				preAuthMeta.Refill()
+				b2bRL.Refill()
 			}
 		}
 	}()
@@ -330,7 +371,7 @@ func runListener(ctx context.Context, ln net.Listener) error {
 		}
 		return v
 	}
-	srv := newHTTPServer(NewServer(blobStore, tokens, authHandler, rl, qg, ready, metrics, preAuthMeta, attachStore, activityTouch, acctStore, accountStatus, cfg.AllowedOrigins, awarenessRL, int(cfg.AwarenessMaxSubscribers)))
+	srv := newHTTPServer(NewServer(blobStore, tokens, authHandler, rl, qg, ready, metrics, preAuthMeta, attachStore, activityTouch, acctStore, accountStatus, cfg.AllowedOrigins, awarenessRL, int(cfg.AwarenessMaxSubscribers), WithRetirementRegistry(retirements)))
 
 	// Aggregate-only metrics on a SEPARATE listener (SYNC-24) — never the public edge.
 	// Disabled unless MYNE_METRICS_ADDR is set; bind it to localhost/internal only.
@@ -378,6 +419,25 @@ func runListener(ctx context.Context, ln net.Listener) error {
 		}, gcInterval)
 		go sched.Start(ctx)
 	}
+
+	// Retirement reclamation (myne-md/myne-server#17): the registry recorded a grace
+	// window and NOTHING ever read it, so a retired namespace's ciphertext was refused for
+	// writes forever and never physically released. This drives the due list into the store:
+	// reclaim the body, then mark the id reclaimed — in that order, so a reclaim that fails
+	// stays due and is retried instead of being lost.
+	reclaimer := gcquota.NewRetirementReclaimer(
+		retirements.DueRetirements,
+		blobStore.ReclaimRetired,
+		retirements.Reclaimed,
+		func(err error) bool { return errors.Is(err, store.ErrNotFound) },
+		func(n int) {
+			for i := 0; i < n; i++ {
+				metrics.IncRetiredBlobReclaimed()
+			}
+		},
+		gcInterval,
+	)
+	go reclaimer.Start(ctx)
 
 	// Built-in encrypted off-box backup (MYND-505). Best-effort: a failed run logs
 	// and is retried on the next tick — it never blocks serving. Only started when
@@ -494,6 +554,9 @@ func runListener(ctx context.Context, ln net.Listener) error {
 		if authCoord != nil {
 			authCoord.Flush() // synchronously persist any coalesced-but-unwritten auth state
 		}
+		if b2bCoord != nil {
+			b2bCoord.Flush() // same for the B2B surface
+		}
 		if metricsSrv != nil {
 			_ = metricsSrv.Shutdown(shutdownCtx)
 		}
@@ -516,6 +579,22 @@ func NewRouter(a auth.Authenticator) http.Handler {
 	return noIP(mux)
 }
 
+// Option is a late-bound switch on NewServer. Variadic so every existing caller —
+// tests included — keeps its positional call, and every current behaviour stays the
+// default.
+type Option func(*serverOptions)
+
+type serverOptions struct {
+	retirements *store.Retirements
+}
+
+// WithRetirementRegistry injects the retirement registry the caller already owns, so
+// the surface that enforces retirement and the registry the B2B persistence
+// coordinator restores are the SAME object. See the constructor for why that matters.
+func WithRetirementRegistry(r *store.Retirements) Option {
+	return func(o *serverOptions) { o.retirements = r }
+}
+
 // NewServer builds the full HTTP handler: health + the push/pull sync routes, all
 // behind the no-IP middleware. Every sync route is session-bound via the token
 // store (MYND-420); the health probe is the only open endpoint. rl/qg may be nil
@@ -533,7 +612,21 @@ type accountStatusView struct {
 	MaxDevices  uint64 `json:"max_devices"`
 }
 
-func NewServer(s store.BlobStore, tokens *auth.TokenStore, authHandler *authapi.Handler, rl syncapi.RateLimiter, qg *gcquota.QuotaGuard, ready *Readiness, metrics *Metrics, preAuthMeta syncapi.PreAuthLimiter, attachStore attachments.Backend, activityTouch func(ids.AccountNumberHash, ids.DeviceID), acctStore *accounts.Store, accountStatus func(ids.AccountNumberHash) any, allowedOrigins string, awarenessRL awareness.RateLimiter, awarenessMaxSubs int) http.Handler {
+func NewServer(s store.BlobStore, tokens *auth.TokenStore, authHandler *authapi.Handler, rl syncapi.RateLimiter, qg *gcquota.QuotaGuard, ready *Readiness, metrics *Metrics, preAuthMeta syncapi.PreAuthLimiter, attachStore attachments.Backend, activityTouch func(ids.AccountNumberHash, ids.DeviceID), acctStore *accounts.Store, accountStatus func(ids.AccountNumberHash) any, allowedOrigins string, awarenessRL awareness.RateLimiter, awarenessMaxSubs int, options ...Option) http.Handler {
+	opts := serverOptions{}
+	for _, o := range options {
+		o(&opts)
+	}
+	// The retirement registry is INJECTED in production and minted here otherwise.
+	// Injecting it is load-bearing: the boot-time B2B persistence coordinator loads the
+	// retired-namespace set back into one instance, and the sync surface must enforce on
+	// THAT instance. A constructor that always minted its own would leave the restored
+	// registry unread, so a restart would reopen a retired namespace while the loaded
+	// copy sat unused — the exact regression the persistence exists to prevent.
+	retirements := opts.retirements
+	if retirements == nil {
+		retirements = store.NewRetirements(0)
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", healthz)
 	if ready != nil {
@@ -566,7 +659,7 @@ func NewServer(s store.BlobStore, tokens *auth.TokenStore, authHandler *authapi.
 		// retired namespace. authHandler is the membership authority; both are
 		// nil-safe (a B2B-less deployment behaves as before).
 		WithMembership(authHandler).
-		WithRetirements(store.NewRetirements(0))
+		WithRetirements(retirements)
 	if metrics != nil {
 		syncMux = syncMux.WithMetrics(metrics.ObserveBlobStored)
 	}

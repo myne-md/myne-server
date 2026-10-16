@@ -1,0 +1,48 @@
+{{/* SPDX-License-Identifier: AGPL-3.0 */}}
+{{- if .Values.ingress.enabled }}
+{{/*
+TLS is not optional here even though the container serves plain HTTP happily: a page
+that cannot be reached over HTTPS cannot be handed a master password, so an
+HTTP-only address is a broken deployment rather than a weaker one.
+
+This Ingress must also terminate TLS with a certificate the BROWSER trusts. Unlike
+the sync server (whose certificate the native clients check against the roots they
+bundle), the browser checks its own store, so either a public certificate or one your
+users have installed works; a bare private CA they have never seen does not.
+
+No access-log obligation rides on this object the way it does on the sync server's
+Ingress: the container's own Caddy already deletes every IP-bearing field, and the
+client-address question here is about a page load, which is not a record the server
+keeps. Whatever your ingress controller logs is still your log, and a page load here
+is a vault opening — the same reasoning as the sync edge applies, with the same fix.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "myne-web.fullname" . }}
+  labels:
+    {{- include "myne-web.labels" . | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- with .Values.ingress.tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    - host: {{ required "ingress.host is required when ingress.enabled is true" .Values.ingress.host | quote }}
+      http:
+        paths:
+          - path: {{ .Values.ingress.path }}
+            pathType: {{ .Values.ingress.pathType }}
+            backend:
+              service:
+                name: {{ include "myne-web.fullname" . }}
+                port:
+                  number: {{ .Values.service.port }}
+{{- end }}

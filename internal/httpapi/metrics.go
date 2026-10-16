@@ -28,6 +28,7 @@ type Metrics struct {
 	blobsStoredTotal              atomic.Uint64
 	bytesStoredTotal              atomic.Uint64
 	tombstonesReclaimedTotal      atomic.Uint64
+	retiredBlobsReclaimedTotal    atomic.Uint64
 	attachmentsStoredTotal        atomic.Uint64
 	attachmentBytesStoredTotal    atomic.Uint64
 	attachmentsReclaimedTotal     atomic.Uint64
@@ -50,6 +51,12 @@ func (m *Metrics) ObserveBlobStored(n int) {
 
 // IncTombstoneReclaimed records one L2-reclaimed tombstone (fed by the GC scheduler).
 func (m *Metrics) IncTombstoneReclaimed() { m.tombstonesReclaimedTotal.Add(1) }
+
+// IncRetiredBlobReclaimed records one retired-namespace blob whose body was released after
+// its grace elapsed (fed by the retirement reclaimer, myne-md/myne-server#17). Separate from
+// the tombstone counter because the two mean different things to an operator: a tombstone is
+// a deletion the user asked for, a retirement is a key rotation the owner did.
+func (m *Metrics) IncRetiredBlobReclaimed() { m.retiredBlobsReclaimedTotal.Add(1) }
 
 // ObserveAttachmentStored records one COMPLETED attachment upload of n bytes
 // (fed by the /attachments PUT completion, MYND-468).
@@ -96,6 +103,9 @@ func (m *Metrics) handler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "# HELP myne_tombstones_reclaimed_total Total tombstones L2-reclaimed by GC (aggregate).\n")
 	fmt.Fprintf(w, "# TYPE myne_tombstones_reclaimed_total counter\n")
 	fmt.Fprintf(w, "myne_tombstones_reclaimed_total %d\n", m.tombstonesReclaimedTotal.Load())
+	fmt.Fprintf(w, "# HELP myne_retired_blobs_reclaimed_total Total retired-namespace blob bodies released after their grace (aggregate).\n")
+	fmt.Fprintf(w, "# TYPE myne_retired_blobs_reclaimed_total counter\n")
+	fmt.Fprintf(w, "myne_retired_blobs_reclaimed_total %d\n", m.retiredBlobsReclaimedTotal.Load())
 	fmt.Fprintf(w, "# HELP myne_attachments_stored_total Total completed attachment uploads (aggregate).\n")
 	fmt.Fprintf(w, "# TYPE myne_attachments_stored_total counter\n")
 	fmt.Fprintf(w, "myne_attachments_stored_total %d\n", m.attachmentsStoredTotal.Load())

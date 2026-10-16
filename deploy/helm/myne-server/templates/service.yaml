@@ -1,0 +1,40 @@
+{{/* SPDX-License-Identifier: AGPL-3.0 */}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "myne-server.fullname" . }}
+  labels:
+    {{- include "myne-server.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    {{- include "myne-server.selectorLabels" . | nindent 4 }}
+{{- if and .Values.metrics.enabled .Values.metrics.service.enabled }}
+---
+{{/* Aggregate-only counters, no per-account label. Cluster-internal on purpose:
+     never route this to the public edge. */}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "myne-server.fullname" . }}-metrics
+  labels:
+    {{- include "myne-server.labels" . | nindent 4 }}
+  {{- with .Values.metrics.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: ClusterIP
+  ports:
+    - port: {{ .Values.metrics.port }}
+      targetPort: metrics
+      protocol: TCP
+      name: metrics
+  selector:
+    {{- include "myne-server.selectorLabels" . | nindent 4 }}
+{{- end }}

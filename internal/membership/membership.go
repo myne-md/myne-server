@@ -56,10 +56,16 @@ var (
 
 // Table is the in-memory person↔vault membership. It is the server-side
 // authority for token scoping; it is deliberately NOT a cryptographic roster.
+//
+// Persistence: `onChange` is the hook the boot-time persistence coordinator
+// installs, so a binding survives a restart. Losing the table would not leak
+// anything, but it would silently revoke every member's access until the owner
+// re-invited them.
 type Table struct {
 	mu       sync.RWMutex
 	byVault  map[VaultID]map[PersonID]Binding
 	byPerson map[PersonID]map[VaultID]Binding
+	onChange func()
 }
 
 // New returns an empty membership table.
@@ -100,6 +106,7 @@ func (t *Table) BindOwner(vault VaultID, person PersonID) error {
 		}
 	}
 	t.bind(Binding{Person: person, Vault: vault, Role: RoleOwner})
+	t.changed()
 	return nil
 }
 
@@ -112,6 +119,7 @@ func (t *Table) BindMember(vault VaultID, person PersonID) error {
 		return ErrAlreadyBound
 	}
 	t.bind(Binding{Person: person, Vault: vault, Role: RoleMember})
+	t.changed()
 	return nil
 }
 
@@ -129,6 +137,7 @@ func (t *Table) Remove(vault VaultID, person PersonID) error {
 	}
 	delete(t.byVault[vault], person)
 	delete(t.byPerson[person], vault)
+	t.changed()
 	return nil
 }
 

@@ -1,0 +1,43 @@
+{{/* SPDX-License-Identifier: AGPL-3.0 */}}
+Myne sync server is installed.
+
+  Service:   {{ include "myne-server.fullname" . }}.{{ .Release.Namespace }}:{{ .Values.service.port }}
+  Store:     {{ include "myne-server.pvcName" . }} at {{ .Values.storage.path }} ({{ .Values.storage.size }})
+  Image:     {{ include "myne-server.image" . }}
+
+The store holds blobs, account metadata and device registrations together. It is the
+only thing worth backing up, and it survives `helm uninstall` on purpose
+(helm.sh/resource-policy: keep).
+
+Check it came up (from inside the cluster):
+
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "myne-server.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
+  curl http://127.0.0.1:{{ .Values.service.port }}/healthz   # {"status":"ok"}
+  curl http://127.0.0.1:{{ .Values.service.port }}/readyz    # {"status":"ready"} once migrations finish
+
+Then point a client at it: Settings -> Sync -> Sync server. Native clients verify the
+certificate against the PUBLIC authorities, so the address must be a public name with
+a publicly trusted certificate; a private CA or a self-signed certificate is refused.
+{{- if not .Values.ingress.enabled }}
+
+No Ingress is enabled, so the server has no public address yet. The user guide
+("Run your own sync server") covers the TLS requirement in full.
+{{- end }}
+{{- if .Values.ingress.enabled }}
+
+An Ingress is enabled and whatever your ingress controller logs is now your log.
+Turn its access log off or drop the IP-bearing fields, or this deployment logs client
+addresses and contradicts what the server promises. See templates/ingress.yaml.
+{{- end }}
+
+Operator console (never exposed, never routed):
+
+  kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "myne-server.fullname" . }} -- myne-server admin list
+{{- if .Values.config.MYNE_ADMIN_PANEL_ADDR }}
+
+WARNING: MYNE_ADMIN_PANEL_ADDR is set ({{ .Values.config.MYNE_ADMIN_PANEL_ADDR }}). That panel has
+NO authentication and reads the account roster. Keep it cluster-internal and reach it
+with:  kubectl -n {{ .Release.Namespace }} port-forward deploy/{{ include "myne-server.fullname" . }} 8081:8081
+{{- end }}
+
+  helm upgrade myne-server {{ .Chart.Name }}   # rolling is Recreate here: the store is single-writer

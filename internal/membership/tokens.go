@@ -26,6 +26,7 @@ type TokenStore struct {
 	byToken  map[string]Binding
 	table    *Table
 	onRevoke func(tokenHex string)
+	onChange func()
 }
 
 // SetOnRevoke installs an observer called with each revoked token's hex when
@@ -59,6 +60,7 @@ func (s *TokenStore) Issue(person PersonID, vault VaultID) (ids.DeviceToken, err
 		Person: person,
 		Vault:  vault,
 	}
+	s.changed()
 	s.mu.Unlock()
 	return ids.DeviceToken(raw), nil
 }
@@ -98,6 +100,12 @@ func (s *TokenStore) Revoke(vault VaultID, person PersonID) {
 	}
 	onRevoke := s.onRevoke
 	s.mu.Unlock()
+	// A revocation changes what a restart must reproduce: the token is gone, and if
+	// that were only in RAM, a restart would resurrect a credential the owner
+	// deliberately revoked.
+	if len(revoked) > 0 {
+		s.changed()
+	}
 	// Report after releasing the lock: the observer (the awareness relay) takes
 	// its own locks and must never run under the token store's.
 	if onRevoke != nil {

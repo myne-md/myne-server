@@ -1,0 +1,41 @@
+{{/* SPDX-License-Identifier: AGPL-3.0 */}}
+{{/*
+Validation, not resources. Each of these refuses an install that would come up
+looking healthy and be wrong.
+*/}}
+
+{{/*
+One replica is a property of the STORE, not a default to tune. The server keeps its
+blobs, account metadata, head chain and device registrations on one filesystem
+(`MYNE_STORAGE_BACKEND=fs`) behind a ReadWriteOnce volume, and it is a single writer.
+There is no object-store or SQL backend today (deferred, SYNC-22), so a second
+replica is not "more capacity": two writers on one volume, or two pods whose
+ReadWriteOnce claim cannot both attach.
+*/}}
+{{- if gt (int .Values.replicaCount) 1 }}
+{{- fail "replicaCount > 1 is not supported: the server is a single writer on a ReadWriteOnce filesystem store. See deploy/helm/myne-server/README.md (\"One replica, one writer\")." }}
+{{- end }}
+
+{{- if and .Values.backup.enabled (not .Values.backup.repository) }}
+{{- fail "backup.enabled requires backup.repository (a restic repository URI, e.g. sftp://user@host/path or s3:...)" }}
+{{- end }}
+
+{{- if and .Values.backup.enabled (not .Values.backup.existingSecret) }}
+{{- fail "backup.enabled requires backup.existingSecret: a Secret holding the restic repository password under key `restic-password`. This chart never creates or stores it." }}
+{{- end }}
+
+{{- if and .Values.serviceMonitor.enabled (not .Values.metrics.enabled) }}
+{{- fail "serviceMonitor.enabled requires metrics.enabled: there is no metrics listener to scrape" }}
+{{- end }}
+
+{{- if and .Values.ingress.enabled (not .Values.ingress.host) }}
+{{- fail "ingress.enabled requires ingress.host" }}
+{{- end }}
+
+{{- if and .Values.ingress.enabled (not .Values.ingress.tls) }}
+{{- /*
+Not a failure: a TLS-terminating proxy in front of the Ingress is a legitimate
+shape. But a bare HTTP Ingress means no native client can connect at all, so say so
+in NOTES.txt rather than letting the install speak for itself.
+*/}}
+{{- end }}

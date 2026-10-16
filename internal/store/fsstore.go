@@ -879,6 +879,52 @@ func (s *FSStore) ReclaimTombstone(account ids.AccountNumberHash, blobID ids.Blo
 	return s.persist(account, v)
 }
 
+// ReclaimRetired drops a RETIRED namespace's blob body (myne-md/myne-server#17):
+// ReclaimTombstone without the tombstone requirement, because a retired id is not
+// tombstoned and the old path therefore could not touch it at all.
+//
+// The record survives, so the id is absent from ChangedSince and GetBlob reports
+// ErrReclaimed rather than a live empty body, and the retirement registry keeps refusing
+// writes to it. Idempotent. A blob this vault does not hold is ErrNotFound, which the caller
+// treats as "nothing to reclaim" — a namespace can be retired before a blob arrives, and one
+// that never arrived has no body to free.
+func (s *FSStore) ReclaimRetired(account ids.AccountNumberHash, blobID ids.BlobID) error {
+	v := s.lookupVault(account)
+	if v == nil {
+		return ErrNotFound
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.deleted {
+		return ErrNotFound
+	}
+	m := v.blobs[blobID]
+	if m == nil {
+		return ErrNotFound
+	}
+	if m.reclaimed {
+		return nil
+	}
+	// Remove the body FIRST, then adjust the index. The reverse order (what ReclaimTombstone
+	// does) leaves the index saying "reclaimed" with the ciphertext still on disk when the
+	// remove fails, which is exactly the leak this exists to close.
+	if err := os.Remove(s.blobPath(account, blobID)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	v.quotaBytes -= uint64(m.size)
+	m.size = 0
+	m.reclaimed = true
+	if rec, ok := v.tombstones[blobID]; ok {
+		rec.reclaimed = true
+		if rec.changeSeq > v.reclaimFloor {
+			v.reclaimFloor = rec.changeSeq
+		}
+	} else if m.changeSeq > v.reclaimFloor {
+		v.reclaimFloor = m.changeSeq
+	}
+	return s.persist(account, v)
+}
+
 func (s *FSStore) GCFloor(account ids.AccountNumberHash) uint64 {
 	v := s.lookupVault(account)
 	if v == nil {

@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: AGPL-3.0
+apiVersion: v2
+name: myne-web
+description: >
+  Myne's browser client, served from your own address on Kubernetes. Same client as
+  app.example.com, same bundle; what changes is who hands the page its code on every
+  visit, which is the code-delivery trust boundary (threat model A15/TB11).
+type: application
+
+# Tracks the web-client release the default image belongs to.
+version: 0.8.1
+appVersion: "0.8.1"
+
+keywords:
+  - myne
+  - web
+  - notes
+  - self-host
+home: https://myne.md
+sources:
+  - https://github.com/myne-md/myne
+maintainers:
+  - name: Myne
+    url: https://myne.md

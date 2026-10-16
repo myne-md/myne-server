@@ -31,10 +31,11 @@ const DefaultRetirementGrace = 7 * 24 * time.Hour
 // type therefore stores the record's fields for provenance but keys enforcement
 // on the sync ids the owner named, which is what a write can be matched against.
 type Retirements struct {
-	mu      sync.Mutex
-	grace   time.Duration
-	now     func() time.Time
-	byVault map[ids.AccountNumberHash]*vaultRetirement
+	mu       sync.Mutex
+	grace    time.Duration
+	now      func() time.Time
+	byVault  map[ids.AccountNumberHash]*vaultRetirement
+	onChange func()
 }
 
 type vaultRetirement struct {
@@ -90,6 +91,7 @@ func (r *Retirements) Record(account ids.AccountNumberHash, retiredEpoch, replac
 		v.retired[id] = true
 		v.dueAt[id] = due
 	}
+	r.changed()
 }
 
 // IsRetired reports whether a sync id is retired for the vault, and so may not
@@ -116,11 +118,15 @@ func (r *Retirements) HighestRetiredEpoch(account ids.AccountNumberHash) (uint64
 	return v.retiredEpoch, true
 }
 
-// DueReclaims returns every retired blob whose grace has elapsed and CONSUMES
-// it, so each blob is reported for reclamation exactly once. A blob is reported
-// only when the clock has reached its due instant, which is the "after the
-// grace, not before" rule.
-func (r *Retirements) DueReclaims() map[ids.AccountNumberHash][]ids.BlobID {
+// DueRetirements returns every retired blob whose grace has elapsed, WITHOUT consuming it.
+// The caller reclaims the blob and then calls Reclaimed, so a reclaim that fails stays due
+// and is retried on the next pass.
+//
+// It replaced a consuming `DueReclaims` (myne-md/myne-server#17). Consuming first is the
+// wrong order: the caller's next step is the storage write that can fail, and a consumed id
+// whose reclaim failed is never reported again — a silent permanent leak, which is exactly
+// what the gap this closes looked like from the outside (the retention promise, unkept).
+func (r *Retirements) DueRetirements() map[ids.AccountNumberHash][]ids.BlobID {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	now := r.now()
@@ -132,9 +138,26 @@ func (r *Retirements) DueReclaims() map[ids.AccountNumberHash][]ids.BlobID {
 					out = make(map[ids.AccountNumberHash][]ids.BlobID)
 				}
 				out[account] = append(out[account], id)
-				delete(v.dueAt, id)
 			}
 		}
 	}
 	return out
+}
+
+// Reclaimed records that a due blob's body has been reclaimed, so it is not reported again.
+// The id stays in the permanent retired set — a stale push to it is still refused forever —
+// and only its due time is dropped. Idempotent: marking an id twice (or one that was never
+// due) is not an error, because the caller's reclaim is itself idempotent.
+func (r *Retirements) Reclaimed(account ids.AccountNumberHash, id ids.BlobID) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	v := r.byVault[account]
+	if v == nil {
+		return
+	}
+	if _, ok := v.dueAt[id]; !ok {
+		return
+	}
+	delete(v.dueAt, id)
+	r.changed()
 }

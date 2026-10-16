@@ -1,0 +1,105 @@
+# SPDX-License-Identifier: AGPL-3.0
+#
+# myne-web Helm values. See README.md before installing: this chart needs a sync
+# server, a public domain and a TLS terminator, and the sync server needs to be told
+# this deployment's origin in return.
+
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  repository: ghcr.io/myne-md/myne-web
+  # A TAG, unlike the server chart's digest, because the published web images are
+  # single-architecture (linux/amd64) and their digests have not been recorded as
+  # multi-arch manifest lists. See README "Architecture".
+  #
+  # Set `digest` to pin by digest once you have one for your architecture.
+  tag: v0.8.1
+  digest: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+replicaCount: 2
+
+# The container writes two generated files at start-up (the CSP header snippet and
+# /config.json, both derived from syncOrigin) and Caddy reads its bundled config from
+# the same directory, so the root filesystem is NOT read-only for this chart. What is
+# enforced instead: every capability dropped, no privilege escalation, default seccomp.
+# A future image that pre-generates those files at build time could run read-only and
+# non-root; today's cannot.
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false
+  capabilities:
+    drop:
+      - ALL
+  seccompProfile:
+    type: RuntimeDefault
+
+# Which sync server this deployment talks to. THE client reads this at first sign-in;
+# the CSP's connect-src is generated from it at container start, so the served bundle
+# stays byte-identical to the published one and its hash stays comparable.
+#
+# An ORIGIN: scheme + host + optional port. No path, no trailing slash.
+syncOrigin: ""
+
+service:
+  type: ClusterIP
+  port: 8080
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  host: ""
+  path: /
+  pathType: Prefix
+  tls: []
+  #  - secretName: myne-notes-tls
+  #    hosts:
+  #      - notes.example.org
+
+networkPolicy:
+  enabled: false
+  ingressControllerNamespaceSelector:
+    kubernetes.io/metadata.name: ingress-nginx
+  extraIngressFrom: []
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 96Mi
+  limits:
+    cpu: "500m"
+    memory: 256Mi
+
+# httpGet probes. The image's own HEALTHCHECK uses wget over loopback, which k8s
+# ignores, and /healthz answers a content-free "ok".
+livenessProbe:
+  path: /healthz
+  initialDelaySeconds: 3
+  periodSeconds: 10
+  timeoutSeconds: 3
+  failureThreshold: 3
+readinessProbe:
+  path: /healthz
+  initialDelaySeconds: 3
+  periodSeconds: 10
+  timeoutSeconds: 3
+  failureThreshold: 3
+
+terminationGracePeriodSeconds: 15
+revisionHistoryLimit: 3
+
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []
+priorityClassName: ""
+automountServiceAccountToken: false
+
+extraEnv: []
+extraVolumes: []
+extraVolumeMounts: []
