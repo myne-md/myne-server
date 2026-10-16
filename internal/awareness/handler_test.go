@@ -162,6 +162,42 @@ func TestCrossVaultIsolation(t *testing.T) {
 	}
 }
 
+// openAwarenessStream opens one SSE stream and hands the caller the live
+// response.
+//
+// It returns the RESPONSE rather than a status code, and that is the whole
+// reason it exists as a helper instead of an `open() int` closure. A
+// `defer resp.Body.Close()` inside the helper ties the stream's lifetime to the
+// helper's: the first subscriber is released before the next request is issued,
+// so a per-vault cap of 1 never appears to be reached and the 429 assertion
+// reads 200. This is NOT a timing race to be papered over — the ordering is
+// decided by the server, and it is decided the FAILING way here:
+//
+//	handler.go:178  h.relay.Subscribe(...)   <- the slot is taken
+//	handler.go:189  flusher.Flush()          <- headers reach the client
+//
+// so once `Do` returns, the slot is held for as long as the body stays open.
+// Closing it inside the helper contradicts a guarantee the server makes
+// synchronously, and which toolchain you run decides whether you notice: go
+// 1.26.4 (the CI image and go.mod pin) resolves it the failing way every run,
+// while 1.27 passed by scheduling the second GET before the close was observed.
+// The test was therefore green locally and red in CI, which reads as flake and
+// is not one.
+//
+// The caller owns the lifetime and MUST `defer resp.Body.Close()` — the same
+// shape internal/poke/poke_test.go's openStream uses for the same cap on the
+// poke route.
+func openAwarenessStream(t *testing.T, url, token string) *http.Response {
+	t.Helper()
+	req, _ := http.NewRequest("GET", url+"/sync/awareness", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	return resp
+}
+
 func TestHTTPPerVaultCapRefuses(t *testing.T) {
 	h, _ := newTestHandler()
 	h = h.WithCaps(1, MaxFrameSize, MaxFramesPerPost)
@@ -170,21 +206,18 @@ func TestHTTPPerVaultCapRefuses(t *testing.T) {
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
-	open := func() int {
-		req, _ := http.NewRequest("GET", srv.URL+"/sync/awareness", nil)
-		req.Header.Set("Authorization", "Bearer "+devToken())
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatalf("GET: %v", err)
-		}
-		defer resp.Body.Close()
-		return resp.StatusCode
+	// The first stream stays open for the whole test: the slot it holds is
+	// precisely what the second request must be refused for.
+	first := openAwarenessStream(t, srv.URL, devToken())
+	defer first.Body.Close()
+	if first.StatusCode != http.StatusOK {
+		t.Fatalf("first GET = %d", first.StatusCode)
 	}
-	if code := open(); code != http.StatusOK {
-		t.Fatalf("first GET = %d", code)
-	}
-	if code := open(); code != http.StatusTooManyRequests {
-		t.Fatalf("second GET at cap = %d, want 429", code)
+
+	second := openAwarenessStream(t, srv.URL, devToken())
+	defer second.Body.Close()
+	if second.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("second GET at cap = %d, want 429", second.StatusCode)
 	}
 }
 
