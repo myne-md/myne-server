@@ -4,30 +4,27 @@
 
 > You write. The server never reads. Hosted or self-hosted.
 
-The zero-knowledge sync server for [Myne](https://github.com/myne-md/myne) — the open-source, end-to-end-encrypted, local-first markdown notes app. This repository will hold the server that stores and relays encrypted note blobs between a user's devices. It never sees plaintext, never sees the master password or recovery phrase, and never holds a key that could decrypt anything. Every byte of note content is encrypted on the client before it leaves the device.
+The zero-knowledge sync server for [Myne](https://github.com/myne-md/myne) — the open-source, end-to-end-encrypted, local-first markdown notes app. This repository holds the server that stores and relays encrypted note blobs between a user's devices. It never sees plaintext, never sees the master password or recovery phrase, and never holds a key that could decrypt anything. Every byte of note content is encrypted on the client before it leaves the device.
 
-Myne is a multi-repo project under [github.com/myne-md](https://github.com/myne-md). The main repo carries the desktop client and the canonical specifications; the protocol this server must implement lives in [`myne/docs/spec/protocol.md`](https://github.com/myne-md/myne/blob/main/docs/spec/protocol.md), and the threat model that bounds it lives in [`myne/docs/threat-model.md`](https://github.com/myne-md/myne/blob/main/docs/threat-model.md). Read those before writing server code.
+Myne is a multi-repo project under [github.com/myne-md](https://github.com/myne-md). The main repo carries the desktop client and the canonical specifications; the protocol this server must implement lives in [`myne/docs/spec/protocol.md`](https://github.com/myne-md/myne/blob/develop/docs/spec/protocol.md), and the threat model that bounds it lives in [`myne/docs/threat-model.md`](https://github.com/myne-md/myne/blob/develop/docs/threat-model.md). Read those before writing server code.
 
 ## Status
 
-**Pre-alpha — Phase 2, not yet started.** This repository is an empty scaffold. No application code has shipped.
+**Active, pre-alpha.** No longer a scaffold: the server runs, stores and relays the vault, and ships as a container image and a Helm chart. It is a Go program (`go 1.26`), one binary at `cmd/myne-server`, and it is the implementation behind the main repo's normative [`server-protocol.md`](https://github.com/myne-md/myne/blob/develop/docs/spec/server-protocol.md).
 
 What exists today:
 
-- `LICENSE` — AGPL-3.0
-- `CLAUDE.md` — architectural notes and the non-negotiable commitments below
-- `lefthook.yml` — the baseline commit hooks (whitespace, EOF newline, secret-pattern guard)
+- `cmd/myne-server` — the server binary.
+- `internal/` — the implementation, one package per concern: `httpapi` (routing, config, CORS, no-IP logging, metrics, health and readiness), `store` (the `mem` and `fs` backends), `accounts` / `auth` / `authapi` (account numbers, SCRAM, device approval), `syncapi` (blob push and pull, the vault head, cursors, retention and reclamation), `attachments` (the attachment half of the same surface), `awareness` (live-collaboration frames and their fan-out) and `poke` (the SSE poke channel), `b2bpersist` / `membership` / `grouppkg` / `profiles` / `relay` / `headid` (the B2B surface: invites, membership, group packages, per-person private profiles, the invite relay, signed-head author ids), `adminapi` / `panel` / `console` (the operator surfaces), `backup` (restic-backed backup and restore), `gcquota` (quota accounting and retirement reclamation), and `ids` / `authpersist`.
+- `deploy/` — a Helm chart for the server and one for the web client, plus Kubernetes manifests.
+- `Dockerfile` — a reproducible, minimal, non-root image. The shipped artefact is the image, and its digest is the verification unit (both bases pinned by `@sha256`).
+- `LICENSE` (AGPL-3.0), `CLAUDE.md` (architectural notes and the non-negotiables below), `the CI configuration` (CI), `lefthook.yml` (the commit-hook baseline), and `KNOWN-GAPS-711.md` (the B2B surface's known gaps, recorded where they ship).
+- `scripts/` — `repro-gate.sh`, the GitHub triage tooling, and the fetch tool.
+- 97 Go test files; `go test ./...` is the suite.
 
-What is planned, once Phase 2 opens:
+The wire surface today: `/auth/*` (register, SCRAM init and final, verifier, device approve and revoke), `/sync/*` (blob push and pull, poke), `/attachments/*`, `/b2b/*` (invites, membership, retirement, profiles, group packages), and `/admin/*` behind `MYNE_ADMIN_SOCKET`. Route names and the wire contract are normative in the main repo's [`server-protocol.md`](https://github.com/myne-md/myne/blob/develop/docs/spec/server-protocol.md) and [`sync-protocol.md`](https://github.com/myne-md/myne/blob/develop/docs/spec/sync-protocol.md).
 
-- A **Go** sync server storing opaque ciphertext blobs keyed by hashed account identifiers
-- Account-number authentication (verifier shape deferred to Phase 2; the main repo carries a v005 OPAQUE commitment but Phase 2 may decide otherwise — see `myne/design notes.md`)
-- Per-note **opaque version counters** for conflict detection, resolved client-side after decryption
-- A server-protocol spec (`myne/docs/spec/server-protocol.md`, does not exist yet)
-
-Phase 1 is desktop-only with local vault storage and does not require a server. Work here stays parked until the Phase 1 pre-ship gate closes.
-
-## How it works (intended design)
+## How it works
 
 The server is **outside the trust boundary by design** — it is trust boundary TB5 in the threat model, and the protocol assumes a curious or compelled operator. The client encrypts every note with XChaCha20-Poly1305 under keys derived via Argon2id + HKDF-SHA-256 from a master password the server never receives. The server's job is storage and conflict detection over ciphertext it cannot read.
 
@@ -89,7 +86,7 @@ this table cannot drift from the server silently.
 
 ## Development
 
-Run `go test ./...`. The repo has no application packaging yet; the only other local tooling is the commit-hook baseline:
+Run `go test ./...`. Packaging is the `Dockerfile` and `deploy/` (the server and web Helm charts); the other local tooling is the commit-hook baseline:
 
 ```bash
 brew install lefthook && lefthook install   # one-time per clone; activates git hooks
