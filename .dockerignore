@@ -6,7 +6,7 @@
 the CI configuration
 .DS_Store
 Dockerfile
-CLAUDE.md
+AGENTS.md
 README.md
 LICENSE
 lefthook.yml

@@ -36,7 +36,7 @@ func noIP(next http.Handler) http.Handler {
 // What is logged is deliberately narrow: the method and the route path, and
 // nothing else. Not the panic value (it can carry request-derived state), not a
 // stack (frames can carry arguments), not an account. That keeps it inside the
-// ALLOW list in `src-tauri/CLAUDE.md` "Secret-handling logging discipline",
+// ALLOW list in `src-tauri/AGENTS.md` "Secret-handling logging discipline",
 // which this server follows too.
 //
 // The 500 is written only if the handler had not already written a header —

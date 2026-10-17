@@ -18,7 +18,7 @@ What exists today:
 - `internal/` — the implementation, one package per concern: `httpapi` (routing, config, CORS, no-IP logging, metrics, health and readiness), `store` (the `mem` and `fs` backends), `accounts` / `auth` / `authapi` (account numbers, SCRAM, device approval), `syncapi` (blob push and pull, the vault head, cursors, retention and reclamation), `attachments` (the attachment half of the same surface), `awareness` (live-collaboration frames and their fan-out) and `poke` (the SSE poke channel), `b2bpersist` / `membership` / `grouppkg` / `profiles` / `relay` / `headid` (the B2B surface: invites, membership, group packages, per-person private profiles, the invite relay, signed-head author ids), `adminapi` / `panel` / `console` (the operator surfaces), `backup` (restic-backed backup and restore), `gcquota` (quota accounting and retirement reclamation), and `ids` / `authpersist`.
 - `deploy/` — a Helm chart for the server and one for the web client, plus Kubernetes manifests.
 - `Dockerfile` — a reproducible, minimal, non-root image. The shipped artefact is the image, and its digest is the verification unit (both bases pinned by `@sha256`).
-- `LICENSE` (AGPL-3.0), `CLAUDE.md` (architectural notes and the non-negotiables below), `the CI configuration` (CI), `lefthook.yml` (the commit-hook baseline), and `KNOWN-GAPS-711.md` (the B2B surface's known gaps, recorded where they ship).
+- `LICENSE` (AGPL-3.0), `AGENTS.md` (architectural notes and the non-negotiables below), `the CI configuration` (CI), `lefthook.yml` (the commit-hook baseline), and `KNOWN-GAPS-711.md` (the B2B surface's known gaps, recorded where they ship).
 - `scripts/` — `repro-gate.sh`, the GitHub triage tooling, and the fetch tool.
 - 97 Go test files; `go test ./...` is the suite.
 
@@ -41,7 +41,7 @@ These are load-bearing for the zero-knowledge claim. Walking any of them back si
 
 Cross-implementation byte-level agreement is enforced by the [`myne-test-vectors`](https://github.com/myne-md/myne-test-vectors) companion: any server-side primitive must reproduce the same bytes as the Phase 1 Rust client, with no custom primitive implementations and hash-pinned dependencies.
 
-See `CLAUDE.md` for the deferred design decisions and the gotchas that protect these commitments.
+See `AGENTS.md` for the deferred design decisions and the gotchas that protect these commitments.
 
 ## Configuration
 

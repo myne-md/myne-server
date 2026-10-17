@@ -24,7 +24,7 @@ Phase 2 server side. The client side (engine, device-mgmt, deletion, fork-confli
 - No custom primitive implementations
 - Hash-pinned `go.sum`; minimal direct dependencies (same discipline as main repo Phase 1)
 
-## Hard architectural commitments (from `vision.md` + main repo CLAUDE.md)
+## Hard architectural commitments (from `vision.md` + main repo AGENTS.md)
 
 These are **non-negotiable**. Walking any of them back silently breaks the zero-knowledge claim:
 

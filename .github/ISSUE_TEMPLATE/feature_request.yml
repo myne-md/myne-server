@@ -6,7 +6,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        The server is TB5 — a curious or compelled operator is assumed. Proposals may not add a way for the server to learn plaintext, correlate accounts, or log client IPs persistently. See [`docs/threat-model.md`](https://github.com/myne-md/myne/blob/main/docs/threat-model.md) and the server's own `CLAUDE.md` non-negotiable commitments.
+        The server is TB5 — a curious or compelled operator is assumed. Proposals may not add a way for the server to learn plaintext, correlate accounts, or log client IPs persistently. See [`docs/threat-model.md`](https://github.com/myne-md/myne/blob/main/docs/threat-model.md) and the server's own `AGENTS.md` non-negotiable commitments.
   - type: textarea
     id: problem
     attributes:
