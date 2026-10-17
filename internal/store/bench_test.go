@@ -9,6 +9,7 @@ package store
 
 import (
 	"bytes"
+	"fmt"
 	"testing"
 )
 
@@ -150,5 +151,69 @@ func BenchmarkAdvanceHead(b *testing.B) {
 				prev = next // chain from the head we just set
 			}
 		})
+	}
+}
+
+// populate writes `n` distinct blobs into a fresh vault, batched so the index is
+// written once rather than once per blob. Population is NOT measured.
+func populate(b *testing.B, bk benchBackend, n int) BlobStore {
+	b.Helper()
+	s := bk.mk(b)
+	a := acct(1)
+	body := bytes.Repeat([]byte{0x5a}, 128)
+	err := s.Batch(a, func() error {
+		for i := 0; i < n; i++ {
+			if _, err := s.PutBlob(a, blobN(i), body); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+	return s
+}
+
+// BenchmarkPullBookkeepingNBlobs measures the two per-PULL writes a POPULATED
+// vault pays for, at two vault sizes.
+//
+// The siblings above run against an empty vault, and on that shape both of these
+// look flat: the only cost is the atomic write's four fsyncs, and the index they
+// re-serialize is a few hundred bytes. A real vault is not empty, and both paths
+// re-serialize and rewrite the WHOLE vault index on every call — so their cost is
+// a function of the blob count rather than of the work asked for (one cursor, one
+// head). This is the benchmark that says whether that matters, and the one to
+// re-run before touching either path's storage.
+//
+// `AckCursor` is called with a strictly increasing position on purpose: it is a
+// no-op when the position does not advance, so a fixed one would measure nothing
+// and report an impressively fast number.
+func BenchmarkPullBookkeepingNBlobs(b *testing.B) {
+	rec := bytes.Repeat([]byte{0x33}, 128)
+	for _, n := range []int{100, 1000} {
+		for _, bk := range benchBackends() {
+			b.Run(fmt.Sprintf("%s/n=%d/ack-cursor", bk.name, n), func(b *testing.B) {
+				s := populate(b, bk, n)
+				a, dev := acct(1), deviceID(2)
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					s.AckCursor(a, dev, uint64(i+1))
+				}
+			})
+			b.Run(fmt.Sprintf("%s/n=%d/advance-head", bk.name, n), func(b *testing.B) {
+				s := populate(b, bk, n)
+				a := acct(1)
+				var prev [HeadIDLen]byte // genesis = zero
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					next, err := s.AdvanceHead(a, prev, rec)
+					if err != nil {
+						b.Fatal(err)
+					}
+					prev = next // chain from the head we just set
+				}
+			})
+		}
 	}
 }
