@@ -80,6 +80,13 @@ FROM gcr.io/distroless/static:nonroot@sha256:963fa6c544fe5ce420f1f54fb88b6fb0147
 
 COPY --from=build /out/myne-server /usr/local/bin/myne-server
 
+# Third-party notices for the binaries this image redistributes (restic,
+# rclone) and for the empty Go module graph. `lefthook`'s `third-party-notices`
+# check holds NOTICE to the pinned downloads above, so a third one cannot land
+# without a row; nothing else here would notice, since a download pinned by
+# sha256 leaves no trace in the module graph a compiler reads.
+COPY NOTICE /NOTICE
+
 # Bundled backup engine (MYND-505): sha256-pinned restic + its rclone SFTP
 # transport. The server invokes restic via os/exec (no shell needed); restic
 # finds rclone on PATH. RESTIC_CACHE_DIR must be writable for UID 65532 (the

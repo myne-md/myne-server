@@ -16,6 +16,43 @@ pre-commit:
   parallel: true
   commands:
 
+    third-party-notices:
+      # The runtime image COPYs two sha256-pinned binaries in — restic and its
+      # rclone transport — and NOTICE has to name each of them with its licence.
+      # Adding a third pinned download without a row here is SILENT: the download
+      # leaves no trace in the Go module graph, no compiler reads a Dockerfile,
+      # and `go vet` has nothing to say about a file that is not Go at all.
+      #
+      # The check derives the binaries from the Dockerfile's own release URLs
+      # rather than from a list kept here, so it cannot agree with the Dockerfile
+      # by accident, and it fails when it finds fewer than two of them, which is
+      # the shape of a check that has stopped reading anything.
+      run: |
+        fail=0
+
+        if ! grep -q '^COPY NOTICE /NOTICE' Dockerfile; then
+          echo "Dockerfile does not copy NOTICE into the runtime image."
+          fail=1
+        fi
+
+        urls="$(grep -o 'https://github.com/[a-zA-Z0-9._-]*/[a-zA-Z0-9._-]*/releases/download/' Dockerfile || true)"
+        n="$(printf '%s\n' "$urls" | grep -c . || true)"
+        if [ "$n" -lt 2 ]; then
+          echo "expected the sha256-pinned download URLs in Dockerfile, found $n;"
+          echo "either they moved or this check is now reading nothing."
+          fail=1
+        fi
+
+        for bin in $(printf '%s\n' "$urls" | cut -d/ -f4 | sort -u); do
+          [ -n "$bin" ] || continue
+          if ! grep -qi "$bin" NOTICE; then
+            echo "NOTICE does not name the bundled binary '$bin'."
+            fail=1
+          fi
+        done
+
+        exit $fail
+
     whitespace:
       run: git diff --cached --check
 

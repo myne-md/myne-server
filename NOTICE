@@ -1,0 +1,103 @@
+Third-party notices — myne-server
+=================================
+
+The shipped artefact is the OCI image built by `Dockerfile`, whose digest is the
+verification unit (SYNC-28). Three answers about what it redistributes, and two
+of them are not the obvious ones.
+
+
+1. The Go module graph is empty
+-------------------------------
+
+`go.mod` declares a module and a toolchain and nothing else, and the repository
+has no `go.sum`: the server is pure standard library today. No third-party Go
+module is redistributed by this binary.
+
+Verify:
+
+  go list -m all        # the module itself, then nothing
+  ls go.sum             # absent by design, not by accident
+
+
+2. Two binaries this repository pins and copies in
+--------------------------------------------------
+
+The image bundles a backup engine and its transport. Both are fetched at build
+time by `scripts/fetchtool`, each pinned by sha256 in the Dockerfile (the SYNC-20
+pin-by-digest discipline), and both are REDISTRIBUTED inside the shipped image.
+They have no row in the Go module graph, so nothing else in this repository
+would have mentioned them.
+
+restic 0.19.1  ·  BSD 2-Clause License
+  Author: Copyright (c) 2014, Alexander Neumann <alexander@bumpern.de>
+  Source: https://github.com/restic/restic
+  Text:   the upstream `/LICENSE` for v0.19.1, reproduced below
+
+
+BSD 2-Clause License
+
+Copyright (c) 2014, Alexander Neumann <alexander@bumpern.de>
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+* Redistributions of source code must retain the above copyright notice, this
+  list of conditions and the following disclaimer.
+
+* Redistributions in binary form must reproduce the above copyright notice,
+  this list of conditions and the following disclaimer in the documentation
+  and/or other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+
+rclone 1.74.4  ·  MIT License
+  Author: Copyright (C) 2012 by Nick Craig-Wood
+  Source: https://github.com/rclone/rclone
+  Text:   the upstream `/COPYING` for v1.74.4, reproduced below
+
+
+Copyright (C) 2012 by Nick Craig-Wood http://www.craig-wood.com/nick/
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+
+
+3. The base image, and the limit of this file
+---------------------------------------------
+
+`gcr.io/distroless/static:nonroot` (Apache-2.0) is the runtime base, pinned by
+digest in the Dockerfile. A container base image carries a distribution's worth
+of files, and re-inventorying Debian's from here would be a list that goes stale
+on every base bump; that obligation belongs to the base image, which is part of
+why the pin is a digest and not a tag. What this file covers is what THIS
+repository adds on top of it, and the two binaries above are the whole of that.
+
+The build stage (`golang:1.26.4`) is discarded by the multi-stage build and is
+not redistributed.
