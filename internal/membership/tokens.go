@@ -47,7 +47,7 @@ func NewTokenStore(table *Table) *TokenStore {
 // Issue mints a fresh per-vault token for an existing binding. A binding the
 // table does not hold, or whose role has since changed, is refused: a token is
 // only ever minted for access that currently exists.
-func (s *TokenStore) Issue(person PersonID, vault VaultID) (ids.DeviceToken, error) {
+func (s *TokenStore) Issue(person PersonID, vault VaultID, device ids.DeviceID) (ids.DeviceToken, error) {
 	if _, ok := s.table.Role(vault, person); !ok {
 		return nil, ErrNotBound
 	}
@@ -59,6 +59,7 @@ func (s *TokenStore) Issue(person PersonID, vault VaultID) (ids.DeviceToken, err
 	s.byToken[hex.EncodeToString(raw)] = Binding{
 		Person: person,
 		Vault:  vault,
+		Device: DeviceID(device),
 	}
 	s.changed()
 	s.mu.Unlock()
@@ -84,6 +85,38 @@ func (s *TokenStore) Resolve(token ids.DeviceToken) (Binding, error) {
 	}
 	b.Role = role
 	return b, nil
+}
+
+// RevokeDevice reports every outstanding token issued to `device` as retired,
+// WITHOUT deleting them (myne-md/myne#911 task 9).
+//
+// The bindings stay on purpose. A deleted token would answer `unauthenticated`,
+// which reads to the device as "sign in again"; leaving it lets the next request
+// answer `device_revoked`, which is the honest "the owner removed this device"
+// (the same choice `handleRevoke` documents). What this method is FOR is the
+// observer: the live-awareness relay closes a member's open streams from it, so a
+// revoked device does not keep receiving frames until it happens to reconnect.
+// Whether the device is still allowed to authenticate at all is the registry's
+// answer, checked on every session.
+func (s *TokenStore) RevokeDevice(device DeviceID) {
+	if device == (DeviceID{}) {
+		return
+	}
+	s.mu.RLock()
+	var tokens []string
+	for tok, b := range s.byToken {
+		if b.Device == device {
+			tokens = append(tokens, tok)
+		}
+	}
+	onRevoke := s.onRevoke
+	s.mu.RUnlock()
+	if onRevoke == nil {
+		return
+	}
+	for _, tok := range tokens {
+		onRevoke(tok)
+	}
 }
 
 // Revoke deletes every outstanding token for one (person, vault) binding. This

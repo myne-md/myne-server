@@ -114,10 +114,10 @@ func TestTokenGrantAndTargetedRevoke(t *testing.T) {
 	}
 
 	// A token can be minted only for an existing binding.
-	if _, err := store.Issue(person(0xDD), v); err != ErrNotBound {
+	if _, err := store.Issue(person(0xDD), v, DeviceID{0x0a}); err != ErrNotBound {
 		t.Fatalf("Issue for unbound person err = %v, want ErrNotBound", err)
 	}
-	tok, err := store.Issue(member, v)
+	tok, err := store.Issue(member, v, DeviceID{0x0a})
 	if err != nil {
 		t.Fatalf("Issue: %v", err)
 	}
@@ -135,7 +135,7 @@ func TestTokenGrantAndTargetedRevoke(t *testing.T) {
 	if err := tbl.BindMember(other, member); err != nil {
 		t.Fatal(err)
 	}
-	otherTok, err := store.Issue(member, other)
+	otherTok, err := store.Issue(member, other, DeviceID{0x0a})
 	if err != nil {
 		t.Fatal(err)
 	}

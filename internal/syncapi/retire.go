@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/myne-md/myne-server/internal/ids"
+	"github.com/myne-md/myne-server/internal/membership"
 )
 
 // This file is the owner-only namespace-retirement surface (myne-md/myne#711,
@@ -44,12 +45,19 @@ func bearerHex(r *http.Request) string {
 // broken by the B2B gate landing.
 func (h *Handler) vaultMetaWriteAccount(w http.ResponseWriter, r *http.Request) (ids.AccountNumberHash, bool) {
 	if h.membership != nil {
-		if vault, owner, ok := h.membership.ResolveMember(bearerHex(r)); ok {
-			if !owner {
+		if b, ok := h.membership.ResolveMember(bearerHex(r)); ok {
+			if b.Role != membership.RoleOwner {
 				writeErr(w, http.StatusForbidden, "forbidden")
 				return ids.AccountNumberHash{}, false
 			}
-			return vault, true
+			// The registry answer applies here too: an owner token on a revoked
+			// device must not keep writing the credential blob after the device
+			// was removed (myne-md/myne#911 task 9).
+			if b.Device != (ids.DeviceID{}) && !h.membership.DeviceActive(ids.AccountNumberHash(b.Person), ids.DeviceID(b.Device)) {
+				writeErr(w, http.StatusUnauthorized, "device_revoked")
+				return ids.AccountNumberHash{}, false
+			}
+			return b.Vault, true
 		}
 	}
 	sess, authCode := h.sessionWithCode(r)
@@ -62,6 +70,79 @@ func (h *Handler) vaultMetaWriteAccount(w http.ResponseWriter, r *http.Request) 
 		return ids.AccountNumberHash{}, false
 	}
 	return sess.Account, true
+}
+
+// vaultMetaPublishAccount is the vault.meta PUT path for a PERSON session that
+// names a vault (`?account=`, myne-md/myne#911 task 7).
+//
+// Publishing is the act that makes a device-local vault a server vault, so it is
+// also the act that records who owns it: owner-at-first-write, the rule §3.1a
+// already applies to `POST /b2b/vaults/{h}/members`. The three answers, in this
+// order, and the order is the authority:
+//
+//  1. The vault has an owner and it is this person: write.
+//  2. The vault has an owner and it is someone else: `403 forbidden`. This is
+//     the case a cross-tenant publish would hit, and it is checked BEFORE any
+//     write so a refused publish leaves no trace.
+//  3. The vault has no owner: bind this person as the owner, then write. A vault
+//     that already has blobs but no owner is a pre-B2B vault whose first B2B act
+//     is this publish, which is the same first-write-only transition the
+//     membership route performs.
+//
+// A selector naming the caller's OWN account never reaches here: that is a vault
+// device token addressing its own namespace, and `vaultMetaWriteAccount`'s
+// existing gate owns it.
+func (h *Handler) vaultMetaPublishAccount(w http.ResponseWriter, r *http.Request, vault ids.AccountNumberHash) (ids.AccountNumberHash, bool) {
+	if h.membership == nil {
+		writeErr(w, http.StatusForbidden, "forbidden")
+		return ids.AccountNumberHash{}, false
+	}
+	sess, authCode := h.sessionWithCode(r)
+	if authCode != "" {
+		writeErr(w, http.StatusUnauthorized, authCode)
+		return ids.AccountNumberHash{}, false
+	}
+	if vault == sess.Account {
+		// The vault's own device token naming itself: the legacy path.
+		if h.membership.HasOwner(vault) {
+			writeErr(w, http.StatusForbidden, "owner_required")
+			return ids.AccountNumberHash{}, false
+		}
+		return vault, true
+	}
+	owner, bound := h.membership.BoundTo(vault, sess.Account)
+	if bound {
+		if !owner {
+			writeErr(w, http.StatusForbidden, "forbidden")
+			return ids.AccountNumberHash{}, false
+		}
+		return vault, true
+	}
+	if h.membership.HasOwner(vault) {
+		// Someone else's vault. Same refusal a non-owner member gets, so the
+		// route is not an oracle for "this vault exists and has an owner".
+		writeErr(w, http.StatusForbidden, "forbidden")
+		return ids.AccountNumberHash{}, false
+	}
+	// Owner-at-first-write binds a VIRGIN namespace only (myne-md/myne#911
+	// review). A namespace that already holds a `vault.meta` has an owner even
+	// when the binding table does not know it: every pre-B2B vault is ownerless
+	// in the table, and its namespace is its account number, which this change
+	// reclassifies as an identifier rather than a credential. Binding it on the
+	// strength of knowing a number would let any person account claim someone
+	// else's vault and overwrite the one blob every other device bootstraps from.
+	// A peer that genuinely has to publish an existing vault proves it the way it
+	// always did: with that vault's own device session, which the selector-less
+	// arm above owns.
+	if _, err := h.store.GetMeta(vault); err == nil {
+		writeErr(w, http.StatusForbidden, "owner_required")
+		return ids.AccountNumberHash{}, false
+	}
+	if err := h.membership.BindOwner(vault, sess.Account); err != nil {
+		writeErr(w, http.StatusConflict, "already_owned")
+		return ids.AccountNumberHash{}, false
+	}
+	return vault, true
 }
 
 type retireReq struct {
@@ -89,12 +170,16 @@ func (h *Handler) handleRetire(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusUnauthorized, "unauthenticated")
 		return
 	}
-	v, owner, ok := h.membership.ResolveMember(bearerHex(r))
+	b, ok := h.membership.ResolveMember(bearerHex(r))
 	if !ok {
 		writeErr(w, http.StatusUnauthorized, "unauthenticated")
 		return
 	}
-	if v != vault || !owner {
+	if b.Device != (ids.DeviceID{}) && !h.membership.DeviceActive(ids.AccountNumberHash(b.Person), ids.DeviceID(b.Device)) {
+		writeErr(w, http.StatusUnauthorized, "device_revoked")
+		return
+	}
+	if b.Vault != vault || b.Role != membership.RoleOwner {
 		writeErr(w, http.StatusForbidden, "forbidden")
 		return
 	}

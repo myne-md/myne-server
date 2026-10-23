@@ -295,6 +295,11 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /b2b/invites", h.limitB2B(h.handleCreateInvite))
 	mux.HandleFunc("GET /b2b/invites", h.limitB2B(h.handleListInvites))
 	mux.HandleFunc("GET /b2b/vaults/{account_hash}/invites", h.limitB2B(h.handleListVaultInvites))
+	// Vault discovery for a person session (myne-md/myne#911 task 7): the
+	// bindings this account holds, so a second device can learn which vaults to
+	// sync without a per-vault token for each. Reads the membership index and
+	// authorizes nothing by itself.
+	mux.HandleFunc("GET /b2b/vaults", h.limitB2B(h.handleDiscoverVaults))
 	mux.HandleFunc("POST /b2b/invites/{invite_id}/claim", h.limitB2B(h.handleClaimInvite))
 	// Person-private AI profiles (myne-md/myne#711 task 16): a vault-scoped,
 	// person-authorized namespace, separate from the shared group manifest.
@@ -351,8 +356,8 @@ func (h *Handler) b2bKey(r *http.Request) ids.AccountNumberHash {
 	if !ok {
 		return ids.AccountNumberHash{}
 	}
-	if vault, _, ok := h.ResolveMember(hex.EncodeToString(tok)); ok {
-		return vault
+	if binding, ok := h.ResolveMember(hex.EncodeToString(tok)); ok {
+		return binding.Vault
 	}
 	if b, err := h.tokens.Authenticate(tok); err == nil {
 		return b
@@ -1041,6 +1046,17 @@ func (h *Handler) handleRevoke(w http.ResponseWriter, r *http.Request) {
 	var doSave bool
 	defer h.maybeSave(&doSave)
 	_ = h.reg.Retire(sess.Account, device)
+	// The registry row is what refuses the DEVICE, and on an account-scoped
+	// surface that is enough. It is not enough for the per-vault membership
+	// tokens this device holds: `TokenStore.Resolve` answers from the binding
+	// table, so a token minted for a shared vault keeps resolving after its
+	// device is retired (myne-md/myne#911 review). `RevokeDevice` does not delete
+	// those rows, which is deliberate and documented there; it reports them, and
+	// the awareness relay closes the streams they were holding open. Without this
+	// call the sentence in `server-protocol.md` §3.1a that says one revocation
+	// reaches every vault the device joined was true of the registry and false of
+	// the credential.
+	h.memberTks.RevokeDevice(membership.DeviceID(device))
 	doSave = true
 	writeJSON(w, map[string]bool{"ok": true})
 }

@@ -13,6 +13,7 @@ import (
 
 	"github.com/myne-md/myne-server/internal/auth"
 	"github.com/myne-md/myne-server/internal/ids"
+	"github.com/myne-md/myne-server/internal/membership"
 )
 
 // Defaults. The subscriber cap is larger than the poke's single-user 8 because a
@@ -38,7 +39,7 @@ type TokenAuth interface {
 // MembershipResolver is the B2B per-vault membership seam (satisfied by
 // *authapi.Handler), the same one syncapi uses.
 type MembershipResolver interface {
-	ResolveMember(bearerHex string) (vault ids.AccountNumberHash, owner bool, ok bool)
+	ResolveMember(bearerHex string) (b membership.Binding, ok bool)
 }
 
 // RateLimiter gates requests per account (nil = disabled); never IP.
@@ -109,7 +110,8 @@ func (h *Handler) session(r *http.Request) (auth.Session, bool) {
 		return sess, true
 	}
 	if h.membership != nil {
-		if vault, _, ok := h.membership.ResolveMember(hexTok); ok {
+		if b, ok := h.membership.ResolveMember(hexTok); ok {
+			vault := b.Vault
 			return auth.Session{Account: vault}, true
 		}
 	}

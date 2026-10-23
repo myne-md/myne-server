@@ -10,6 +10,7 @@
 package syncapi
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -21,6 +22,7 @@ import (
 
 	"github.com/myne-md/myne-server/internal/auth"
 	"github.com/myne-md/myne-server/internal/ids"
+	"github.com/myne-md/myne-server/internal/membership"
 	"github.com/myne-md/myne-server/internal/store"
 )
 
@@ -140,8 +142,9 @@ type Handler struct {
 	frozen func(account ids.AccountNumberHash) bool
 	// accountStatus returns the caller's own status projection (stored bytes, device
 	// count, frozen, effective ceilings) for GET /account/status. The account is the
-	// authenticated one; nil = the endpoint reports unavailable.
-	accountStatus func(account ids.AccountNumberHash) any
+	// authenticated one, plus the vaults it owns when it is a person session
+	// (myne-md/myne#911 task 11); nil = the endpoint reports unavailable.
+	accountStatus func(scope StatusScope) any
 	// usedBytes is the UNIFIED per-account stored-byte total — blobs plus
 	// attachments — the AS17 ceiling is defined against (#8).
 	//
@@ -166,8 +169,43 @@ type Handler struct {
 // handler is wired in the composition layer. ResolveMember answers "is this
 // per-vault bearer token valid, for which vault, and is it the owner's".
 type MembershipAuth interface {
-	ResolveMember(bearerHex string) (vault ids.AccountNumberHash, owner bool, ok bool)
+	ResolveMember(bearerHex string) (b membership.Binding, ok bool)
+	// DeviceActive reports whether `device` is still an active, approved device of
+	// `person`'s account (myne-md/myne#911 task 9). A membership token names the
+	// device it was issued to, so the ONE act that revokes a device also ends its
+	// access to every shared vault it joined: this is asked on every request
+	// rather than swept at revoke time, so a token cannot outlive its device.
+	//
+	// A token with no device (issued before this field existed) is never refused
+	// by this check: it cannot be attributed, and guessing would revoke somebody
+	// else's access.
+	DeviceActive(person ids.AccountNumberHash, device ids.DeviceID) bool
 	HasOwner(vault ids.AccountNumberHash) bool
+	// BoundTo reports whether `person` holds a binding to `vault` (myne-md/myne#911
+	// task 7). It is the ONE new authority this feature adds to the sync surface:
+	// a person session may act on a vault it is bound to, and on nothing else.
+	//
+	// `person` is an account id, because the server cannot tell a person id from a
+	// vault id and does not try (server-protocol §3.1a). A vault's own device
+	// account is not bound to itself, so this answers false for it, which is why
+	// the resolver below checks the equality case FIRST and never reaches here for
+	// a vault acting on its own namespace.
+	BoundTo(vault ids.AccountNumberHash, person ids.AccountNumberHash) (owner bool, ok bool)
+	// BindOwner records the vault's owner. Publishing a vault under a person
+	// session is owner-at-first-write (§3.1a's rule), so the sync surface needs
+	// exactly this one mutator and no other membership write.
+	BindOwner(vault ids.AccountNumberHash, person ids.AccountNumberHash) error
+	// OwnedVaults reports the vaults `person` OWNS (myne-md/myne#911 task 11). It
+	// is what lets GET /account/status answer with ONE usage figure for a person
+	// account: the aggregate is the sum of those vaults' byte counters.
+	//
+	// OWned only, deliberately. A vault the person merely JOINED holds somebody
+	// else's bytes and the member cannot free them, so counting them would report
+	// usage the person cannot act on. An account with no owned vaults answers
+	// empty, which is also how the status route tells a person session from a
+	// vault session without a second identity flag: a vault's own account is
+	// bound to nothing.
+	OwnedVaults(person ids.AccountNumberHash) []ids.AccountNumberHash
 }
 
 // WithMembership installs the B2B membership seam (myne-md/myne#711). It gates
@@ -197,10 +235,36 @@ func (h *Handler) WithFrozenCheck(fn func(account ids.AccountNumberHash) bool) *
 }
 
 // WithAccountStatus installs the GET /account/status projection (MYND-506). fn is
-// invoked with the AUTHENTICATED account (never a URL/query value).
-func (h *Handler) WithAccountStatus(fn func(account ids.AccountNumberHash) any) *Handler {
+// invoked with the AUTHENTICATED account (never a URL/query value), and with the
+// vaults that account owns when it is a person session (myne-md/myne#911 task 11),
+// so one projection can answer both scopes.
+func (h *Handler) WithAccountStatus(fn func(scope StatusScope) any) *Handler {
 	h.accountStatus = fn
 	return h
+}
+
+// StatusScope is what GET /account/status is asked about.
+//
+// The account always comes from the token; `Vaults` is populated only for a
+// person session that owns at least one vault, and it is the ONE input that makes
+// the difference between "this vault's usage" and "this account's usage". It is a
+// struct rather than a second parameter so a caller cannot pass the vault list
+// while forgetting which account it belongs to.
+type StatusScope struct {
+	// Account is the token-resolved account: a vault's account hash for a vault
+	// session, the person id for a person session (the server cannot tell the two
+	// apart, §3.1a, and does not try).
+	Account ids.AccountNumberHash
+	// Vaults are the vaults `Account` OWNS. Empty for a vault session and for a
+	// person who owns nothing, which is why `Person` is a separate bit rather
+	// than `len(Vaults) > 0`: the projection must be able to say "this is an
+	// account total over zero vaults" rather than "this is a vault".
+	Vaults []ids.AccountNumberHash
+	// Person reports that the caller is a person session (the membership table
+	// has an owner binding naming this account). A person's own namespace holds
+	// no blobs, so a projection that ignored this bit would report zero bytes for
+	// an account with ten full vaults.
+	Person bool
 }
 
 // WithUsedBytes injects the UNIFIED per-account stored-byte total the quota gate
@@ -418,7 +482,17 @@ func (h *Handler) handleAccountStatus(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusServiceUnavailable, "unavailable")
 		return
 	}
-	writeJSON(w, h.accountStatus(sess.Account))
+	// The person arm (myne-md/myne#911 task 11): one usage figure for the account
+	// rather than one per vault. A person session owns vaults; a vault session owns
+	// none, which is what makes this answer a fact rather than a guess. The person
+	// ceiling this reports is NOT enforced (§5.1): the push guard reads the vault's
+	// own ceiling, because a person's namespace holds no blobs to count.
+	scope := StatusScope{Account: sess.Account}
+	if h.membership != nil {
+		scope.Vaults = h.membership.OwnedVaults(sess.Account)
+		scope.Person = len(scope.Vaults) > 0
+	}
+	writeJSON(w, h.accountStatus(scope))
 }
 
 func writeErr(w http.ResponseWriter, status int, code string) {
@@ -458,8 +532,17 @@ func (h *Handler) sessionWithCode(r *http.Request) (auth.Session, string) {
 	// device id, so member cursors share the zero device slot; that only costs a
 	// re-pull and never a wrong read.
 	if h.membership != nil {
-		if vault, _, ok := h.membership.ResolveMember(hexTok); ok {
-			return auth.Session{Account: vault}, ""
+		if b, ok := h.membership.ResolveMember(hexTok); ok {
+			// One revocation covers every vault (myne-md/myne#911 task 9): the
+			// token still resolves (its binding stands), but the device it was
+			// issued to is gone, so every request it makes is refused the same way
+			// a revoked DEVICE token is. `device_revoked` rather than
+			// `unauthenticated` keeps the client from re-enrolling into an account
+			// whose owner removed it.
+			if b.Device != (ids.DeviceID{}) && !h.membership.DeviceActive(ids.AccountNumberHash(b.Person), ids.DeviceID(b.Device)) {
+				return auth.Session{}, "device_revoked"
+			}
+			return auth.Session{Account: b.Vault}, ""
 		}
 	}
 	return auth.Session{}, auth.FailureCode(err)
@@ -469,6 +552,84 @@ func (h *Handler) sessionWithCode(r *http.Request) (auth.Session, string) {
 func (h *Handler) session(r *http.Request) (auth.Session, bool) {
 	sess, code := h.sessionWithCode(r)
 	return sess, code == ""
+}
+
+// requestedNamespace reads the optional `?account=<hex>` selector.
+//
+// Present only on a PERSON session: a member's per-vault token and a vault's own
+// device token already carry their namespace, and neither needs to name one. It
+// is ABSENT on every pre-existing call, which is what keeps the legacy wire byte
+// identical (myne-md/myne#911 task 7).
+//
+// A malformed value is a client error rather than an ignored parameter: silently
+// falling back to the bearer's own namespace would turn a typo into a write to
+// the wrong vault.
+func requestedNamespace(r *http.Request) (ids.AccountNumberHash, bool, bool) {
+	raw := r.URL.Query().Get("account")
+	if raw == "" {
+		return ids.AccountNumberHash{}, false, true
+	}
+	vault, ok := ids.ParseAccountNumberHash(raw)
+	return vault, true, ok
+}
+
+// namespaceRefusalStatus maps a `namespaceSession` code to its HTTP status.
+//
+// The codes are the same closed set the sync surface already speaks; only the
+// status differs, and a refusal that is about AUTHORITY (403) must not be
+// reported as a refusal about IDENTITY (401): a client that reads 401 as "my
+// token died" would re-enrol on a request that was correctly refused.
+func namespaceRefusalStatus(code string) int {
+	switch code {
+	case "forbidden":
+		return http.StatusForbidden
+	case "bad_request":
+		return http.StatusBadRequest
+	default:
+		return http.StatusUnauthorized
+	}
+}
+
+// namespaceSession is sessionWithCode plus the person-selector rule.
+//
+// Three cases, in this order, and the order is the security property:
+//
+//  1. No selector: exactly the pre-task-7 behaviour, so every existing client
+//     and every legacy token (vault device token, per-vault membership token)
+//     is authorized by the same code path it always was.
+//  2. Selector equal to the session's own account: the vault's own device token
+//     naming itself. Authorized without a membership lookup, because a vault
+//     does not need a binding to its own namespace (and could not have one: the
+//     owner binding names a PERSON).
+//  3. Selector different from the session's account: the session is treated as a
+//     PERSON, and the request is authorized only when that person is bound to the
+//     requested vault. An unbound selector is REFUSED, never quietly
+//     reinterpreted as the caller's own namespace; that refusal is the whole
+//     difference between an availability control and a cross-vault read/write.
+func (h *Handler) namespaceSession(r *http.Request) (auth.Session, string) {
+	sess, code := h.sessionWithCode(r)
+	if code != "" {
+		return auth.Session{}, code
+	}
+	vault, hasSelector, ok := requestedNamespace(r)
+	if !hasSelector {
+		return sess, ""
+	}
+	if !ok {
+		return auth.Session{}, "bad_request"
+	}
+	if vault == sess.Account {
+		return sess, ""
+	}
+	if h.membership == nil {
+		return auth.Session{}, "forbidden"
+	}
+	if _, bound := h.membership.BoundTo(vault, sess.Account); !bound {
+		return auth.Session{}, "forbidden"
+	}
+	// The device slot is the person's own: cursors are per (namespace, device),
+	// and a person driving two vaults must not share one cursor across them.
+	return auth.Session{Account: vault, Device: sess.Device}, ""
 }
 
 func parseBlobID(s string) (ids.BlobID, bool) {
@@ -492,13 +653,16 @@ func parseNonce(s string) ([store.ContentNonceLen]byte, bool) {
 }
 
 func (h *Handler) handlePush(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		writeErr(w, http.StatusMethodNotAllowed, "bad_request")
+	// The namespace is the bearer's own unless a person session names
+	// one (`?account=`, task 7); see `namespaceSession`.
+	sess, nsCode := h.namespaceSession(r)
+	if nsCode != "" {
+		writeErr(w, namespaceRefusalStatus(nsCode), nsCode)
 		return
 	}
-	sess, authCode := h.sessionWithCode(r)
-	if authCode != "" {
-		writeErr(w, http.StatusUnauthorized, authCode)
+
+	if r.Method != http.MethodPost {
+		writeErr(w, http.StatusMethodNotAllowed, "bad_request")
 		return
 	}
 	if h.rl != nil && !h.rl.Allow(sess.Account) {
@@ -668,13 +832,16 @@ func (h *Handler) handlePush(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handlePull(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		writeErr(w, http.StatusMethodNotAllowed, "bad_request")
+	// The namespace is the bearer's own unless a person session names
+	// one (`?account=`, task 7); see `namespaceSession`.
+	sess, nsCode := h.namespaceSession(r)
+	if nsCode != "" {
+		writeErr(w, namespaceRefusalStatus(nsCode), nsCode)
 		return
 	}
-	sess, authCode := h.sessionWithCode(r)
-	if authCode != "" {
-		writeErr(w, http.StatusUnauthorized, authCode)
+
+	if r.Method != http.MethodGet {
+		writeErr(w, http.StatusMethodNotAllowed, "bad_request")
 		return
 	}
 	if h.rl != nil && !h.rl.Allow(sess.Account) {
@@ -734,13 +901,16 @@ func (h *Handler) handlePull(w http.ResponseWriter, r *http.Request) {
 // per-account namespaced (the blob is looked up under the session's account).
 // Blind relay — the server never inspects the ciphertext.
 func (h *Handler) handleBlob(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		writeErr(w, http.StatusMethodNotAllowed, "bad_request")
+	// The namespace is the bearer's own unless a person session names
+	// one (`?account=`, task 7); see `namespaceSession`.
+	sess, nsCode := h.namespaceSession(r)
+	if nsCode != "" {
+		writeErr(w, namespaceRefusalStatus(nsCode), nsCode)
 		return
 	}
-	sess, authCode := h.sessionWithCode(r)
-	if authCode != "" {
-		writeErr(w, http.StatusUnauthorized, authCode)
+
+	if r.Method != http.MethodGet {
+		writeErr(w, http.StatusMethodNotAllowed, "bad_request")
 		return
 	}
 	if h.rl != nil && !h.rl.Allow(sess.Account) {
@@ -793,19 +963,18 @@ func (h *Handler) handleBlob(w http.ResponseWriter, r *http.Request) {
 // id is reported by OMISSION FROM THE PAYLOAD plus an explicit code, never as an
 // entry with empty bytes.
 func (h *Handler) handleBlobs(w http.ResponseWriter, r *http.Request) {
+	// The namespace is the bearer's own unless a person session names
+	// one (`?account=`, task 7); see `namespaceSession`.
+	sess, nsCode := h.namespaceSession(r)
+	if nsCode != "" {
+		writeErr(w, namespaceRefusalStatus(nsCode), nsCode)
+		return
+	}
+
 	if r.Method != http.MethodPost {
 		writeErr(w, http.StatusMethodNotAllowed, "bad_request")
 		return
 	}
-	sess, authCode := h.sessionWithCode(r)
-	if authCode != "" {
-		writeErr(w, http.StatusUnauthorized, authCode)
-		return
-	}
-	// Charge one token BEFORE the body is read, so an unparseable request costs
-	// exactly what it costs on every other route. The rest of the batch's cost
-	// depends on len(ids) and can only be charged after decoding — but it is
-	// charged before any store work, so a large batch can never run free.
 	if h.rl != nil && !h.rl.AllowN(sess.Account, 1) {
 		writeErr(w, http.StatusTooManyRequests, "rate")
 		return
@@ -901,14 +1070,50 @@ const MaxVaultMetaSize = 64 * 1024
 //     "useless without the password", which inverts the property: they are
 //     useless only for as long as the password holds. What is served is the
 //     complete offline password-cracking target — Argon2id salt, cost
-//     parameters, and both wrapped root_key copies — so anyone holding an
-//     account number can obtain it from anywhere, with no device. That is
+//     parameters, and the wrapped root_key — so anyone holding an account
+//     number can obtain it from anywhere, with no device. Since `NTV7` there is
+//     one password wrap rather than two plus a person envelope, which is a
+//     stronger handle (a random 128-bit vault id rather than 95 derived bits)
+//     and not a smaller surface: the password wrap is still the target. That is
 //     accepted, and it is recorded where a reader will look for it:
 //     docs/threat-model.md §7 (technical) and §5 (plain language).
 func (h *Handler) handleMeta(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodPut:
-		account, ok := h.vaultMetaWriteAccount(w, r)
+		// A person session may name the vault it is publishing (`?account=`,
+		// myne-md/myne#911 task 7); without the parameter this is exactly the
+		// pre-task behaviour, selector-less and byte-identical on the wire.
+		//
+		// The body is read BEFORE the owner bind runs, because the bind and the
+		// frame have to agree: `vaultMetaPublishAccount` records the owner as this
+		// person on first write, and `BindOwner` cannot be unwound, so a frame that
+		// names a different namespace must be refused before any binding exists.
+		// The read is capped at `MaxVaultMetaSize` (64 KiB), so this is not an
+		// unbounded body read ahead of authorization.
+		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, MaxVaultMetaSize))
+		if err != nil {
+			writeErr(w, http.StatusRequestEntityTooLarge, "too_large")
+			return
+		}
+		var account ids.AccountNumberHash
+		var ok bool
+		vault, hasSelector, parsed := requestedNamespace(r)
+		if hasSelector {
+			if !parsed {
+				writeErr(w, http.StatusBadRequest, "bad_request")
+				return
+			}
+			// §9.3's namespace field is the 16 bytes at offset 6, and it is exactly
+			// what the selector names in every generation (the account hash in the
+			// legacy ones, the random vault id in `NTV7`).
+			if len(body) < 22 || !bytes.Equal(body[6:22], vault[:]) {
+				writeErr(w, http.StatusBadRequest, "bad_request")
+				return
+			}
+			account, ok = h.vaultMetaPublishAccount(w, r, vault)
+		} else {
+			account, ok = h.vaultMetaWriteAccount(w, r)
+		}
 		if !ok {
 			return
 		}
@@ -924,11 +1129,6 @@ func (h *Handler) handleMeta(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusForbidden, "frozen")
 			return
 		}
-		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, MaxVaultMetaSize))
-		if err != nil {
-			writeErr(w, http.StatusRequestEntityTooLarge, "too_large")
-			return
-		}
 		// The 200 is what the device acts on: it clears the dirty marker and pins
 		// this meta as its baseline. Answering ok for a meta the store never
 		// wrote does not just lose the upload — the next cycle reads the stale
@@ -941,13 +1141,32 @@ func (h *Handler) handleMeta(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]bool{"ok": true})
 
 	case http.MethodGet:
-		// Authed fetch (F1 Faz B): an enrolled device polls its OWN meta each sync
-		// cycle to pick up a password-side change made on another device. A valid
-		// session serves the session's account directly — no ?account= query, and
-		// NOT behind the pre-auth limiter (it is the enrolled device's own data,
-		// rate-limited like the other sync routes). Falls through to the pre-auth
-		// bootstrap path only when there is no session.
-		if sess, ok := h.session(r); ok {
+		// Authed fetch (F1 Faz B): an enrolled device polls its meta each sync
+		// cycle to pick up a password-side change made on another device. A vault
+		// device token asks for its own namespace; a PERSON session names the
+		// vault with `?account=` (myne-md/myne#911 task 7), which is why this arm
+		// goes through `namespaceSession` and not `session`.
+		//
+		// The selector must be resolved HERE and not ignored: a person session's
+		// own account holds no `vault.meta` (the person namespace carries no
+		// blobs), so serving `sess.Account` would answer `404` on every poll for
+		// the birth generation, leaving the meta phase's pull half dead and
+		// letting a device with a dirty local frame push a stale one over the
+		// server's. That is a silent credential rollback, and `server-protocol.md`
+		// §3.1a forbids the fallback in words ("never a silent fall back to the
+		// caller's own namespace").
+		//
+		// NOT behind the pre-auth limiter: this is an authenticated read of data
+		// the caller is bound to, rate-limited like the other sync routes.
+		if _, hasSession := h.session(r); hasSession {
+			sess, nsCode := h.namespaceSession(r)
+			if nsCode != "" {
+				// A refused selector is REFUSED, never retried as a pre-auth
+				// fetch: `403` says "not yours" and `400` says "malformed", and
+				// neither may become "here is whatever the query names".
+				writeErr(w, namespaceRefusalStatus(nsCode), nsCode)
+				return
+			}
 			if h.rl != nil && !h.rl.Allow(sess.Account) {
 				writeErr(w, http.StatusTooManyRequests, "rate")
 				return

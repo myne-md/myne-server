@@ -17,6 +17,7 @@ import (
 
 	"github.com/myne-md/myne-server/internal/auth"
 	"github.com/myne-md/myne-server/internal/ids"
+	"github.com/myne-md/myne-server/internal/membership"
 )
 
 type fakeAuth struct {
@@ -34,11 +35,11 @@ type fakeMembership struct {
 	m map[string]ids.AccountNumberHash
 }
 
-func (f fakeMembership) ResolveMember(bearerHex string) (ids.AccountNumberHash, bool, bool) {
+func (f fakeMembership) ResolveMember(bearerHex string) (membership.Binding, bool) {
 	if v, ok := f.m[bearerHex]; ok {
-		return v, false, true
+		return membership.Binding{Vault: v, Role: membership.RoleMember}, true
 	}
-	return ids.AccountNumberHash{}, false, false
+	return membership.Binding{}, false
 }
 
 type allowAll struct{}

@@ -228,7 +228,9 @@ func (h *Handler) handleClaimInvite(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "internal")
 		return
 	}
-	token, err := h.memberTks.Issue(person, inv.Vault)
+	// The claiming device is recorded on the token, so one device revocation
+	// retires the shared vaults it joined as well (myne-md/myne#911 task 9).
+	token, err := h.memberTks.Issue(person, inv.Vault, sess.Device)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "internal")
 		return

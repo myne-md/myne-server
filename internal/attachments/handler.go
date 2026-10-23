@@ -50,6 +50,60 @@ type Handler struct {
 	// on the sync route: freezing must not hold data hostage.
 	// nil = no freeze wired.
 	frozen func(account ids.AccountNumberHash) bool
+	// bound answers whether `person` holds a membership binding to `vault`
+	// (myne-md/myne#911 task 7's `MembershipAuth.BoundTo` seam). It is what makes
+	// `?account=` safe on these three routes: without it the parameter would let
+	// any session read or write any vault's attachment bytes by guessing a
+	// 32-byte id.
+	//
+	// nil = the selector is refused rather than honoured unverified.
+	bound func(vault, person ids.AccountNumberHash) (bool, bool)
+}
+
+// WithVaultSelector lets a PERSON session name the vault its attachment bytes
+// belong to, with the same `?account=` parameter the sync routes take.
+//
+// It exists because a person session carries no vault: without it a person-born
+// vault's attachments landed in the PERSON's own namespace on upload, where no
+// other device could ever fetch them (each request is scoped to the account that
+// stored the bytes), and the vault's own namespace stayed empty. A session that
+// is already a vault account keeps the old behaviour exactly: no parameter, no
+// lookup.
+func (h *Handler) WithVaultSelector(
+	bound func(vault, person ids.AccountNumberHash) (bool, bool),
+) *Handler {
+	h.bound = bound
+	return h
+}
+
+// target resolves WHICH namespace this request reads or writes.
+//
+// No `?account=`: the session's own account, byte for byte the pre-selector
+// behaviour. A parameter: the membership table decides, and an unbound caller is
+// `403 forbidden` before any store call, never a fallback to its own namespace
+// (which would turn a typo into a write to the wrong vault) and never a `404`
+// (which would let an unbound caller probe which vaults exist).
+// The second return is the HTTP status to refuse with, or 0 for "this is the
+// namespace". A malformed value is 400 and an unbound one is 403, the same split
+// the sync routes make, because the two failures have different remedies.
+func (h *Handler) target(r *http.Request, sess auth.Session) (ids.AccountNumberHash, int) {
+	q := r.URL.Query().Get("account")
+	if q == "" {
+		return sess.Account, 0
+	}
+	b, err := hex.DecodeString(q)
+	if err != nil || len(b) != len(ids.AccountNumberHash{}) {
+		return ids.AccountNumberHash{}, http.StatusBadRequest
+	}
+	var vault ids.AccountNumberHash
+	copy(vault[:], b)
+	if h.bound == nil {
+		return ids.AccountNumberHash{}, http.StatusForbidden
+	}
+	if bound, _ := h.bound(vault, sess.Account); !bound {
+		return ids.AccountNumberHash{}, http.StatusForbidden
+	}
+	return vault, 0
 }
 
 // WithFrozenCheck gates the WRITE route on the operator freeze (#9). Reads are
@@ -157,6 +211,11 @@ func (h *Handler) handleHead(w http.ResponseWriter, r *http.Request) {
 		writeAuthErr(w, authCode)
 		return
 	}
+	acct, refuse := h.target(r, sess)
+	if refuse != 0 {
+		w.WriteHeader(refuse)
+		return
+	}
 	if h.rl != nil && !h.rl.Allow(sess.Account) {
 		w.WriteHeader(http.StatusTooManyRequests)
 		return
@@ -166,13 +225,13 @@ func (h *Handler) handleHead(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-	n, known := h.store.UploadedLen(sess.Account, id)
+	n, known := h.store.UploadedLen(acct, id)
 	if !known {
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
 	w.Header().Set("X-Uploaded-Length", strconv.Itoa(n))
-	if h.store.Has(sess.Account, id) {
+	if h.store.Has(acct, id) {
 		w.Header().Set("X-Complete", "1")
 	}
 	w.WriteHeader(http.StatusOK)
@@ -202,6 +261,11 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request) {
 		_, _ = fmt.Fprint(w, `{"error_code":"frozen"}`)
 		return
 	}
+	acct, refuse := h.target(r, sess)
+	if refuse != 0 {
+		w.WriteHeader(refuse)
+		return
+	}
 	if h.rl != nil && !h.rl.Allow(sess.Account) {
 		w.WriteHeader(http.StatusTooManyRequests)
 		return
@@ -223,10 +287,10 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request) {
 	if h.qg != nil && offset == 0 {
 		var current uint64
 		if h.used != nil {
-			current = h.used(sess.Account)
+			current = h.used(acct)
 		}
-		current += h.store.AccountBytes(sess.Account)
-		if h.qg.WouldExceedTotalForAccount(sess.Account, current, uint64(total)) {
+		current += h.store.AccountBytes(acct)
+		if h.qg.WouldExceedTotalForAccount(acct, current, uint64(total)) {
 			w.WriteHeader(http.StatusInsufficientStorage)
 			return
 		}
@@ -236,7 +300,7 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-	werr := h.store.WriteAt(sess.Account, id, offset, total, chunk)
+	werr := h.store.WriteAt(acct, id, offset, total, chunk)
 	switch werr {
 	case nil:
 		// ok
@@ -253,7 +317,7 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	n, _ := h.store.UploadedLen(sess.Account, id)
+	n, _ := h.store.UploadedLen(acct, id)
 	if h.onStored != nil && n == total && offset+len(chunk) == total {
 		// The upload just completed with this chunk — one aggregate observation.
 		h.onStored(total)
@@ -271,6 +335,11 @@ func (h *Handler) handleGet(w http.ResponseWriter, r *http.Request) {
 		writeAuthErr(w, authCode)
 		return
 	}
+	acct, refuse := h.target(r, sess)
+	if refuse != 0 {
+		w.WriteHeader(refuse)
+		return
+	}
 	if h.rl != nil && !h.rl.Allow(sess.Account) {
 		w.WriteHeader(http.StatusTooManyRequests)
 		return
@@ -285,7 +354,7 @@ func (h *Handler) handleGet(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-	chunk, total, err := h.store.ReadRange(sess.Account, id, start, length)
+	chunk, total, err := h.store.ReadRange(acct, id, start, length)
 	if err == ErrNotFound {
 		w.WriteHeader(http.StatusNotFound)
 		return

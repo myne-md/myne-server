@@ -7,6 +7,7 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"time"
 
@@ -31,6 +33,7 @@ import (
 	"github.com/myne-md/myne-server/internal/console"
 	"github.com/myne-md/myne-server/internal/gcquota"
 	"github.com/myne-md/myne-server/internal/ids"
+	"github.com/myne-md/myne-server/internal/membership"
 	"github.com/myne-md/myne-server/internal/panel"
 	"github.com/myne-md/myne-server/internal/poke"
 	"github.com/myne-md/myne-server/internal/store"
@@ -357,19 +360,9 @@ func runListener(ctx context.Context, ln net.Listener) error {
 	// GET /account/status projection (MYND-506): the caller's own stored bytes +
 	// device count + frozen + EFFECTIVE ceilings. Same sources as the admin API,
 	// scoped to one (token-resolved) account.
-	accountStatus := func(a ids.AccountNumberHash) any {
-		v := accountStatusView{
-			StoredBytes: usedBytes(a),
-			DeviceCount: reg.CountActiveDevices(a),
-			QuotaBytes:  cfg.Policy.QuotaCeilingBytes,
-			MaxDevices:  cfg.MaxDevicesPerAccount,
-		}
-		if acctStore != nil {
-			v.Frozen = acctStore.Frozen(a)
-			v.QuotaBytes = acctStore.EffectiveQuota(a, cfg.Policy.QuotaCeilingBytes)
-			v.MaxDevices = acctStore.EffectiveMaxDevices(a, cfg.MaxDevicesPerAccount)
-		}
-		return v
+	accountStatus := func(scope syncapi.StatusScope) any {
+		return accountStatusFor(scope, usedBytes, reg.CountActiveDevices, acctStore,
+			cfg.Policy.QuotaCeilingBytes, cfg.MaxDevicesPerAccount)
 	}
 	srv := newHTTPServer(NewServer(blobStore, tokens, authHandler, rl, qg, ready, metrics, preAuthMeta, attachStore, activityTouch, acctStore, accountStatus, cfg.AllowedOrigins, awarenessRL, int(cfg.AwarenessMaxSubscribers), WithRetirementRegistry(retirements)))
 
@@ -467,17 +460,81 @@ func runListener(ctx context.Context, ln net.Listener) error {
 	// accounts store (nil on the mem backend, so reads report defaults). No wall-clock
 	// / activity / time-series is exposed (MYND-440 aggregate-only).
 	listAccounts := func() []ids.AccountNumberHash {
+		seen := make(map[ids.AccountNumberHash]struct{})
+		var out []ids.AccountNumberHash
+		add := func(a ids.AccountNumberHash) {
+			if _, dup := seen[a]; dup {
+				return
+			}
+			seen[a] = struct{}{}
+			out = append(out, a)
+		}
 		if l, ok := blobStore.(interface {
 			ListAccounts() []ids.AccountNumberHash
 		}); ok {
-			return l.ListAccounts()
+			for _, a := range l.ListAccounts() {
+				add(a)
+			}
 		}
-		return nil
+		// A person account holds no blobs of its own, so the store above never
+		// lists one. Without this union an operator cannot target a person account
+		// for erasure at all (myne-md/myne#911).
+		if m := authHandler.Membership(); m != nil {
+			for _, p := range m.Persons() {
+				add(ids.AccountNumberHash(p))
+			}
+		}
+		sort.Slice(out, func(i, j int) bool {
+			return bytes.Compare(out[i][:], out[j][:]) < 0
+		})
+		return out
 	}
-	// Irreversible account delete (MYND-506), remove-then-forget: blob + attachment
-	// data first, then auth + policy, so no half-deleted account is served if a later
-	// step fails. This is the write side and is never handed to the projection.
+	// Irreversible account delete (MYND-506), remove-then-forget: everything the
+	// account OWNS first, then the account row itself, so no half-deleted account
+	// is served if a later step fails. This is the write side and is never handed
+	// to the projection.
+	//
+	// Person accounts (myne-md/myne#911) own more than one namespace, which the
+	// pre-B2B shape could not express: a person namespace holds no blobs, and each
+	// vault they own is a separate namespace reached only through the membership
+	// table. Erasing "the account" therefore has to enumerate what that account
+	// owns, or the vaults, the bindings and the sealed profiles all survive a
+	// deletion the published privacy text sells as complete. The person id is
+	// derived from the recovery phrase, so a surviving binding is worse than a
+	// leftover row: re-registering recreates the SAME account hash and `BoundTo`
+	// answers owner again, resurrecting access to vaults the user asked to erase.
+	//
+	// A vault this person owns ALONE goes with the account. A vault they share
+	// keeps its bytes and loses only this binding: the other members' data is not
+	// this person's to destroy, and the vault is left owner-less rather than
+	// silently deleted. That trade is stated in `docs/spec/server-protocol.md`
+	// §3.1a ("Account erasure").
 	deleteAccount := func(a ids.AccountNumberHash) error {
+		person := membership.PersonID(a)
+		if m := authHandler.Membership(); m != nil {
+			for _, b := range m.Vaults(person) {
+				if b.Role == membership.RoleOwner && len(m.Members(b.Vault)) == 1 {
+					if err := blobStore.DeleteAccount(b.Vault); err != nil {
+						return err
+					}
+					attachStore.DeleteAccount(b.Vault)
+					if acctStore != nil {
+						acctStore.Delete(b.Vault)
+					}
+				}
+				// The sealed per-person profile is keyed per (vault, person) and
+				// lives in the vault's namespace, so a shared vault needs it
+				// removed explicitly.
+				if ps := authHandler.Profiles(); ps != nil {
+					ps.DeleteByPerson(b.Vault, b.Person)
+				}
+				// Removing the binding is what makes the token inert; Revoke also
+				// drops the row, so a restart cannot resurrect a credential for an
+				// account that no longer exists.
+				authHandler.MemberTokens().Revoke(b.Vault, b.Person)
+				_ = m.Remove(b.Vault, b.Person)
+			}
+		}
 		if err := blobStore.DeleteAccount(a); err != nil {
 			return err
 		}
@@ -610,9 +667,80 @@ type accountStatusView struct {
 	Frozen      bool   `json:"frozen"`
 	QuotaBytes  uint64 `json:"quota_bytes"`
 	MaxDevices  uint64 `json:"max_devices"`
+	// Person reports that `stored_bytes` is an ACCOUNT total over `vault_count`
+	// owned vaults rather than one vault's own figure (myne-md/myne#911 task 11).
+	// A client that ignores this reads the aggregate as a vault figure, so it is
+	// part of the contract rather than decoration. Absent on a vault session, so
+	// an older client's rendering is unchanged there.
+	Person bool `json:"person,omitempty"`
+	// VaultCount is how many owned vaults the account total covers; 0 for a vault
+	// session. Reported so the client can say what the figure spans instead of
+	// implying it is one vault.
+	VaultCount int `json:"vault_count,omitempty"`
 }
 
-func NewServer(s store.BlobStore, tokens *auth.TokenStore, authHandler *authapi.Handler, rl syncapi.RateLimiter, qg *gcquota.QuotaGuard, ready *Readiness, metrics *Metrics, preAuthMeta syncapi.PreAuthLimiter, attachStore attachments.Backend, activityTouch func(ids.AccountNumberHash, ids.DeviceID), acctStore *accounts.Store, accountStatus func(ids.AccountNumberHash) any, allowedOrigins string, awarenessRL awareness.RateLimiter, awarenessMaxSubs int, options ...Option) http.Handler {
+// aggregateStoredBytes is a person account's usage: the sum of the unified byte
+// totals of the vaults it owns (myne-md/myne#911 task 11).
+//
+// Named and extracted rather than inlined in the projection so the one arithmetic
+// claim this feature makes ("quota sums across vaults") is testable without
+// standing up a server. An empty list is zero, which is the honest answer for a
+// person who owns nothing: their own namespace holds no blobs, so there is
+// nothing else it could be.
+func aggregateStoredBytes(usedBytes func(ids.AccountNumberHash) uint64, vaults []ids.AccountNumberHash) uint64 {
+	var total uint64
+	for _, vault := range vaults {
+		total += usedBytes(vault)
+	}
+	return total
+}
+
+// accountStatusFor is the whole GET /account/status projection: the caller's own
+// live stats plus the EFFECTIVE ceilings and frozen state, for either scope.
+//
+// A named function rather than the inline closure it used to be, because the two
+// claims this feature adds are about which key the figures come from: a person
+// scope sums the vaults it OWNS and resolves the ceiling from the PERSON's policy
+// row, a vault scope does neither. A closure inside `NewServer` could only be
+// tested through a full HTTP round trip, which would measure the wiring and leave
+// the choice of key unmeasured.
+func accountStatusFor(
+	scope syncapi.StatusScope,
+	usedBytes func(ids.AccountNumberHash) uint64,
+	deviceCount func(ids.AccountNumberHash) uint64,
+	acctStore *accounts.Store,
+	quotaBase uint64,
+	maxDevicesBase uint64,
+) accountStatusView {
+	v := accountStatusView{
+		DeviceCount: deviceCount(scope.Account),
+		QuotaBytes:  quotaBase,
+		MaxDevices:  maxDevicesBase,
+	}
+	if scope.Person {
+		// ONE figure for the account (myne-md/myne#911 task 11): the sum of the
+		// vaults this person owns. The person's own namespace holds no blobs, so
+		// reading it here would report zero for an account with ten full vaults.
+		//
+		// The ceiling stays REPORTED, never enforced: the push guard resolves a
+		// vault's own ceiling, because that is the namespace whose counter it reads
+		// (server-protocol §5.1). A client must therefore not render a meter
+		// against this figure, which is why `person` crosses the wire.
+		v.StoredBytes = aggregateStoredBytes(usedBytes, scope.Vaults)
+		v.Person = true
+		v.VaultCount = len(scope.Vaults)
+	} else {
+		v.StoredBytes = usedBytes(scope.Account)
+	}
+	if acctStore != nil {
+		v.Frozen = acctStore.Frozen(scope.Account)
+		v.QuotaBytes = acctStore.EffectiveQuota(scope.Account, quotaBase)
+		v.MaxDevices = acctStore.EffectiveMaxDevices(scope.Account, maxDevicesBase)
+	}
+	return v
+}
+
+func NewServer(s store.BlobStore, tokens *auth.TokenStore, authHandler *authapi.Handler, rl syncapi.RateLimiter, qg *gcquota.QuotaGuard, ready *Readiness, metrics *Metrics, preAuthMeta syncapi.PreAuthLimiter, attachStore attachments.Backend, activityTouch func(ids.AccountNumberHash, ids.DeviceID), acctStore *accounts.Store, accountStatus func(syncapi.StatusScope) any, allowedOrigins string, awarenessRL awareness.RateLimiter, awarenessMaxSubs int, options ...Option) http.Handler {
 	opts := serverOptions{}
 	for _, o := range options {
 		o(&opts)
@@ -698,6 +826,14 @@ func NewServer(s store.BlobStore, tokens *auth.TokenStore, authHandler *authapi.
 	// (no separate, bypassable budget), plus a per-vault id cap (OOM bound).
 	attachMux := attachments.New(attachStore, tokens).
 		WithPolicy(rl, qg, func(a ids.AccountNumberHash) uint64 { return s.QuotaBytes(a) })
+	// A person session carries no vault, so it names one with `?account=` on
+	// these routes exactly as it does on `/sync/*` (myne-md/myne#911 checklist).
+	// The membership table decides; the handler refuses an unbound caller before
+	// it touches the store. Legacy vault sessions pass no parameter and are
+	// unaffected, byte for byte.
+	if authHandler != nil {
+		attachMux = attachMux.WithVaultSelector(authHandler.BoundTo)
+	}
 	if metrics != nil {
 		attachMux = attachMux.WithMetrics(metrics.ObserveAttachmentStored)
 	}

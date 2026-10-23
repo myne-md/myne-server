@@ -15,7 +15,9 @@
 package membership
 
 import (
+	"bytes"
 	"errors"
+	"sort"
 	"sync"
 
 	"github.com/myne-md/myne-server/internal/ids"
@@ -28,6 +30,9 @@ type PersonID [16]byte
 
 // VaultID is a vault's public id: the vault `account_number_hash`.
 type VaultID = ids.AccountNumberHash
+
+// DeviceID is one device of a person's account.
+type DeviceID = ids.DeviceID
 
 // Role is a binding's standing in a vault.
 type Role uint8
@@ -44,6 +49,16 @@ type Binding struct {
 	Person PersonID
 	Vault  VaultID
 	Role   Role
+	// Device is the device the per-vault token was ISSUED to, when the issuing
+	// route knows it (myne-md/myne#911 task 9). It is not part of the access
+	// decision: it exists so revoking a device also stops the shared vaults that
+	// device joined, through one check on the device registry.
+	//
+	// The zero value means UNATTRIBUTABLE, and it is treated as such rather than
+	// guessed at: a token persisted before this field existed cannot be tied to a
+	// device, so a device revocation leaves it working rather than revoking
+	// somebody else's. Recorded in `design notes/` by the person-account work.
+	Device DeviceID
 }
 
 // Table errors.
@@ -185,6 +200,25 @@ func (t *Table) Vaults(person PersonID) []Binding {
 		out = append(out, b)
 	}
 	sortBindings(out)
+	return out
+}
+
+// Persons returns every person that holds at least one binding, sorted by id.
+//
+// It exists so the operator console can NAME a person account at all: a person
+// namespace carries no blobs, so `BlobStore.ListAccounts` never lists one, and an
+// erasure the console cannot target is an erasure only the database can perform
+// (myne-md/myne#911, account erasure).
+func (t *Table) Persons() []PersonID {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	out := make([]PersonID, 0, len(t.byPerson))
+	for p := range t.byPerson {
+		out = append(out, p)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return bytes.Compare(out[i][:], out[j][:]) < 0
+	})
 	return out
 }
 

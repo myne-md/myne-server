@@ -18,6 +18,11 @@ type PersistedToken struct {
 	Person []byte `json:"person"`
 	Vault  []byte `json:"vault"`
 	Role   uint8  `json:"role"`
+	// Device is the device the token was issued to, or absent on a row written
+	// before myne-md/myne#911 task 9. An absent device loads as the zero value,
+	// which the session path treats as unattributable: the token keeps working and
+	// a device revocation cannot guess it away.
+	Device []byte `json:"device,omitempty"`
 }
 
 // ErrBadPersistedToken is returned for a persisted token row whose lengths do not
@@ -28,6 +33,7 @@ var ErrBadPersistedToken = errors.New("membership: persisted token row is not a 
 const (
 	personIDLen = 16
 	vaultIDLen  = 16
+	deviceIDLen = 16
 )
 
 // SetOnChange installs the persistence hook (see Table.SetOnChange). Call once,
@@ -57,12 +63,16 @@ func (s *TokenStore) Snapshot() []PersistedToken {
 			// programming error and the row is encoded from what we have.
 			continue
 		}
-		out = append(out, PersistedToken{
+		row := PersistedToken{
 			Token:  raw,
 			Person: b.Person[:],
 			Vault:  b.Vault[:],
 			Role:   uint8(b.Role),
-		})
+		}
+		if b.Device != (DeviceID{}) {
+			row.Device = b.Device[:]
+		}
+		out = append(out, row)
 	}
 	sort.Slice(out, func(i, j int) bool { return string(out[i].Token) < string(out[j].Token) })
 	return out
@@ -82,11 +92,21 @@ func (s *TokenStore) Load(rows []PersistedToken) error {
 		if Role(r.Role) != RoleOwner && Role(r.Role) != RoleMember {
 			return ErrBadPersistedToken
 		}
+		if len(r.Device) != 0 && len(r.Device) != deviceIDLen {
+			return ErrBadPersistedToken
+		}
 		var person PersonID
 		copy(person[:], r.Person)
 		var vault VaultID
 		copy(vault[:], r.Vault)
-		byToken[hex.EncodeToString(r.Token)] = Binding{Person: person, Vault: vault, Role: Role(r.Role)}
+		var device DeviceID
+		copy(device[:], r.Device)
+		byToken[hex.EncodeToString(r.Token)] = Binding{
+			Person: person,
+			Vault:  vault,
+			Role:   Role(r.Role),
+			Device: device,
+		}
 	}
 	s.mu.Lock()
 	s.byToken = byToken

@@ -65,16 +65,56 @@ func (h *Handler) MemberTokens() *membership.TokenStore { return h.memberTks }
 // per-vault bearer token to its vault and whether it is the owner's. ok=false
 // for anything that is not a membership token (an /auth device token, an
 // unknown string), which is how the sync surface distinguishes the two.
-func (h *Handler) ResolveMember(bearerHex string) (ids.AccountNumberHash, bool, bool) {
+func (h *Handler) ResolveMember(bearerHex string) (membership.Binding, bool) {
 	raw, err := hex.DecodeString(bearerHex)
 	if err != nil {
-		return ids.AccountNumberHash{}, false, false
+		return membership.Binding{}, false
 	}
 	b, err := h.memberTks.Resolve(ids.DeviceToken(raw))
 	if err != nil {
-		return ids.AccountNumberHash{}, false, false
+		return membership.Binding{}, false
 	}
-	return b.Vault, b.Role == membership.RoleOwner, true
+	return b, true
+}
+
+// DeviceActive implements the sync surface's revocation seam (myne-md/myne#911
+// task 9): a device that the owner removed stops authenticating EVERY credential
+// it holds, including the per-vault tokens it joined shared vaults with.
+//
+// Read from the device registry, which is already the authority every
+// `AuthenticateSession` call consults, so a device revocation and a membership
+// revocation cannot disagree. An unknown device, an unapproved one (still
+// pending) and a retired one all answer false; `device_revoked` is the code the
+// caller returns, which is the honest one for all three from the vault's side.
+func (h *Handler) DeviceActive(person ids.AccountNumberHash, device ids.DeviceID) bool {
+	rec, ok := h.reg.Get(person, device)
+	if !ok {
+		return false
+	}
+	return rec.Approved && !rec.Retired
+}
+
+// BoundTo implements the sync surface's person-selector seam (myne-md/myne#911
+// task 7): it answers whether `person` holds a binding to `vault`.
+//
+// `person` arrives as an account id because the server cannot tell a person id
+// from a vault id, and does not try. The table is keyed by person, so an account
+// that is actually a vault id simply has no binding and the answer is false.
+func (h *Handler) BoundTo(vault, person ids.AccountNumberHash) (bool, bool) {
+	if h.members == nil {
+		return false, false
+	}
+	role, ok := h.members.Role(vault, membership.PersonID(person))
+	return role == membership.RoleOwner, ok
+}
+
+// BindOwner implements the publish half of the same seam: a person publishing a
+// vault it owns binds itself as the owner (owner-at-first-write, §3.1a).
+func (h *Handler) BindOwner(vault, person ids.AccountNumberHash) error {
+	if h.members == nil {
+		return membership.ErrNotBound
+	}
+	return h.members.BindOwner(vault, membership.PersonID(person))
 }
 
 // HasOwner reports whether a vault has an owner membership binding. It is what
@@ -84,6 +124,27 @@ func (h *Handler) ResolveMember(bearerHex string) (ids.AccountNumberHash, bool, 
 func (h *Handler) HasOwner(vault ids.AccountNumberHash) bool {
 	_, ok := h.members.OwnerOf(vault)
 	return ok
+}
+
+// OwnedVaults implements the status-aggregate half of the membership seam
+// (myne-md/myne#911 task 11): the vaults `person` OWNS, and nothing else.
+//
+// Filtered to `RoleOwner` on purpose. `Table.Vaults` returns every binding,
+// including the vaults this person merely joined, and a member's bytes are the
+// owner's to free: reporting them as the member's usage would show a figure the
+// member cannot act on and that the owner's own account already counts.
+func (h *Handler) OwnedVaults(person ids.AccountNumberHash) []ids.AccountNumberHash {
+	if h.members == nil {
+		return nil
+	}
+	bindings := h.members.Vaults(membership.PersonID(person))
+	var out []ids.AccountNumberHash
+	for _, b := range bindings {
+		if b.Role == membership.RoleOwner {
+			out = append(out, b.Vault)
+		}
+	}
+	return out
 }
 
 // parsePersonID decodes a 16-byte person_id_hash from lowercase hex. It is the
@@ -207,7 +268,10 @@ func (h *Handler) handleBindMember(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusBadRequest, "bad_request")
 			return
 		}
-		h.writeIssuedBinding(w, person, vault, role)
+		// Attributed to the device that OWNS the owner token that asked, which is
+		// this physical device: the owner token was issued to a device, and the
+		// member token it mints lives and dies with it (myne-md/myne#911 task 9).
+		h.writeIssuedBinding(w, person, vault, role, ids.DeviceID(b.Device))
 		return
 	}
 
@@ -233,11 +297,18 @@ func (h *Handler) handleBindMember(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "bad_request")
 		return
 	}
-	h.writeIssuedBinding(w, person, vault, role)
+	h.writeIssuedBinding(w, person, vault, role, sess.Device)
 }
 
-func (h *Handler) writeIssuedBinding(w http.ResponseWriter, person membership.PersonID, vault membership.VaultID, role membership.Role) {
-	token, err := h.memberTks.Issue(person, vault)
+// writeIssuedBinding mints the per-vault token for a binding and returns it.
+//
+// `device` is the device that asked for it, and it is recorded on the token so
+// revoking that device also ends its access to every shared vault it joined
+// (myne-md/myne#911 task 9). A device revocation is a registry change, and the
+// token names its device, so no separate sweep is needed: the session check asks
+// the registry on every request.
+func (h *Handler) writeIssuedBinding(w http.ResponseWriter, person membership.PersonID, vault membership.VaultID, role membership.Role, device ids.DeviceID) {
+	token, err := h.memberTks.Issue(person, vault, device)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "internal")
 		return

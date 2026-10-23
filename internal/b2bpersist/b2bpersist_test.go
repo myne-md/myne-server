@@ -77,7 +77,7 @@ func TestB2BStateSurvivesARestart(t *testing.T) {
 	if err := s1.Membership.BindMember(v, member); err != nil {
 		t.Fatalf("bind member: %v", err)
 	}
-	tok, err := s1.MemberTokens.Issue(member, v)
+	tok, err := s1.MemberTokens.Issue(member, v, ids.DeviceID{0x0a})
 	if err != nil {
 		t.Fatalf("issue: %v", err)
 	}

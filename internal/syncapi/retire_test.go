@@ -14,6 +14,7 @@ import (
 
 	"github.com/myne-md/myne-server/internal/auth"
 	"github.com/myne-md/myne-server/internal/ids"
+	"github.com/myne-md/myne-server/internal/membership"
 	"github.com/myne-md/myne-server/internal/store"
 )
 
@@ -24,20 +25,69 @@ type fakeMembership struct {
 	memberBearer string
 	vault        ids.AccountNumberHash
 	owners       map[ids.AccountNumberHash]bool
+	// bindings is the person→vault side: vault → (person → role). Absent means
+	// the person in the request holds no binding, which is the refusal case.
+	bindings map[ids.AccountNumberHash]map[ids.AccountNumberHash]string
+	// device is what ResolveMember reports as the issuing device, and
+	// deviceRevoked is the registry answer for it (task 9).
+	device        ids.DeviceID
+	deviceRevoked bool
 }
 
-func (f *fakeMembership) ResolveMember(bearerHex string) (ids.AccountNumberHash, bool, bool) {
+func (f *fakeMembership) ResolveMember(bearerHex string) (membership.Binding, bool) {
+	// `device` is the device the token was issued to. Tests that care about
+	// device revocation set it; a zero device is unattributable and never refused
+	// (myne-md/myne#911 task 9).
 	switch bearerHex {
 	case f.ownerBearer:
-		return f.vault, true, true
+		return membership.Binding{Vault: f.vault, Role: membership.RoleOwner, Device: f.device}, true
 	case f.memberBearer:
-		return f.vault, false, true
+		return membership.Binding{Vault: f.vault, Role: membership.RoleMember, Device: f.device}, true
 	default:
-		return ids.AccountNumberHash{}, false, false
+		return membership.Binding{}, false
 	}
 }
 
+// DeviceActive reports the fake's one device as active unless a test retired it.
+// The zero device is always active, matching the real implementation's
+// "unattributable tokens are not refused" rule.
+func (f *fakeMembership) DeviceActive(_ ids.AccountNumberHash, device ids.DeviceID) bool {
+	if device == (ids.DeviceID{}) {
+		return true
+	}
+	return !f.deviceRevoked
+}
+
 func (f *fakeMembership) HasOwner(v ids.AccountNumberHash) bool { return f.owners[v] }
+
+// The person-selector half (myne-md/myne#911 task 7). The fake keeps a binding
+// map so a test can grant one person a role in the fake's vault and nothing else;
+// `boundOwner`/`boundMember` name the two accounts allowed to name it.
+func (f *fakeMembership) BoundTo(vault, person ids.AccountNumberHash) (bool, bool) {
+	role, ok := f.bindings[vault][person]
+	return role == "owner", ok
+}
+
+func (f *fakeMembership) BindOwner(vault, person ids.AccountNumberHash) error {
+	if _, ok := f.bindings[vault]; !ok {
+		f.bindings[vault] = map[ids.AccountNumberHash]string{}
+	}
+	f.bindings[vault][person] = "owner"
+	return nil
+}
+
+// OwnedVaults is the status-aggregate half (myne-md/myne#911 task 11): the fake
+// reports the vaults `person` owns by walking the same binding map `BoundTo`
+// reads, so a test that grants an owner binding grants the aggregate with it.
+func (f *fakeMembership) OwnedVaults(person ids.AccountNumberHash) []ids.AccountNumberHash {
+	var out []ids.AccountNumberHash
+	for vault, people := range f.bindings {
+		if people[person] == "owner" {
+			out = append(out, vault)
+		}
+	}
+	return out
+}
 
 // setupB2B wires a sync handler with a fake membership authority and a
 // retirement registry. withOwner controls whether the vault is a B2B vault (an
