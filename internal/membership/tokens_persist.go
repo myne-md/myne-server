@@ -6,6 +6,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"sort"
+
+	"github.com/myne-md/myne-server/internal/ids"
 )
 
 // PersistedToken is one outstanding per-vault token. Persisting tokens is what
@@ -23,6 +25,16 @@ type PersistedToken struct {
 	// which the session path treats as unattributable: the token keeps working and
 	// a device revocation cannot guess it away.
 	Device []byte `json:"device,omitempty"`
+	// Account is the SCRAM account that device is registered under, or absent on a
+	// row written before it was recorded. An absent account loads as the zero value
+	// and is treated exactly like an absent device: the token keeps working rather
+	// than being guessed into somebody else's account.
+	//
+	// The device registry is keyed by ACCOUNT, so without this a token attributed to
+	// a device still cannot be checked: the owner of a shared vault is minted under
+	// the VAULT's account and asked about under their PERSON id, which the registry
+	// has never heard of (myne-md/myne#911 follow-up).
+	Account []byte `json:"account,omitempty"`
 }
 
 // ErrBadPersistedToken is returned for a persisted token row whose lengths do not
@@ -31,9 +43,10 @@ var ErrBadPersistedToken = errors.New("membership: persisted token row is not a 
 
 // tokenLen is declared in tokens.go; these are the id widths a row must carry.
 const (
-	personIDLen = 16
-	vaultIDLen  = 16
-	deviceIDLen = 16
+	personIDLen  = 16
+	vaultIDLen   = 16
+	deviceIDLen  = 16
+	accountIDLen = 16
 )
 
 // SetOnChange installs the persistence hook (see Table.SetOnChange). Call once,
@@ -72,6 +85,9 @@ func (s *TokenStore) Snapshot() []PersistedToken {
 		if b.Device != (DeviceID{}) {
 			row.Device = b.Device[:]
 		}
+		if b.Account != (ids.AccountNumberHash{}) {
+			row.Account = b.Account[:]
+		}
 		out = append(out, row)
 	}
 	sort.Slice(out, func(i, j int) bool { return string(out[i].Token) < string(out[j].Token) })
@@ -95,17 +111,23 @@ func (s *TokenStore) Load(rows []PersistedToken) error {
 		if len(r.Device) != 0 && len(r.Device) != deviceIDLen {
 			return ErrBadPersistedToken
 		}
+		if len(r.Account) != 0 && len(r.Account) != accountIDLen {
+			return ErrBadPersistedToken
+		}
 		var person PersonID
 		copy(person[:], r.Person)
 		var vault VaultID
 		copy(vault[:], r.Vault)
 		var device DeviceID
 		copy(device[:], r.Device)
+		var account ids.AccountNumberHash
+		copy(account[:], r.Account)
 		byToken[hex.EncodeToString(r.Token)] = Binding{
-			Person: person,
-			Vault:  vault,
-			Role:   Role(r.Role),
-			Device: device,
+			Person:  person,
+			Vault:   vault,
+			Role:    Role(r.Role),
+			Device:  device,
+			Account: account,
 		}
 	}
 	s.mu.Lock()

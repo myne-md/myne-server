@@ -2,7 +2,11 @@
 
 package membership
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/myne-md/myne-server/internal/ids"
+)
 
 func person(b byte) PersonID {
 	var p PersonID
@@ -14,6 +18,15 @@ func vault(b byte) VaultID {
 	var v VaultID
 	v[0] = b
 	return v
+}
+
+// account is the SCRAM account a token is issued under: the account the issuing
+// device is registered with, which is what the revocation check asks the device
+// registry about. It is not the person holding the binding.
+func account(b byte) ids.AccountNumberHash {
+	var a ids.AccountNumberHash
+	a[0] = b
+	return a
 }
 
 func TestOwnerIsSingleton(t *testing.T) {
@@ -114,10 +127,10 @@ func TestTokenGrantAndTargetedRevoke(t *testing.T) {
 	}
 
 	// A token can be minted only for an existing binding.
-	if _, err := store.Issue(person(0xDD), v, DeviceID{0x0a}); err != ErrNotBound {
+	if _, err := store.Issue(person(0xDD), v, DeviceID{0x0a}, account(0xaa)); err != ErrNotBound {
 		t.Fatalf("Issue for unbound person err = %v, want ErrNotBound", err)
 	}
-	tok, err := store.Issue(member, v, DeviceID{0x0a})
+	tok, err := store.Issue(member, v, DeviceID{0x0a}, account(0xaa))
 	if err != nil {
 		t.Fatalf("Issue: %v", err)
 	}
@@ -135,7 +148,7 @@ func TestTokenGrantAndTargetedRevoke(t *testing.T) {
 	if err := tbl.BindMember(other, member); err != nil {
 		t.Fatal(err)
 	}
-	otherTok, err := store.Issue(member, other, DeviceID{0x0a})
+	otherTok, err := store.Issue(member, other, DeviceID{0x0a}, account(0xaa))
 	if err != nil {
 		t.Fatal(err)
 	}

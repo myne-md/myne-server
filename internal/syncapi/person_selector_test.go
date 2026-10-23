@@ -61,6 +61,7 @@ func newPersonHarness(t *testing.T) *personHarness {
 
 	mem := &fakeMembership{
 		vault:    vault,
+		account:  vault,
 		owners:   map[ids.AccountNumberHash]bool{},
 		bindings: map[ids.AccountNumberHash]map[ids.AccountNumberHash]string{},
 	}
@@ -376,9 +377,11 @@ func TestARevokedDeviceStopsAuthenticatingItsMembershipToken(t *testing.T) {
 		t.Fatalf("the refusal must name the revocation, got %s", body)
 	}
 
-	// An unattributable token (no device recorded, i.e. one issued before the
-	// field existed) is not refused by a guess: the check must skip it.
+	// An unattributable token (no device AND no account recorded, i.e. one issued
+	// before those fields existed) is not refused by a guess: the check must skip
+	// it, because the registry cannot be asked about an account it was never told.
 	h.mem.device = ids.DeviceID{}
+	h.mem.account = ids.AccountNumberHash{}
 	if status, body := get(); status == http.StatusUnauthorized {
 		t.Fatalf("an unattributable token must keep working, got %d %s", status, body)
 	}

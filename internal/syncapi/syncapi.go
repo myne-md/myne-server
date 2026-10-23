@@ -171,15 +171,22 @@ type Handler struct {
 type MembershipAuth interface {
 	ResolveMember(bearerHex string) (b membership.Binding, ok bool)
 	// DeviceActive reports whether `device` is still an active, approved device of
-	// `person`'s account (myne-md/myne#911 task 9). A membership token names the
-	// device it was issued to, so the ONE act that revokes a device also ends its
-	// access to every shared vault it joined: this is asked on every request
-	// rather than swept at revoke time, so a token cannot outlive its device.
+	// the ACCOUNT it is registered under (myne-md/myne#911 task 9). A membership
+	// token names the device it was issued to, so the ONE act that revokes a device
+	// also ends its access to every shared vault it joined: this is asked on every
+	// request rather than swept at revoke time, so a token cannot outlive its
+	// device.
 	//
-	// A token with no device (issued before this field existed) is never refused
-	// by this check: it cannot be attributed, and guessing would revoke somebody
-	// else's access.
-	DeviceActive(person ids.AccountNumberHash, device ids.DeviceID) bool
+	// `account` is the SCRAM account the token was issued under, NOT the person
+	// holding the binding: the registry is keyed by account, and a shared vault's
+	// owner binding is minted by the VAULT's own device session, so asking about the
+	// person is asking about an account the registry has never held
+	// (myne-md/myne#911 follow-up).
+	//
+	// A token with no device or no account (issued before those fields existed) is
+	// never refused by this check: it cannot be attributed, and guessing would
+	// revoke somebody else's access.
+	DeviceActive(account ids.AccountNumberHash, device ids.DeviceID) bool
 	HasOwner(vault ids.AccountNumberHash) bool
 	// BoundTo reports whether `person` holds a binding to `vault` (myne-md/myne#911
 	// task 7). It is the ONE new authority this feature adds to the sync surface:
@@ -539,7 +546,7 @@ func (h *Handler) sessionWithCode(r *http.Request) (auth.Session, string) {
 			// a revoked DEVICE token is. `device_revoked` rather than
 			// `unauthenticated` keeps the client from re-enrolling into an account
 			// whose owner removed it.
-			if b.Device != (ids.DeviceID{}) && !h.membership.DeviceActive(ids.AccountNumberHash(b.Person), ids.DeviceID(b.Device)) {
+			if b.Device != (ids.DeviceID{}) && b.Account != (ids.AccountNumberHash{}) && !h.membership.DeviceActive(b.Account, ids.DeviceID(b.Device)) {
 				return auth.Session{}, "device_revoked"
 			}
 			return auth.Session{Account: b.Vault}, ""

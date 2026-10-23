@@ -59,6 +59,23 @@ type Binding struct {
 	// device, so a device revocation leaves it working rather than revoking
 	// somebody else's. Recorded in `design notes/` by the person-account work.
 	Device DeviceID
+	// Account is the SCRAM account that device is REGISTERED under, i.e. the account
+	// its session authenticated as when the token was minted.
+	//
+	// It exists because `Device` alone is not answerable: the device registry is
+	// keyed by account (`auth.Registry.Get(account, device)`), and the account a
+	// shared vault's tokens are minted under is not the person who owns the vault.
+	// Every pre-B2B vault's owner binding is minted by the VAULT's own device token,
+	// whose session account is the vault's account number, while the binding's
+	// `Person` is the owner's person id: asking the registry about the person found
+	// nothing and answered "revoked" for a live device, so every owner's
+	// `vault.meta` write and every rotation delivery was refused `device_revoked`
+	// (myne-md/myne#911 follow-up).
+	//
+	// The zero value means UNATTRIBUTABLE, exactly as it does for `Device`, and for
+	// the same reason: a row persisted before this field existed must not be guessed
+	// into an account it may not belong to.
+	Account ids.AccountNumberHash
 }
 
 // Table errors.

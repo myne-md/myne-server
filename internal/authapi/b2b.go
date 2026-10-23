@@ -86,8 +86,15 @@ func (h *Handler) ResolveMember(bearerHex string) (membership.Binding, bool) {
 // revocation cannot disagree. An unknown device, an unapproved one (still
 // pending) and a retired one all answer false; `device_revoked` is the code the
 // caller returns, which is the honest one for all three from the vault's side.
-func (h *Handler) DeviceActive(person ids.AccountNumberHash, device ids.DeviceID) bool {
-	rec, ok := h.reg.Get(person, device)
+//
+// `account` is the SCRAM account the device is REGISTERED under, which is what the
+// registry is keyed by. It is deliberately not the person holding the binding:
+// a shared vault's owner binding is minted by the vault's own device session, so
+// the account is the vault's and the person is the owner's, and asking about the
+// person made every owner `vault.meta` write answer `device_revoked` for a live
+// device (myne-md/myne#911 follow-up).
+func (h *Handler) DeviceActive(account ids.AccountNumberHash, device ids.DeviceID) bool {
+	rec, ok := h.reg.Get(account, device)
 	if !ok {
 		return false
 	}
@@ -271,7 +278,9 @@ func (h *Handler) handleBindMember(w http.ResponseWriter, r *http.Request) {
 		// Attributed to the device that OWNS the owner token that asked, which is
 		// this physical device: the owner token was issued to a device, and the
 		// member token it mints lives and dies with it (myne-md/myne#911 task 9).
-		h.writeIssuedBinding(w, person, vault, role, ids.DeviceID(b.Device))
+		// Its account travels with it for the same reason the device does: it is what
+		// the revocation check asks the registry about.
+		h.writeIssuedBinding(w, person, vault, role, ids.DeviceID(b.Device), b.Account)
 		return
 	}
 
@@ -297,7 +306,7 @@ func (h *Handler) handleBindMember(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "bad_request")
 		return
 	}
-	h.writeIssuedBinding(w, person, vault, role, sess.Device)
+	h.writeIssuedBinding(w, person, vault, role, sess.Device, sess.Account)
 }
 
 // writeIssuedBinding mints the per-vault token for a binding and returns it.
@@ -307,8 +316,12 @@ func (h *Handler) handleBindMember(w http.ResponseWriter, r *http.Request) {
 // (myne-md/myne#911 task 9). A device revocation is a registry change, and the
 // token names its device, so no separate sweep is needed: the session check asks
 // the registry on every request.
-func (h *Handler) writeIssuedBinding(w http.ResponseWriter, person membership.PersonID, vault membership.VaultID, role membership.Role, device ids.DeviceID) {
-	token, err := h.memberTks.Issue(person, vault, device)
+//
+// `account` is the SCRAM account that device authenticated as, and it is recorded
+// beside it because the registry is keyed by account: without it the revocation
+// check has a device it cannot look up (myne-md/myne#911 follow-up).
+func (h *Handler) writeIssuedBinding(w http.ResponseWriter, person membership.PersonID, vault membership.VaultID, role membership.Role, device ids.DeviceID, account ids.AccountNumberHash) {
+	token, err := h.memberTks.Issue(person, vault, device, account)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "internal")
 		return

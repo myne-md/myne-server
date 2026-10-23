@@ -24,11 +24,11 @@ func TestRevokeReportsRevokedTokensToObserver(t *testing.T) {
 		t.Fatalf("BindMember other: %v", err)
 	}
 	ts := NewTokenStore(tbl)
-	tokA, err := ts.Issue(person, vault, DeviceID{0x0a})
+	tokA, err := ts.Issue(person, vault, DeviceID{0x0a}, account(0xaa))
 	if err != nil {
 		t.Fatalf("Issue A: %v", err)
 	}
-	tokB, err := ts.Issue(other, vault, DeviceID{0x0b})
+	tokB, err := ts.Issue(other, vault, DeviceID{0x0b}, account(0xaa))
 	if err != nil {
 		t.Fatalf("Issue B: %v", err)
 	}
@@ -71,7 +71,7 @@ func TestDeviceAttributionSurvivesSnapshotAndLoad(t *testing.T) {
 	store := NewTokenStore(table)
 	var device DeviceID
 	device[0] = 0x0a
-	if _, err := store.Issue(person, vault, device); err != nil {
+	if _, err := store.Issue(person, vault, device, account(0xaa)); err != nil {
 		t.Fatal(err)
 	}
 	rows := store.Snapshot()

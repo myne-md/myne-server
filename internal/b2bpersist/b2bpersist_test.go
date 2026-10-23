@@ -77,7 +77,7 @@ func TestB2BStateSurvivesARestart(t *testing.T) {
 	if err := s1.Membership.BindMember(v, member); err != nil {
 		t.Fatalf("bind member: %v", err)
 	}
-	tok, err := s1.MemberTokens.Issue(member, v, ids.DeviceID{0x0a})
+	tok, err := s1.MemberTokens.Issue(member, v, ids.DeviceID{0x0a}, ids.AccountNumberHash{0xaa})
 	if err != nil {
 		t.Fatalf("issue: %v", err)
 	}
@@ -108,6 +108,22 @@ func TestB2BStateSurvivesARestart(t *testing.T) {
 	}
 	if _, err := s2.MemberTokens.Resolve(tok); err != nil {
 		t.Fatalf("member token did not survive: %v", err)
+	}
+	// The attribution fields must survive with it: a token that loses its account
+	// across a restart cannot be checked against the device registry any more, so
+	// the boot after a restart would silently stop enforcing device revocation on
+	// every shared vault (myne-md/myne#911 follow-up).
+	resolved, err := s2.MemberTokens.Resolve(tok)
+	if err != nil {
+		t.Fatalf("resolve after restart: %v", err)
+	}
+	wantDevice := ids.DeviceID{0x0a}
+	if resolved.Device != wantDevice {
+		t.Fatalf("the token's device did not survive: %x", resolved.Device)
+	}
+	wantAccount := ids.AccountNumberHash{0xaa}
+	if resolved.Account != wantAccount {
+		t.Fatalf("the token's issuing account did not survive: %x", resolved.Account)
 	}
 	inv, err := s2.Invites.Claim(member, inviteID)
 	if err != nil {

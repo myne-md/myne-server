@@ -29,20 +29,25 @@ type fakeMembership struct {
 	// the person in the request holds no binding, which is the refusal case.
 	bindings map[ids.AccountNumberHash]map[ids.AccountNumberHash]string
 	// device is what ResolveMember reports as the issuing device, and
-	// deviceRevoked is the registry answer for it (task 9).
+	// deviceRevoked is the registry answer for it (task 9). `account` is the SCRAM
+	// account that device is registered under, which is what the registry is keyed
+	// by; the real routes fill it from the issuing session, and both harnesses set
+	// it to the vault's account because that is the shape a shared vault's owner
+	// binding is minted in (the vault's own device session asks for it).
 	device        ids.DeviceID
+	account       ids.AccountNumberHash
 	deviceRevoked bool
 }
 
 func (f *fakeMembership) ResolveMember(bearerHex string) (membership.Binding, bool) {
-	// `device` is the device the token was issued to. Tests that care about
-	// device revocation set it; a zero device is unattributable and never refused
-	// (myne-md/myne#911 task 9).
+	// `device` and `account` are the attribution pair the token carries. Tests that
+	// care about device revocation set them; a token missing EITHER is unattributable
+	// and never refused (myne-md/myne#911 task 9 and its follow-up).
 	switch bearerHex {
 	case f.ownerBearer:
-		return membership.Binding{Vault: f.vault, Role: membership.RoleOwner, Device: f.device}, true
+		return membership.Binding{Vault: f.vault, Role: membership.RoleOwner, Device: f.device, Account: f.account}, true
 	case f.memberBearer:
-		return membership.Binding{Vault: f.vault, Role: membership.RoleMember, Device: f.device}, true
+		return membership.Binding{Vault: f.vault, Role: membership.RoleMember, Device: f.device, Account: f.account}, true
 	default:
 		return membership.Binding{}, false
 	}
@@ -113,6 +118,7 @@ func setupB2B(t *testing.T, grace time.Duration, withOwner bool) (srv *httptest.
 		ownerBearer:  strings.Repeat("aa", 32),
 		memberBearer: strings.Repeat("bb", 32),
 		vault:        vault,
+		account:      vault,
 		owners:       owners,
 	}
 	rets = store.NewRetirements(grace)

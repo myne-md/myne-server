@@ -53,7 +53,7 @@ func (h *Handler) vaultMetaWriteAccount(w http.ResponseWriter, r *http.Request) 
 			// The registry answer applies here too: an owner token on a revoked
 			// device must not keep writing the credential blob after the device
 			// was removed (myne-md/myne#911 task 9).
-			if b.Device != (ids.DeviceID{}) && !h.membership.DeviceActive(ids.AccountNumberHash(b.Person), ids.DeviceID(b.Device)) {
+			if b.Device != (ids.DeviceID{}) && b.Account != (ids.AccountNumberHash{}) && !h.membership.DeviceActive(b.Account, ids.DeviceID(b.Device)) {
 				writeErr(w, http.StatusUnauthorized, "device_revoked")
 				return ids.AccountNumberHash{}, false
 			}
@@ -175,7 +175,7 @@ func (h *Handler) handleRetire(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusUnauthorized, "unauthenticated")
 		return
 	}
-	if b.Device != (ids.DeviceID{}) && !h.membership.DeviceActive(ids.AccountNumberHash(b.Person), ids.DeviceID(b.Device)) {
+	if b.Device != (ids.DeviceID{}) && b.Account != (ids.AccountNumberHash{}) && !h.membership.DeviceActive(b.Account, ids.DeviceID(b.Device)) {
 		writeErr(w, http.StatusUnauthorized, "device_revoked")
 		return
 	}

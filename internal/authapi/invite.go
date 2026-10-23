@@ -229,8 +229,10 @@ func (h *Handler) handleClaimInvite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// The claiming device is recorded on the token, so one device revocation
-	// retires the shared vaults it joined as well (myne-md/myne#911 task 9).
-	token, err := h.memberTks.Issue(person, inv.Vault, sess.Device)
+	// retires the shared vaults it joined as well (myne-md/myne#911 task 9). Its
+	// account travels with it: the device registry is keyed by account, and this is
+	// the account the revocation check must ask about (myne-md/myne#911 follow-up).
+	token, err := h.memberTks.Issue(person, inv.Vault, sess.Device, sess.Account)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "internal")
 		return

@@ -47,7 +47,16 @@ func NewTokenStore(table *Table) *TokenStore {
 // Issue mints a fresh per-vault token for an existing binding. A binding the
 // table does not hold, or whose role has since changed, is refused: a token is
 // only ever minted for access that currently exists.
-func (s *TokenStore) Issue(person PersonID, vault VaultID, device ids.DeviceID) (ids.DeviceToken, error) {
+//
+// `device` and `account` are the device the caller is and the SCRAM account that
+// device authenticated as. Both are recorded so a device revocation can end this
+// token (`Binding.Device`), and so the registry lookup that decides it knows
+// which account to ask about (`Binding.Account`): the registry is keyed by
+// ACCOUNT, and the person holding the binding is frequently not that account
+// (myne-md/myne#911 follow-up). Pass the zero value only when the route genuinely
+// cannot attribute the token; a token attributed to neither is refused by the
+// device check rather than guessed at.
+func (s *TokenStore) Issue(person PersonID, vault VaultID, device ids.DeviceID, account ids.AccountNumberHash) (ids.DeviceToken, error) {
 	if _, ok := s.table.Role(vault, person); !ok {
 		return nil, ErrNotBound
 	}
@@ -57,9 +66,10 @@ func (s *TokenStore) Issue(person PersonID, vault VaultID, device ids.DeviceID) 
 	}
 	s.mu.Lock()
 	s.byToken[hex.EncodeToString(raw)] = Binding{
-		Person: person,
-		Vault:  vault,
-		Device: DeviceID(device),
+		Person:  person,
+		Vault:   vault,
+		Device:  DeviceID(device),
+		Account: account,
 	}
 	s.changed()
 	s.mu.Unlock()
