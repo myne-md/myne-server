@@ -21,6 +21,7 @@ import (
 //	POST /b2b/invites                      owner posts a sealed invite
 //	GET  /b2b/invites                      recipient lists invites addressed to it
 //	POST /b2b/invites/{invite_id}/claim    recipient claims one, binding the vault
+//	DELETE /b2b/invites/{invite_id}        recipient declines one, which drops its payload
 //
 // The outer routing frame is the recipient person id, the vault id and the
 // opaque sealed payload. Because the relay is addressed by person id, the
@@ -133,6 +134,7 @@ type vaultInviteWire struct {
 	InviteIDHex          string `json:"invite_id_hex"`
 	RecipientPersonIDHex string `json:"recipient_person_id_hex"`
 	Claimed              bool   `json:"claimed"`
+	Declined             bool   `json:"declined"`
 }
 
 // handleListVaultInvites lists the invitations a vault's OWNER has sent, with
@@ -171,6 +173,7 @@ func (h *Handler) handleListVaultInvites(w http.ResponseWriter, r *http.Request)
 			InviteIDHex:          hex.EncodeToString(m.ID[:]),
 			RecipientPersonIDHex: hex.EncodeToString(m.Recipient[:]),
 			Claimed:              m.Claimed,
+			Declined:             m.Declined,
 		})
 	}
 	writeJSON(w, map[string][]vaultInviteWire{"invites": out})
@@ -253,4 +256,52 @@ func parseInviteID(s string) (relay.InviteID, bool) {
 	}
 	copy(id[:], b)
 	return id, true
+}
+
+// handleDeclineInvite is the recipient's refusal of an invitation
+// (myne-md/myne#911 follow-up): DELETE /b2b/invites/{invite_id} under the
+// recipient's own person session.
+//
+// It is a REAL server-side deletion of the sealed payload, not a client-side
+// hide. Without it the only two things an invitee could do were "accept" and
+// "wait", and the owner's list could not tell somebody who declined from
+// somebody who had not opened the app yet. The slot keeps a payload-free
+// tombstone so the owner's §3.1a view can report "declined"; the claim route
+// then answers the same 404 an unknown id gives.
+//
+// Authorization mirrors the claim: the caller must be the invite's own
+// recipient. A wrong account, an unknown id and an already-declined slot are all
+// the same 404, so the route cannot be used to enumerate another person's
+// invitations. An already-CLAIMED invite is a conflict rather than a delete: the
+// caller is already a member of that vault, and declining an invitation it
+// accepted makes no sense.
+func (h *Handler) handleDeclineInvite(w http.ResponseWriter, r *http.Request) {
+	tok, ok := bearerToken(r)
+	if !ok {
+		writeErr(w, http.StatusUnauthorized, "unauthenticated")
+		return
+	}
+	sess, err := h.tokens.AuthenticateSession(tok)
+	if err != nil {
+		writeErr(w, http.StatusUnauthorized, auth.FailureCode(err))
+		return
+	}
+	inviteID, ok := parseInviteID(r.PathValue("invite_id"))
+	if !ok {
+		writeErr(w, http.StatusBadRequest, "bad_request")
+		return
+	}
+	inv, err := h.relay.Decline(personFromSession(sess), inviteID)
+	if err != nil {
+		if errors.Is(err, relay.ErrClaimed) {
+			writeErr(w, http.StatusConflict, "already_claimed")
+			return
+		}
+		writeErr(w, http.StatusNotFound, "not_found")
+		return
+	}
+	writeJSON(w, map[string]string{
+		"invite_id_hex":          hex.EncodeToString(inv.ID[:]),
+		"vault_account_hash_hex": hex.EncodeToString(inv.Vault[:]),
+	})
 }

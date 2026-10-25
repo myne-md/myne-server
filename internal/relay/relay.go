@@ -25,6 +25,10 @@
 // rule widens no enumeration signal. Meta, the recipient projection, still
 // deliberately excludes the payload: a list cannot be used to drain a slot, and
 // the Claimed flag is what the owner's view reads.
+//
+// Declining is the recipient's own exit and it DESTROYS the slot's payload (see
+// Store.Decline): the sender then reads "declined" from a tombstone that holds
+// nothing but the three ids and the flag.
 package relay
 
 import (
@@ -41,12 +45,19 @@ type InviteID [16]byte
 
 // Invite is one stored invite. Payload is opaque sealed bytes; the server never
 // parses, interprets or reorders them.
+//
+// Declined is the recipient's refusal (myne-md/myne#911 follow-up). It is a real
+// delete of the sealed payload rather than a client-side hide: a declined slot
+// releases nothing and can never be claimed, and the ROW survives only so the
+// owner's view can say "declined" instead of "not accepted yet". The tombstone
+// therefore holds no payload and no group key: three ids and one flag.
 type Invite struct {
 	ID        InviteID
 	Recipient membership.PersonID
 	Vault     membership.VaultID
 	Payload   []byte
 	Claimed   bool
+	Declined  bool
 }
 
 // Meta is the list projection of an invite: everything a recipient may know
@@ -63,16 +74,20 @@ type Meta struct {
 // person id, which the owner supplied when posting, so an owner can render
 // claimed-versus-pending without the server releasing any payload. It is still
 // not a fingerprint or a public half: those live inside the sealed payload.
+// Declined is the third state that projection can carry.
 type VaultMeta struct {
 	ID        InviteID
 	Recipient membership.PersonID
 	Claimed   bool
+	Declined  bool
 }
 
 // ErrNotFound is returned both for an unknown id and for an id addressed to a
 // DIFFERENT person, so the caller cannot enumerate another person's invites or
 // confirm that one exists. A re-claim by the invite's own recipient is signalled
-// with ErrClaimed instead, which carries the stored invite (see Claim).
+// with ErrClaimed instead, which carries the stored invite (see Claim). A
+// declined invite answers ErrNotFound like an unknown one: there is no slot left
+// to claim.
 var (
 	ErrNotFound = errors.New("relay: invite not found")
 	ErrClaimed  = errors.New("relay: invite already claimed")
@@ -111,12 +126,14 @@ func (s *Store) Put(recipient membership.PersonID, vault membership.VaultID, pay
 // List returns the recipient's invites in a deterministic order (id ascending),
 // without payloads. Claimed invites are included with Claimed set, so a client
 // can show what it already accepted rather than watching a slot vanish.
+// Declined ones are not listed at all: the recipient is the party that refused
+// them, so there is nothing left to tell it.
 func (s *Store) List(recipient membership.PersonID) []Meta {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := make([]Meta, 0)
 	for _, inv := range s.byID {
-		if inv.Recipient == recipient {
+		if inv.Recipient == recipient && !inv.Declined {
 			out = append(out, Meta{ID: inv.ID, Vault: inv.Vault, Claimed: inv.Claimed})
 		}
 	}
@@ -136,7 +153,12 @@ func (s *Store) ListByVault(vault membership.VaultID) []VaultMeta {
 	out := make([]VaultMeta, 0)
 	for _, inv := range s.byID {
 		if inv.Vault == vault {
-			out = append(out, VaultMeta{ID: inv.ID, Recipient: inv.Recipient, Claimed: inv.Claimed})
+			out = append(out, VaultMeta{
+				ID:        inv.ID,
+				Recipient: inv.Recipient,
+				Claimed:   inv.Claimed,
+				Declined:  inv.Declined,
+			})
 		}
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -158,7 +180,7 @@ func (s *Store) Claim(recipient membership.PersonID, id InviteID) (Invite, error
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	inv, ok := s.byID[id]
-	if !ok || inv.Recipient != recipient {
+	if !ok || inv.Recipient != recipient || inv.Declined {
 		return Invite{}, ErrNotFound
 	}
 	if inv.Claimed {
@@ -167,6 +189,33 @@ func (s *Store) Claim(recipient membership.PersonID, id InviteID) (Invite, error
 		return inv, ErrClaimed
 	}
 	inv.Claimed = true
+	s.byID[id] = inv
+	s.changed()
+	return inv, nil
+}
+
+// Decline is the recipient's refusal of an invite: the sealed payload is DROPPED
+// on the spot and the slot can never be claimed, while a payload-free tombstone
+// stays so the owner's list can report "declined" rather than "not accepted
+// yet". The rule that makes it safe to keep the row is that it keeps nothing
+// worth releasing: no payload, no fingerprint, no public half.
+//
+// Errors mirror Claim, and for the same reason: an unknown id and somebody
+// else's id are one ErrNotFound, so declining is not an enumeration oracle. An
+// already-claimed invite answers ErrClaimed: that recipient is already a member,
+// and the act that ends that is the owner's removal, not a declined invitation.
+func (s *Store) Decline(recipient membership.PersonID, id InviteID) (Invite, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	inv, ok := s.byID[id]
+	if !ok || inv.Recipient != recipient {
+		return Invite{}, ErrNotFound
+	}
+	if inv.Claimed {
+		return inv, ErrClaimed
+	}
+	inv.Declined = true
+	inv.Payload = nil
 	s.byID[id] = inv
 	s.changed()
 	return inv, nil

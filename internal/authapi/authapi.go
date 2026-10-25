@@ -301,6 +301,10 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	// authorizes nothing by itself.
 	mux.HandleFunc("GET /b2b/vaults", h.limitB2B(h.handleDiscoverVaults))
 	mux.HandleFunc("POST /b2b/invites/{invite_id}/claim", h.limitB2B(h.handleClaimInvite))
+	// The recipient's refusal of an invitation (myne-md/myne#911 follow-up). A
+	// real delete of the sealed payload, so the owner reads "declined" instead of
+	// an invitation that is never accepted. Recipient-scoped like the claim.
+	mux.HandleFunc("DELETE /b2b/invites/{invite_id}", h.limitB2B(h.handleDeclineInvite))
 	// Person-private AI profiles (myne-md/myne#711 task 16): a vault-scoped,
 	// person-authorized namespace, separate from the shared group manifest.
 	mux.HandleFunc("PUT /b2b/vaults/{account_hash}/profiles/{profile_id}", h.limitB2B(h.handlePutProfile))

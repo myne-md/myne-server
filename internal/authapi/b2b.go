@@ -218,7 +218,7 @@ type bindMemberResp struct {
 // handleBindMember creates a person↔vault binding and issues that binding's
 // per-vault token.
 //
-// Two authorizations are accepted, and they are not interchangeable:
+// Three authorizations are accepted, and they are not interchangeable:
 //
 //   - The VAULT's own device session (an /auth token resolving to this vault)
 //     may register the vault's OWNER, once. This is "owner at registration": the
@@ -226,6 +226,11 @@ type bindMemberResp struct {
 //     that proves control of the namespace. It may not add members.
 //   - The OWNER's per-vault membership token may add a MEMBER. The owner role is
 //     fixed at registration and cannot be re-assigned through this route.
+//   - The OWNER's own PERSON session may do both of the above for a vault born
+//     under an identity (`NTV7`, myne-md/myne#911): such a vault has no vault
+//     device session, so the first arm cannot reach it, and its owner holds no
+//     per-vault token yet, so the second cannot either. See
+//     `bindByPersonSession` for the two things this arm will and will not do.
 func (h *Handler) handleBindMember(w http.ResponseWriter, r *http.Request) {
 	vault, ok := ids.ParseAccountNumberHash(r.PathValue("account_hash"))
 	if !ok {
@@ -291,7 +296,11 @@ func (h *Handler) handleBindMember(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if sess.Account != vault {
-		writeErr(w, http.StatusForbidden, "forbidden")
+		// Not the vault's own device, so this is a PERSON session. For a vault born
+		// under an identity that is the only credential that exists; for any other
+		// vault the membership table refuses it, so one arm serves both and the
+		// refusal is the same `forbidden` arm (1) answers.
+		h.bindByPersonSession(w, sess, vault, person, role)
 		return
 	}
 	if role != membership.RoleOwner {
@@ -305,6 +314,65 @@ func (h *Handler) handleBindMember(w http.ResponseWriter, r *http.Request) {
 		}
 		writeErr(w, http.StatusBadRequest, "bad_request")
 		return
+	}
+	h.writeIssuedBinding(w, person, vault, role, sess.Device, sess.Account)
+}
+
+// bindByPersonSession authorizes a binding request made by the OWNER's own
+// PERSON session, the shape a vault born under an identity needs (`NTV7`).
+//
+// **Why this arm exists.** A born-`NTV7` vault has no vault device session (it is
+// never enrolled under a vault account: it is published under the person's
+// namespace instead) and its owner holds no per-vault token until one is minted
+// here, so arms (1) and (2) are both unreachable on that generation by
+// construction rather than by accident. `decisions/storage/0723` makes `NTV7` the
+// birth format, so without this arm a vault created today could never be shared
+// while `NTV5` was still being written, and none at all once it retires.
+//
+// **What it will do.** Bind a MEMBER, when the caller is the vault's recorded
+// owner in the membership table; and re-mint the owner's OWN binding token, which
+// is idempotent and is what the client's `ensure_owner_member_token` needs after a
+// restart (that token is device-local state and can be lost).
+//
+// **What it will not do.** It cannot CREATE the owner binding. The owner is
+// established by the publish act (`PUT /vault.meta?account=`, owner-at-first-write)
+// or by arm (2), so a person session cannot claim a vault it was not already bound
+// to. That is the same authority `BoundTo` gives the sync surface, so publishing
+// and sharing cannot disagree about who owns a vault.
+//
+// The token it mints records the asking device and the session's account exactly
+// as arm (1) does, so one device revocation still ends every vault that device
+// reached.
+func (h *Handler) bindByPersonSession(w http.ResponseWriter, sess auth.Session, vault membership.VaultID, person membership.PersonID, role membership.Role) {
+	if h.members == nil {
+		writeErr(w, http.StatusForbidden, "forbidden")
+		return
+	}
+	// `owner` is the ROLE answer, not merely "bound": a member's own session must
+	// not add members to the vault it joined, so the role is checked explicitly.
+	owner, bound := h.BoundTo(vault, sess.Account)
+	if !bound || !owner {
+		writeErr(w, http.StatusForbidden, "forbidden")
+		return
+	}
+	switch role {
+	case membership.RoleMember:
+		if err := h.members.BindMember(vault, person); err != nil {
+			if errors.Is(err, membership.ErrAlreadyBound) {
+				writeErr(w, http.StatusConflict, "already_bound")
+				return
+			}
+			writeErr(w, http.StatusBadRequest, "bad_request")
+			return
+		}
+	default:
+		// Re-minting the owner's OWN token only. A second person cannot be made
+		// owner through any route: the singleton owner rule is what makes the
+		// client's roster authority answerable.
+		if person != membership.PersonID(sess.Account) {
+			writeErr(w, http.StatusBadRequest, "bad_request")
+			return
+		}
 	}
 	h.writeIssuedBinding(w, person, vault, role, sess.Device, sess.Account)
 }

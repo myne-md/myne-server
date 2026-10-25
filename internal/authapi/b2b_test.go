@@ -327,3 +327,122 @@ func b2bPersonID(t *testing.T, hexStr string) membership.PersonID {
 	}
 	return p
 }
+
+// ---- the person-session arm: a vault born under an identity (`NTV7`) ----
+//
+// A born-`NTV7` vault is published under the person's namespace and never holds a
+// vault device session, so the two pre-existing arms cannot reach it: arm (1) needs
+// a per-vault owner token it does not have yet, and arm (2) needs a vault account it
+// never enrols. Every test below therefore sets the owner binding the way publishing
+// does (`Handler.BindOwner`, owner-at-first-write) and then uses the OWNER'S PERSON
+// token, which is the /auth device token of the person account.
+
+// publishedPersonBornVault is the minimum state a born-`NTV7` vault has on the
+// server, and deliberately no more: an owner binding and no vault account.
+func publishedPersonBornVault(t *testing.T, e *b2bEnv, vaultHex, ownerHex string) {
+	t.Helper()
+	if err := e.h.BindOwner(acct(t, vaultHex), acct(t, ownerHex)); err != nil {
+		t.Fatalf("publish (bind owner): %v", err)
+	}
+}
+
+// The owner's own person session binds a member, and the per-vault token it issues
+// resolves to that member on that vault.
+func TestB2B_PersonSessionBindsAMember(t *testing.T) {
+	e := newB2BEnv(t)
+	_, ownerPersonTok := e.account(t, b2bOwner, 0x0a)
+	publishedPersonBornVault(t, e, b2bVaultA, b2bOwner)
+
+	resp, bound := e.bind(t, b2bVaultA, ownerPersonTok, b2bMember, "member")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("person session binding a member: want 200, got %d", resp.StatusCode)
+	}
+	if bound.TokenHex == "" {
+		t.Fatal("the binding must issue a per-vault token")
+	}
+	got, err := e.resolve(t, bound.TokenHex)
+	if err != nil {
+		t.Fatalf("the issued token must resolve: %v", err)
+	}
+	if got.Vault != acct(t, b2bVaultA) || got.Person != b2bPersonID(t, b2bMember) {
+		t.Fatalf("token resolved to %+v", got)
+	}
+	if got.Role != membership.RoleMember {
+		t.Fatalf("a member binding must carry the member role, got %v", got.Role)
+	}
+	// The device that asked is recorded, so one device revocation ends this access
+	// too. Without it the token would be unattributable and survive a revocation.
+	if got.Device == (ids.DeviceID{}) {
+		t.Fatal("a token minted through a person session must name its device")
+	}
+}
+
+// A person session that is not the vault's owner is refused, and the refusal is
+// about AUTHORITY (403) rather than identity (401), which a client reads as "my
+// token died" and would answer by re-enrolling.
+func TestB2B_PersonSessionCannotBindOnAVaultItDoesNotOwn(t *testing.T) {
+	e := newB2BEnv(t)
+	_, strangerTok := e.account(t, b2bOther, 0x0d)
+	publishedPersonBornVault(t, e, b2bVaultA, b2bOwner)
+
+	resp, _ := e.bind(t, b2bVaultA, strangerTok, b2bAnybody, "member")
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("a non-owner person session binding a member: want 403, got %d", resp.StatusCode)
+	}
+	// …and an unbound vault (never published) is refused the same way, so this arm
+	// cannot be used to claim a namespace.
+	if resp, _ := e.bind(t, b2bVaultB, strangerTok, b2bAnybody, "owner"); resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("claiming an unowned vault from a person session: want 403, got %d", resp.StatusCode)
+	}
+}
+
+// A MEMBER's own session must not add members to the vault it joined: the role is
+// checked, not merely the presence of a binding.
+func TestB2B_MemberSessionCannotBindAnotherMember(t *testing.T) {
+	e := newB2BEnv(t)
+	_, ownerPersonTok := e.account(t, b2bOwner, 0x0a)
+	_, memberPersonTok := e.account(t, b2bMember, 0x0e)
+	publishedPersonBornVault(t, e, b2bVaultA, b2bOwner)
+	if err := e.h.members.BindMember(acct(t, b2bVaultA), b2bPersonID(t, b2bMember)); err != nil {
+		t.Fatalf("bind the member: %v", err)
+	}
+
+	resp, _ := e.bind(t, b2bVaultA, memberPersonTok, b2bAnybody, "member")
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("a member session binding a member: want 403, got %d", resp.StatusCode)
+	}
+	// The owner can still do it, so the refusal is about the caller's role rather
+	// than about the route being shut.
+	if resp, _ := e.bind(t, b2bVaultA, ownerPersonTok, b2bOther, "member"); resp.StatusCode != http.StatusOK {
+		t.Fatalf("the owner must still be able to bind: want 200, got %d", resp.StatusCode)
+	}
+}
+
+// The owner's person session re-mints its OWN owner token (idempotent), which is what
+// the client needs after a restart dropped its device-local copy; and it cannot make
+// a second person the owner.
+func TestB2B_PersonSessionRemintsItsOwnOwnerTokenAndRefusesASecondOwner(t *testing.T) {
+	e := newB2BEnv(t)
+	_, ownerPersonTok := e.account(t, b2bOwner, 0x0a)
+	publishedPersonBornVault(t, e, b2bVaultA, b2bOwner)
+
+	resp, own := e.bind(t, b2bVaultA, ownerPersonTok, b2bOwner, "owner")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("re-minting the owner's own token: want 200, got %d", resp.StatusCode)
+	}
+	if own.TokenHex == "" {
+		t.Fatal("the re-mint must issue a token")
+	}
+	got, err := e.resolve(t, own.TokenHex)
+	if err != nil || got.Role != membership.RoleOwner || got.Person != b2bPersonID(t, b2bOwner) {
+		t.Fatalf("owner re-mint resolved to %+v err=%v", got, err)
+	}
+
+	resp, _ = e.bind(t, b2bVaultA, ownerPersonTok, b2bOther, "owner")
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("making a second person owner: want 400, got %d", resp.StatusCode)
+	}
+	if owner, _ := e.h.members.OwnerOf(acct(t, b2bVaultA)); owner.Person != b2bPersonID(t, b2bOwner) {
+		t.Fatalf("the owner must be unchanged, got %+v", owner)
+	}
+}

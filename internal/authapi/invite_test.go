@@ -328,7 +328,7 @@ func TestB2B_InviteRelay_FrameCarriesOnlyRoutingFields(t *testing.T) {
 	if !ok || len(vaultItems) != 1 {
 		t.Fatalf("vault list body = %s, want one invites entry", vaultBody)
 	}
-	assertKeys(t, jsonBytes(t, vaultItems[0]), "invite_id_hex", "recipient_person_id_hex", "claimed")
+	assertKeys(t, jsonBytes(t, vaultItems[0]), "invite_id_hex", "recipient_person_id_hex", "claimed", "declined")
 }
 
 // Only the vault's owner may address an invite for it, and only a registered
@@ -444,4 +444,99 @@ func keysOf(m map[string]json.RawMessage) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// decline issues DELETE /b2b/invites/{id} under the given bearer.
+func (e *inviteEnv) decline(t *testing.T, bearer, inviteIDHex string) (*http.Response, []byte) {
+	t.Helper()
+	return sendJSON(t, http.MethodDelete, e.srv.URL+"/b2b/invites/"+inviteIDHex, bearer, nil)
+}
+
+// The recipient's refusal is a REAL server-side delete: the sealed payload is
+// gone, the slot can never be claimed, the recipient stops seeing it, and the
+// OWNER's list says "declined" instead of "not accepted yet". The four refusals
+// are one 404 so the route is not an enumeration oracle; an already-claimed
+// invite is a 409 because the caller is a member and removal is the owner's act.
+func TestB2B_InviteRelay_DeclineDeletesThePayloadAndTellsTheOwner(t *testing.T) {
+	e := newInviteEnv(t)
+	_, memberTok := e.account(t, b2bMember, 0x0d)
+	_, otherTok := e.account(t, b2bOther, 0x0e)
+
+	payload := []byte("sealed invite payload the recipient will refuse")
+	_, inviteID, _ := e.createInvite(t, e.ownerA, b2bMember, payload)
+
+	// Another account cannot decline somebody else's invitation, and the answer is
+	// the same 404 an unknown id gives.
+	if resp, body := e.decline(t, otherTok, inviteID); resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("decline by another account: want 404, got %d: %s", resp.StatusCode, body)
+	}
+	if resp, _ := e.decline(t, memberTok, "00112233445566778899aabbccddeeff"); resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("decline of an unknown id: want 404, got %d", resp.StatusCode)
+	}
+	// The refusals above must not have destroyed the slot.
+	if resp, body := e.claim(t, memberTok, inviteID); resp.StatusCode != http.StatusOK {
+		t.Fatalf("claim after the refused declines: want 200, got %d: %s", resp.StatusCode, body)
+	}
+	// That claim bound the member, so a later decline is a conflict, not a delete.
+	if resp, body := e.decline(t, memberTok, inviteID); resp.StatusCode != http.StatusConflict {
+		t.Fatalf("decline of an already-claimed invite: want 409, got %d: %s", resp.StatusCode, body)
+	}
+
+	// A second, fresh invite, this time actually declined.
+	_, refuseID, _ := e.createInvite(t, e.ownerA, b2bMember, payload)
+	if resp, body := e.decline(t, memberTok, refuseID); resp.StatusCode != http.StatusOK {
+		t.Fatalf("decline: want 200, got %d: %s", resp.StatusCode, body)
+	}
+
+	// The payload is GONE: no claim can release it, and the answer is the same 404
+	// an unknown id gives, not a distinct "declined" one.
+	resp, body := e.claim(t, memberTok, refuseID)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("claim of a declined invite: want 404, got %d: %s", resp.StatusCode, body)
+	}
+	// Declining twice is IDEMPOTENT, not a second refusal: a client whose first
+	// request lost its response retries and must not read the retry as a failure.
+	if resp, body := e.decline(t, memberTok, refuseID); resp.StatusCode != http.StatusOK {
+		t.Fatalf("decline of a declined invite: want 200, got %d: %s", resp.StatusCode, body)
+	}
+
+	// The recipient's own list drops it entirely.
+	_, listBody := sendJSON(t, http.MethodGet, e.srv.URL+"/b2b/invites", memberTok, nil)
+	var listEnv struct {
+		Invites []inviteWire `json:"invites"`
+	}
+	if err := json.Unmarshal(listBody, &listEnv); err != nil {
+		t.Fatal(err)
+	}
+	for _, inv := range listEnv.Invites {
+		if inv.InviteIDHex == refuseID {
+			t.Fatalf("recipient list still carries the declined invite: %+v", listEnv.Invites)
+		}
+	}
+
+	// The OWNER's view keeps the row and reports it declined, which is the whole
+	// point of the tombstone: the sender is told what happened.
+	_, vaultBody := sendJSON(t, http.MethodGet, e.srv.URL+"/b2b/vaults/"+b2bVaultA+"/invites", e.ownerA, nil)
+	var vaultEnv struct {
+		Invites []vaultInviteWire `json:"invites"`
+	}
+	if err := json.Unmarshal(vaultBody, &vaultEnv); err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, inv := range vaultEnv.Invites {
+		if inv.InviteIDHex != refuseID {
+			continue
+		}
+		found = true
+		if !inv.Declined {
+			t.Fatalf("owner view of the declined invite = %+v, want declined", inv)
+		}
+		if inv.Claimed {
+			t.Fatalf("owner view of the declined invite = %+v, want not claimed", inv)
+		}
+	}
+	if !found {
+		t.Fatalf("owner view lost the declined invite: %+v", vaultEnv.Invites)
+	}
 }
