@@ -32,6 +32,7 @@
 package authapi
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -122,7 +123,14 @@ type Handler struct {
 
 	mu    sync.Mutex
 	creds map[ids.AccountNumberHash]storedCredential
-	hs    map[string]handshake
+	// deviceCreds holds the per-device SCRAM verifiers a phrase-free device
+	// authenticates with (`decisions/protocol/0735`). ADDITIVE on purpose: an account
+	// with none, which is every account that exists today, reads as empty, so neither
+	// the wire nor the persisted shape needs a migration. The outer key is the account
+	// and the inner one is the device, because a verifier belongs to one device of one
+	// account and nothing else may look it up.
+	deviceCreds map[ids.AccountNumberHash]map[ids.DeviceID]storedCredential
+	hs          map[string]handshake
 
 	// Pre-auth abuse bounds (0/nil = disabled — the mem/test default). preAuth is
 	// the global pre-auth rate bucket; maxCreds caps the registered-account map;
@@ -182,6 +190,7 @@ func (h *Handler) WithAccountGate(frozen func(ids.AccountNumberHash) bool, maxDe
 func (h *Handler) DeleteAccount(account ids.AccountNumberHash) {
 	h.mu.Lock()
 	delete(h.creds, account)
+	delete(h.deviceCreds, account)
 	h.mu.Unlock()
 	h.reg.DeleteAccount(account)
 	h.tokens.DeleteAccountTokens(account)
@@ -206,17 +215,18 @@ func (h *Handler) maybeSave(do *bool) {
 func New(reg *auth.Registry, tokens *auth.TokenStore) *Handler {
 	table := membership.New()
 	return &Handler{
-		reg:       reg,
-		tokens:    tokens,
-		enroll:    auth.NewEnrollment(reg, tokens),
-		members:   table,
-		memberTks: membership.NewTokenStore(table),
-		relay:     relay.NewStore(),
-		profs:     profiles.NewStore(),
-		groupPkgs: grouppkg.NewStore(),
-		creds:     make(map[ids.AccountNumberHash]storedCredential),
-		hs:        make(map[string]handshake),
-		now:       time.Now,
+		reg:         reg,
+		tokens:      tokens,
+		enroll:      auth.NewEnrollment(reg, tokens),
+		members:     table,
+		memberTks:   membership.NewTokenStore(table),
+		relay:       relay.NewStore(),
+		profs:       profiles.NewStore(),
+		groupPkgs:   grouppkg.NewStore(),
+		creds:       make(map[ids.AccountNumberHash]storedCredential),
+		deviceCreds: make(map[ids.AccountNumberHash]map[ids.DeviceID]storedCredential),
+		hs:          make(map[string]handshake),
+		now:         time.Now,
 	}
 }
 
@@ -280,6 +290,10 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/auth/devices", h.handleDevices)
 	mux.HandleFunc("/auth/devices/approve", h.handleApprove)
 	mux.HandleFunc("/auth/devices/revoke", h.handleRevoke)
+	// A per-device SCRAM verifier, installed by an already-authenticated device of the
+	// same account (`decisions/protocol/0735`). Authed, not pre-auth: it is an account
+	// mutation, and the session IS the authorization.
+	mux.HandleFunc("/auth/devices/credential", h.handleInstallDeviceCredential)
 	// B2B person↔vault membership (myne-md/myne#711, decisions/protocol/0599).
 	// Person accounts themselves use the /auth/* routes above with their
 	// person_id_hash as the account id (see b2b.go's header).
@@ -423,6 +437,50 @@ func parseDevice(s string) (ids.DeviceID, bool) {
 // and the init door cannot drift on the encoding; see server-protocol.md §3.1.
 func canonicalUsername(a ids.AccountNumberHash) string {
 	return hex.EncodeToString(a[:])
+}
+
+// deviceUsername is the SCRAM username of a DEVICE credential. The `dev:` prefix is
+// load-bearing rather than cosmetic: an account id and a device id are both 16 bytes, so
+// both encode to 32 lowercase hex characters, and without a prefix the handshake could not
+// tell which namespace a username came from. It also makes the two sets structurally
+// disjoint, so a caller cannot present a device id as an account id or the reverse.
+func deviceUsername(dev ids.DeviceID) string {
+	return "dev:" + hex.EncodeToString(dev[:])
+}
+
+// parseDeviceUsername is the inverse, refusing anything that is not the canonical form.
+func parseDeviceUsername(username string) (ids.DeviceID, bool) {
+	const pfx = "dev:"
+	if !strings.HasPrefix(username, pfx) {
+		return ids.DeviceID{}, false
+	}
+	b, err := hex.DecodeString(strings.TrimPrefix(username, pfx))
+	if err != nil || len(b) != ids.DeviceIDLen {
+		return ids.DeviceID{}, false
+	}
+	var d ids.DeviceID
+	copy(d[:], b)
+	return d, true
+}
+
+// credentialFor resolves the SCRAM verifier a handshake is to be verified against: the
+// ACCOUNT credential when the username is the account's canonical one, else a DEVICE
+// credential under that account. One function so init and final cannot disagree about
+// which credential a username names, which is the failure that would let a handshake begin
+// against one verifier and finish against another.
+//
+// Caller holds h.mu.
+func (h *Handler) credentialFor(account ids.AccountNumberHash, username string) (storedCredential, bool) {
+	if username == canonicalUsername(account) {
+		sc, ok := h.creds[account]
+		return sc, ok && sc.username == username
+	}
+	dev, ok := parseDeviceUsername(username)
+	if !ok {
+		return storedCredential{}, false
+	}
+	sc, found := h.deviceCreds[account][dev]
+	return sc, found && sc.username == username
 }
 
 // --- POST /auth/register: upload the SCRAM verifier (first-write only) ---
@@ -704,11 +762,13 @@ func (h *Handler) handleScramInit(w http.ResponseWriter, r *http.Request) {
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	sc, exists := h.creds[account]
-	if !exists || sc.username != req.Username || req.Username != canonicalUsername(account) {
+	sc, exists := h.credentialFor(account, req.Username)
+	if !exists {
 		// Unknown account, wrong username, and a non-canonical (e.g. raw/display-
 		// form) username are all the SAME 401 — no enumeration signal (AS9: only
-		// the hash-hex identity is accepted on any pre-auth surface).
+		// the hash-hex identity is accepted on any pre-auth surface). A device
+		// credential is resolved by the same door and refused by the same answer,
+		// so a caller cannot learn whether a device id is installed.
 		writeErr(w, http.StatusUnauthorized, "unauthenticated")
 		return
 	}
@@ -817,7 +877,15 @@ func (h *Handler) handleScramFinal(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusUnauthorized, "unauthenticated")
 		return
 	}
-	sc := h.creds[hs.account]
+	// The verifier this handshake was STARTED against (`credentialFor` is the one place
+	// that decides), so an account credential and a device credential can never be
+	// crossed between init and final.
+	sc, scOK := h.credentialFor(hs.account, hs.username)
+	if !scOK {
+		delete(h.hs, req.HandshakeID)
+		writeErr(w, http.StatusUnauthorized, "unauthenticated")
+		return
+	}
 
 	// F5: bind to THIS request's tls-exporter (app-terminated TLS 1.3) or the empty
 	// h.serverCbind fallback. The client-final's connection is the one the exporter
@@ -917,6 +985,151 @@ func (h *Handler) handleScramFinal(w http.ResponseWriter, r *http.Request) {
 		TokenHex:           hex.EncodeToString(token),
 		ServerSignatureB64: base64.StdEncoding.EncodeToString(serverSig),
 	})
+}
+
+// --- POST /auth/devices/credential: install a per-device SCRAM verifier ---
+//
+// The route that makes a new device's account credential come from ITS OWN secret
+// instead of the recovery phrase (`decisions/protocol/0735`). The person account's
+// phrase-derived verifier stays exactly as it is; this ADDS a second verifier scoped to
+// one device id, and a device authenticates with it through the same `/auth/scram/*`
+// handshake by naming it as the username.
+//
+// Authorization is the bearer token, the same posture `/auth/verifier` takes: only a
+// device that has ALREADY authenticated against the account may install one, and only
+// into its OWN account (the account comes from the session, never from the body). That is
+// not new authority — a session can already approve a device and write every vault it is
+// bound to — but it IS new persistence, so `threat-model.md` states it rather than leaving
+// it implied.
+//
+// The install and the approval are ONE act on purpose. A credential nobody approved is a
+// device that cannot sync, so a route that installed it and stopped would leave the user
+// with two half-done steps; the admitting device is already holding the session that
+// authorises both.
+
+type deviceCredentialReq struct {
+	DeviceIDHex  string `json:"device_id_hex"`
+	Username     string `json:"username"`
+	SaltHex      string `json:"salt_hex"`
+	Iterations   int    `json:"iterations"`
+	StoredKeyHex string `json:"stored_key_hex"`
+	ServerKeyHex string `json:"server_key_hex"`
+}
+
+// maxDeviceCredsPerAccount bounds the per-device verifier set so an authenticated session
+// cannot grow the persisted auth state without bound. A person with more devices than this
+// is a fleet the operator's device cap already refuses first (MYND-506).
+const maxDeviceCredsPerAccount = 32
+
+func (h *Handler) handleInstallDeviceCredential(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeErr(w, http.StatusMethodNotAllowed, "bad_request")
+		return
+	}
+	sess, authCode := h.sessionWithCode(r)
+	if authCode != "" {
+		writeErr(w, http.StatusUnauthorized, authCode)
+		return
+	}
+	var req deviceCredentialReq
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, MaxAuthBodySize)).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "bad_request")
+		return
+	}
+	device, ok := parseDevice(req.DeviceIDHex)
+	if !ok {
+		writeErr(w, http.StatusBadRequest, "bad_request")
+		return
+	}
+	salt, e1 := hex.DecodeString(req.SaltHex)
+	storedKey, e2 := hex.DecodeString(req.StoredKeyHex)
+	serverKey, e3 := hex.DecodeString(req.ServerKeyHex)
+	// The username is NOT caller-chosen: it is derived from the device id, and the door
+	// refuses anything else. A free-form username would let one account occupy names in a
+	// namespace the handshake resolves blindly, which is how a device id and an account id
+	// (both 32 hex characters) could be confused for one another.
+	if e1 != nil || e2 != nil || e3 != nil || req.Iterations < 1 ||
+		req.Username != deviceUsername(device) {
+		writeErr(w, http.StatusBadRequest, "bad_request")
+		return
+	}
+	next := storedCredential{
+		username: req.Username,
+		cred: scram.Credential{
+			Salt:       salt,
+			Iterations: req.Iterations,
+			StoredKey:  storedKey,
+			ServerKey:  serverKey,
+		},
+	}
+
+	var doSave bool
+	defer h.maybeSave(&doSave)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if _, exists := h.creds[sess.Account]; !exists {
+		// An authenticated session implies a registered account, so this is a client bug
+		// rather than a route to grow `creds` through.
+		writeErr(w, http.StatusNotFound, "not_registered")
+		return
+	}
+	devices := h.deviceCreds[sess.Account]
+	if existing, found := devices[device]; found {
+		// Idempotent for the SAME verifier, refused for a different one. Two devices
+		// admitting the same new device at once must not race into two credentials for one
+		// id, and a re-sent request after a dropped response must not 409.
+		if existing.cred.Iterations == next.cred.Iterations &&
+			bytes.Equal(existing.cred.Salt, next.cred.Salt) &&
+			bytes.Equal(existing.cred.StoredKey, next.cred.StoredKey) &&
+			bytes.Equal(existing.cred.ServerKey, next.cred.ServerKey) {
+			writeJSON(w, map[string]bool{"ok": true, "existing": true})
+			return
+		}
+		writeErr(w, http.StatusConflict, "already_installed")
+		return
+	}
+	if len(devices) >= maxDeviceCredsPerAccount {
+		writeErr(w, http.StatusServiceUnavailable, "capacity")
+		return
+	}
+	if devices == nil {
+		devices = make(map[ids.DeviceID]storedCredential)
+		h.deviceCreds[sess.Account] = devices
+	}
+	devices[device] = next
+	doSave = true
+
+	// The install and the APPROVAL are one act, and they are one act because the two
+	// halves are useless separately: a credential nobody approved is a device that
+	// authenticates and then syncs nothing, and an approval of a device that cannot
+	// authenticate is a promise. The admitting device already holds the session that
+	// authorises both, so splitting them would only teach the user a two-step ceremony
+	// over one decision they already made.
+	//
+	// The operator gates apply here exactly as they do at `/auth/scram/final`: a frozen
+	// account or a full device fleet must not be reachable by pre-approving around them.
+	if h.frozen != nil && h.frozen(sess.Account) {
+		writeErr(w, http.StatusForbidden, "frozen")
+		return
+	}
+	if h.maxDevices != nil {
+		if limit := h.maxDevices(sess.Account); limit > 0 &&
+			h.reg.CountActiveDevices(sess.Account) >= limit {
+			writeErr(w, http.StatusForbidden, "device_limit")
+			return
+		}
+	}
+	if _, found := h.reg.Get(sess.Account, device); !found {
+		// Registers the device as PENDING; the approval below is what admits it. The
+		// pending intermediate is deliberate rather than incidental: a failure between
+		// these two calls leaves a device that cannot sync, not one that can.
+		_, _ = h.enroll.Enroll(sess.Account, device, auth.PathPassword)
+	}
+	if err := h.reg.Approve(sess.Account, device); err != nil {
+		writeErr(w, http.StatusInternalServerError, "internal")
+		return
+	}
+	writeJSON(w, map[string]bool{"ok": true})
 }
 
 // --- authed device management ---
@@ -1061,6 +1274,19 @@ func (h *Handler) handleRevoke(w http.ResponseWriter, r *http.Request) {
 	// reaches every vault the device joined was true of the registry and false of
 	// the credential.
 	h.memberTks.RevokeDevice(membership.DeviceID(device))
+	// And its SCRAM verifier, which is the credential a phrase-free device would
+	// otherwise still authenticate with: retiring the registry row refuses the TOKEN, and
+	// an unauthenticated device simply runs the handshake again and mints a new one. So
+	// revocation has to reach the verifier, or "removed" would mean "ask again"
+	// (`decisions/protocol/0735`).
+	h.mu.Lock()
+	if devices, ok := h.deviceCreds[sess.Account]; ok {
+		delete(devices, device)
+		if len(devices) == 0 {
+			delete(h.deviceCreds, sess.Account)
+		}
+	}
+	h.mu.Unlock()
 	doSave = true
 	writeJSON(w, map[string]bool{"ok": true})
 }
@@ -1082,6 +1308,71 @@ type PersistedCred struct {
 	Iterations int
 	StoredKey  []byte
 	ServerKey  []byte
+}
+
+// PersistedDeviceCred is one DEVICE's stored SCRAM verifier, keyed by the account it
+// belongs to and the device it authenticates (`decisions/protocol/0735`).
+//
+// A separate record type rather than a field on PersistedCred, because the two are
+// different things that happen to share a shape: the account credential is the person's,
+// derived from their phrase, and there is exactly one; a device credential is one
+// device's own secret, and there may be many. Keeping them in separate arrays also means
+// the on-disk `creds` array keeps its exact shape, so an older binary reading a newer
+// auth.json still finds every account credential it expects.
+type PersistedDeviceCred struct {
+	Account    ids.AccountNumberHash
+	Device     ids.DeviceID
+	Username   string
+	Salt       []byte
+	Iterations int
+	StoredKey  []byte
+	ServerKey  []byte
+}
+
+// DeviceCredSnapshot returns a copy of every device's stored SCRAM verifier.
+func (h *Handler) DeviceCredSnapshot() []PersistedDeviceCred {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := make([]PersistedDeviceCred, 0, len(h.deviceCreds))
+	for acct, devices := range h.deviceCreds {
+		for dev, sc := range devices {
+			out = append(out, PersistedDeviceCred{
+				Account:    acct,
+				Device:     dev,
+				Username:   sc.username,
+				Salt:       sc.cred.Salt,
+				Iterations: sc.cred.Iterations,
+				StoredKey:  sc.cred.StoredKey,
+				ServerKey:  sc.cred.ServerKey,
+			})
+		}
+	}
+	return out
+}
+
+// LoadDeviceCreds REPLACES the device-credential set from a snapshot. Boot-only, like
+// LoadCreds, and additive: a snapshot that is absent (an auth.json written before this
+// existed) reads as "no device has its own verifier", which is exactly true.
+func (h *Handler) LoadDeviceCreds(snap []PersistedDeviceCred) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.deviceCreds = make(map[ids.AccountNumberHash]map[ids.DeviceID]storedCredential, len(snap))
+	for _, c := range snap {
+		devices, ok := h.deviceCreds[c.Account]
+		if !ok {
+			devices = make(map[ids.DeviceID]storedCredential)
+			h.deviceCreds[c.Account] = devices
+		}
+		devices[c.Device] = storedCredential{
+			username: c.Username,
+			cred: scram.Credential{
+				Salt:       c.Salt,
+				Iterations: c.Iterations,
+				StoredKey:  c.StoredKey,
+				ServerKey:  c.ServerKey,
+			},
+		}
+	}
 }
 
 // CredSnapshot returns a copy of every account's stored SCRAM verifier.

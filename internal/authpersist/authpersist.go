@@ -52,6 +52,11 @@ type envelope struct {
 	Devices []auth.PersistedDevice  `json:"devices"`
 	Tokens  []auth.PersistedToken   `json:"tokens"`
 	Creds   []authapi.PersistedCred `json:"creds"`
+	// DeviceCreds is the per-device SCRAM verifier set (`decisions/protocol/0735`).
+	// Omitted when empty, so an auth.json written before this existed round-trips
+	// byte-identically through this binary and an older binary still reads the `creds`
+	// array it expects.
+	DeviceCreds []authapi.PersistedDeviceCred `json:"device_creds,omitempty"`
 }
 
 // Coordinator owns the auth.json file and serializes saves. A single mutex makes only
@@ -145,6 +150,7 @@ func (c *Coordinator) load() error {
 	c.reg.LoadDevices(env.Devices)
 	c.tokens.LoadTokens(env.Tokens)
 	c.handler.LoadCreds(env.Creds)
+	c.handler.LoadDeviceCreds(env.DeviceCreds)
 	return nil
 }
 
@@ -160,10 +166,11 @@ func (c *Coordinator) Save() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	env := envelope{
-		Version: schemaVersion,
-		Devices: c.reg.DeviceSnapshot(),
-		Tokens:  c.tokens.TokenSnapshot(),
-		Creds:   c.handler.CredSnapshot(),
+		Version:     schemaVersion,
+		Devices:     c.reg.DeviceSnapshot(),
+		Tokens:      c.tokens.TokenSnapshot(),
+		Creds:       c.handler.CredSnapshot(),
+		DeviceCreds: c.handler.DeviceCredSnapshot(),
 	}
 	raw, err := json.Marshal(env)
 	if err != nil {
