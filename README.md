@@ -20,7 +20,7 @@ What exists today:
 - `Dockerfile` — a reproducible, minimal, non-root image. The shipped artefact is the image, and its digest is the verification unit (both bases pinned by `@sha256`).
 - `LICENSE` (AGPL-3.0), `AGENTS.md` (architectural notes and the non-negotiables below), `the CI configuration` (CI), `lefthook.yml` (the commit-hook baseline), and `KNOWN-GAPS-711.md` (the B2B surface's known gaps, recorded where they ship).
 - `scripts/` — `repro-gate.sh`, the GitHub triage tooling, and the fetch tool.
-- 97 Go test files; `go test ./...` is the suite.
+- `go test ./...` is the suite, with a test file beside every package.
 
 The wire surface today: `/auth/*` (register, SCRAM init and final, verifier, device approve and revoke), `/sync/*` (blob push and pull, poke), `/attachments/*`, `/b2b/*` (invites, membership, retirement, profiles, group packages), and `/admin/*` behind `MYNE_ADMIN_SOCKET`. Route names and the wire contract are normative in the main repo's [`server-protocol.md`](https://github.com/myne-md/myne/blob/develop/docs/spec/server-protocol.md) and [`sync-protocol.md`](https://github.com/myne-md/myne/blob/develop/docs/spec/sync-protocol.md).
 
