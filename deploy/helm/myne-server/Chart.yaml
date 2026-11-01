@@ -11,8 +11,8 @@ type: application
 # Both numbers track the SERVER release, because this chart's job is to deploy one
 # known server build. The image is pinned by DIGEST in values.yaml (see the note
 # there): a tag alone is a moving or, today, a single-architecture reference.
-version: 0.9.0
-appVersion: "0.9.0"
+version: 0.11.3
+appVersion: "0.11.3"
 
 keywords:
   - myne

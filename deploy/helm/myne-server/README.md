@@ -170,19 +170,18 @@ The important ones; `values.yaml` is annotated and is the reference.
 
 The default is a **digest**, not a tag, and three measured facts are why:
 
-- The pinned digest is the newest published server build: the **v0.9.0** cycle's image, built
-  2026-10-02 (commit `6a7f5100`).
-- **`latest` is a different, older build** — 2026-08-12 against 2026-10-02 — so pointing at it would
-  be a downgrade dressed as currency. The 2026-10-02 build was published under a commit-SHA tag;
-  `v0.9.0` was added to that same digest later, as a tag rather than a rebuild.
+- The pinned digest is the newest published server build: the **v0.11.3** cycle's image, built
+  2026-11-01 from tag `v0.11.3` (commit `ee4b71c37`).
+- `latest` is not the pin, because a moving tag cannot be the thing a chart promises: `latest` is a
+  different image, and a self-hoster's install would silently change under them the next time the
+  operator pushed one.
 - The **version tags that do exist** (`0.8.0`, `v0.8.1`) each resolve to a single `linux/amd64`
   manifest, while the pin is a multi-architecture list. A tag-pinned install on an arm64 node either
   needs emulation or fails outright.
 
-**The chart's version tracks the server image, not the app.** They are not the same number, and a
-release cycle can skip the server entirely: **v0.10.0 (2026-10-14) shipped no server image**, recorded
-as skipped in `the operations repository/runbooks/release-checklist.md`, which is why this chart says `0.9.0` while the
-app says `0.10.0`. Bump the chart's `version`, its `appVersion`, `image.digest` and the user guide's
+**The chart's version tracks the server image, not the app.** They are the same number today only
+because v0.11.3 publishes both: **v0.10.0 (2026-10-14) shipped no server image**, recorded as skipped
+in `the operations repository/runbooks/release-checklist.md`, and the chart stayed at `0.9.0` through that cycle. Bump the chart's `version`, its `appVersion`, `image.digest` and the user guide's
 `--version` together, in the cycle that publishes a new server image; the checklist's phase-10 rows
 exist so that is one tick rather than four edits from memory.
 

@@ -9,13 +9,12 @@ fullnameOverride: ""
 
 image:
   repository: ghcr.io/myne-md/myne-web
-  # A TAG, unlike the server chart's digest, because the published web images are
-  # single-architecture (linux/amd64) and their digests have not been recorded as
-  # multi-arch manifest lists. See README "Architecture".
-  #
-  # Set `digest` to pin by digest once you have one for your architecture.
-  tag: v0.8.1
-  digest: ""
+  # BOTH pinned since v0.11.3: the web image is published as a manifest list
+  # (linux/amd64 + linux/arm64) and the digest below is the INDEX, the only
+  # coordinate that resolves on either architecture. A tag alone is a moving
+  # pointer; the tag stays for a reader, the digest is what runs.
+  tag: v0.11.3
+  digest: sha256:b854a6e2b0846a7729b4fca303a6ea7c72611fcbae67ab3ef31f73406245cd4b
   pullPolicy: IfNotPresent
 imagePullSecrets: []
 
