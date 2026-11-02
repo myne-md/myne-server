@@ -69,7 +69,7 @@ source, which is not published. The multi-arch gap is the image's, not this char
 
 | Value | Default | Notes |
 |---|---|---|
-| `image.tag` | `v0.11.3` | Read with `image.digest`, which is the index digest and wins. |
+| `image.tag` | `v0.11.4` | Read with `image.digest`, which is the index digest and wins. |
 | `syncOrigin` | *(required)* | An origin, e.g. `https://sync.example.org`. Plain http is accepted only for a loopback host. |
 | `replicaCount` | `2` | The container is stateless, so replicas are safe here; 1 is fine for a personal instance. |
 | `ingress.enabled` | `false` | TLS must terminate in front of the pod. |
