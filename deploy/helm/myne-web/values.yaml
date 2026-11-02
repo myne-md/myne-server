@@ -13,8 +13,8 @@ image:
   # (linux/amd64 + linux/arm64) and the digest below is the INDEX, the only
   # coordinate that resolves on either architecture. A tag alone is a moving
   # pointer; the tag stays for a reader, the digest is what runs.
-  tag: v0.11.3
-  digest: sha256:b854a6e2b0846a7729b4fca303a6ea7c72611fcbae67ab3ef31f73406245cd4b
+  tag: v0.11.4
+  digest: sha256:5580b0afc5e40b42be480873ca80c8da28c0be28a2816d866c037aa52ef84d71
   pullPolicy: IfNotPresent
 imagePullSecrets: []
 
