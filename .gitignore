@@ -13,3 +13,7 @@ deploy/helm/*.tgz
 
 # OS
 .DS_Store
+
+# Per-repository worktrees, the convention every repo in this org follows
+# (`the agent tooling repository/reference/worktrees.md`). They are working copies, never content.
+/.worktrees/
