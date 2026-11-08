@@ -1,0 +1,8 @@
+{
+  "emitted_from": "myne-server@2a6d4542bbcb486bd6e2b67ba3f37f6fefd79cb5",
+  "note": "Generated from this repository's own constants; the client pins the same file. Change a number in the source and `go test ./...` fails until this is re-emitted, which is the step that tells the client.",
+  "sse_heartbeat_s": 30,
+  "awareness_heartbeat_s": 30,
+  "max_blob_fetch_ids": 256,
+  "max_blob_fetch_bytes": 8388608
+}
