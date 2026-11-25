@@ -53,16 +53,16 @@ RUN GOOS="${TARGETOS}" GOARCH="${TARGETARCH}" \
 # holds. Runs on the native builder ($BUILDPLATFORM) but downloads TARGETARCH.
 FROM --platform=$BUILDPLATFORM golang:1.26.11@sha256:6e59e17a20f13c102e49d82dffab66d41cffe6c266b225d82794328aea859ab5 AS fetch
 ARG TARGETARCH=amd64
-ARG RESTIC_VERSION=0.19.1
+ARG RESTIC_VERSION=0.20.0
 ARG RCLONE_VERSION=1.76.0
 WORKDIR /src
 COPY go.mod ./
 COPY scripts/fetchtool ./scripts/fetchtool
 RUN set -eu; mkdir -p /out; \
     case "${TARGETARCH}" in \
-      amd64) RESTIC_SHA=f415415624dcc452f2a02b8c33641791a8c6d6d3b65bbb3543fcf9a25151585c; \
+      amd64) RESTIC_SHA=0ccd9fa7885074a24603b051e01bf9bd8b5e45d6a1791e9d9887e9e9372107f7; \
              RCLONE_SHA=b00f00b3266c3764413afe599d3ec316f6f43b3e0ea8a0bc1d186d2133e46df7 ;; \
-      arm64) RESTIC_SHA=a5f64aaab53d51e311fa3829124c5b703f2d14cf187d8640b6be3b2b49376465; \
+      arm64) RESTIC_SHA=1188daded239bccb5952a01d2ad33e77a0d3dc34f9d9fc1e7fdda618d44938ef; \
              RCLONE_SHA=ee169016675e23a69d77240565133ff7dbc9b33d16fa8f7053d4af39f1eaeb78 ;; \
       *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
     esac; \
