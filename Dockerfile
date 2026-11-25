@@ -78,6 +78,9 @@ RUN set -eu; mkdir -p /out; \
 # SYNC-22) + a nonroot UID (65532) + no shell/package-manager/secrets.
 FROM gcr.io/distroless/static:nonroot@sha256:963fa6c544fe5ce420f1f54fb88b6fb01479f054c8056d0f74cc2c6000df5240
 
+LABEL org.opencontainers.image.source="https://github.com/myne-md/myne-server"
+LABEL org.opencontainers.image.licenses="AGPL-3.0-only"
+
 COPY --from=build /out/myne-server /usr/local/bin/myne-server
 
 # Third-party notices for the binaries this image redistributes (restic,
