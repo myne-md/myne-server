@@ -20,7 +20,7 @@
 # Pin to $BUILDPLATFORM so the build stage always runs on the native builder and
 # CROSS-COMPILES via GOOS/GOARCH (Go needs no emulation for a CGO_ENABLED=0 build).
 # This keeps multi-arch builds fast and avoids qemu in the Go toolchain.
-FROM --platform=$BUILDPLATFORM golang:1.26.4@sha256:792443b89f65105abba56b9bd5e97f680a80074ac62fc844a584212f8c8102c3 AS build
+FROM --platform=$BUILDPLATFORM golang:1.26.11@sha256:6e59e17a20f13c102e49d82dffab66d41cffe6c266b225d82794328aea859ab5 AS build
 
 # SOURCE_DATE_EPOCH makes the build clock deterministic (reproducible-builds.org).
 ARG SOURCE_DATE_EPOCH=0
@@ -51,19 +51,19 @@ RUN GOOS="${TARGETOS}" GOARCH="${TARGETARCH}" \
 # sha256 (the SYNC-20 pin-by-digest discipline) and extracted by the stdlib-only
 # fetchtool, so the fetch is deterministic and the repro-gate's two-build digest
 # holds. Runs on the native builder ($BUILDPLATFORM) but downloads TARGETARCH.
-FROM --platform=$BUILDPLATFORM golang:1.26.4@sha256:792443b89f65105abba56b9bd5e97f680a80074ac62fc844a584212f8c8102c3 AS fetch
+FROM --platform=$BUILDPLATFORM golang:1.26.11@sha256:6e59e17a20f13c102e49d82dffab66d41cffe6c266b225d82794328aea859ab5 AS fetch
 ARG TARGETARCH=amd64
 ARG RESTIC_VERSION=0.19.1
-ARG RCLONE_VERSION=1.74.4
+ARG RCLONE_VERSION=1.76.0
 WORKDIR /src
 COPY go.mod ./
 COPY scripts/fetchtool ./scripts/fetchtool
 RUN set -eu; mkdir -p /out; \
     case "${TARGETARCH}" in \
       amd64) RESTIC_SHA=f415415624dcc452f2a02b8c33641791a8c6d6d3b65bbb3543fcf9a25151585c; \
-             RCLONE_SHA=fe435e0c36228e7c2f116a8701f01127bb1f694005fc11d1f27186c8bca4115d ;; \
+             RCLONE_SHA=b00f00b3266c3764413afe599d3ec316f6f43b3e0ea8a0bc1d186d2133e46df7 ;; \
       arm64) RESTIC_SHA=a5f64aaab53d51e311fa3829124c5b703f2d14cf187d8640b6be3b2b49376465; \
-             RCLONE_SHA=97685285c9ad6a0cf17d5844115d2a67245af6444db672187074bd9c358de419 ;; \
+             RCLONE_SHA=ee169016675e23a69d77240565133ff7dbc9b33d16fa8f7053d4af39f1eaeb78 ;; \
       *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
     esac; \
     go run ./scripts/fetchtool \
