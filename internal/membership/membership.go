@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Package membership is the person-to-vault access model (myne-md/myne#711,
 // decisions/protocol/0599). A person account is independent of any vault; a

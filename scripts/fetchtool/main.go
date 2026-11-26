@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Command fetchtool downloads a release asset, verifies its SHA-256 against a
 // pinned digest, and extracts a single binary from it (.bz2 or .zip). It exists

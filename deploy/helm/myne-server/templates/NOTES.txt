@@ -1,4 +1,4 @@
-{{/* SPDX-License-Identifier: AGPL-3.0 */}}
+{{/* SPDX-License-Identifier: AGPL-3.0-only */}}
 Myne sync server is installed.
 
   Service:   {{ include "myne-server.fullname" . }}.{{ .Release.Namespace }}:{{ .Values.service.port }}

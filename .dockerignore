@@ -3,7 +3,6 @@
 .git
 .gitignore
 .dockerignore
-the CI configuration
 .DS_Store
 Dockerfile
 AGENTS.md

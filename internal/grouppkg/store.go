@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Package grouppkg is the blind relay for per-member group-rotation packages
 // (collab-b2b-sessions task 1, decisions/protocol/0603 + 0607). When an owner

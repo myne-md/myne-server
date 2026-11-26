@@ -1,4 +1,4 @@
-{{/* SPDX-License-Identifier: AGPL-3.0 */}}
+{{/* SPDX-License-Identifier: AGPL-3.0-only */}}
 {{/*
 Validation, not resources. Each of these refuses an install that would come up
 looking healthy and be wrong.

@@ -1,16 +1,9 @@
-<!--
-PR title = conventional-commit subject carrying the Plane ID, e.g.
-  feat(storage): opaque blob GC by version counter (MYND-###)
-Do NOT mention AI/assistant tooling anywhere — the commit-msg hook rejects attribution trailers.
--->
-
 ## Summary
 
 <!-- What does this change, and why? -->
 
 ## Linked work
 
-- Plane task: MYND-
 - Closes #
 
 ## Type of change
@@ -27,13 +20,12 @@ Do NOT mention AI/assistant tooling anywhere — the commit-msg hook rejects att
 
 ## Trust-boundary checklist
 
-- [ ] Conventional-commit subject carrying the Plane ID.
 - [ ] The server still stores/relays **ciphertext only** — no plaintext, no key material, no way to decrypt.
 - [ ] No cross-account correlation surface and **no persistent per-IP logging** introduced (abuse is per-account counters).
 - [ ] Hosted and self-hosted still share the exact same trust boundary (TB5).
 - [ ] Wire-protocol or storage-schema changes are reflected in `myne/docs/spec/server-protocol.md` and include migration notes.
-- [ ] Tests / lint pass.
+- [ ] `gofmt`, `go vet`, `go test ./...` pass; the vector gate passes with `MYNE_TEST_VECTORS_DIR`.
 
 ## Developer Certificate of Origin
 
-- [ ] I certify the [DCO](https://developercertificate.org/): this contribution is mine to give under the repository's license (AGPL-3.0).
+- [ ] I certify the [DCO](https://developercertificate.org/): this contribution is mine to give under AGPL-3.0-only.

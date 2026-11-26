@@ -1,4 +1,4 @@
-{{/* SPDX-License-Identifier: AGPL-3.0 */}}
+{{/* SPDX-License-Identifier: AGPL-3.0-only */}}
 {{- if .Values.ingress.enabled }}
 {{/*
 TLS is not optional here even though the container serves plain HTTP happily: a page

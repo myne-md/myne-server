@@ -1,4 +1,4 @@
-{{/* SPDX-License-Identifier: AGPL-3.0 */}}
+{{/* SPDX-License-Identifier: AGPL-3.0-only */}}
 {{- if not .Values.storage.existingClaim }}
 {{/*
 One volume holds everything the server has: blobs, account metadata, the chain of

@@ -1,4 +1,4 @@
-{{/* SPDX-License-Identifier: AGPL-3.0 */}}
+{{/* SPDX-License-Identifier: AGPL-3.0-only */}}
 
 {{- define "myne-server.name" -}}
 {{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" -}}

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Package profiles is the person-private AI profile store (myne-md/myne#711,
 // decisions/protocol/0592 §9.28). A profile is one sealed `MYY5` blob per

@@ -6,7 +6,7 @@
 *.out
 
 # `helm package` output. The published artefact is the OCI artifact under
-# ghcr.io/myne-md/charts (`the operations repository/runbooks/server-kubernetes.md` §3); a .tgz beside the chart
+# ghcr.io/myne-md/charts (`the operations runbooks` §3); a .tgz beside the chart
 # source is a local build leftover, and committing one would ship a stale copy the registry
 # knows nothing about.
 deploy/helm/*.tgz
@@ -15,5 +15,5 @@ deploy/helm/*.tgz
 .DS_Store
 
 # Per-repository worktrees, the convention every repo in this org follows
-# (`the agent tooling repository/reference/worktrees.md`). They are working copies, never content.
+# (`the repository worktree convention`). They are working copies, never content.
 /.worktrees/

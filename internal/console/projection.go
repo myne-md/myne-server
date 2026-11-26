@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Package console is the READ-ONLY projection of operator enforcement state that
 // both operator surfaces render: the Unix-socket admin API (internal/adminapi) and

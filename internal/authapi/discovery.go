@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0
+// SPDX-License-Identifier: AGPL-3.0-only
 // Vault discovery for a person account (myne-md/myne#911 task 7).
 //
 // The client's second device has to learn WHICH vaults this person is bound to

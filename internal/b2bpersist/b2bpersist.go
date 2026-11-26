@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Package b2bpersist makes the B2B (person-to-vault) server state survive a
 // restart. Without it, `membership`, the per-vault membership tokens, the invite

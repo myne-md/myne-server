@@ -1,4 +1,4 @@
-{{/* SPDX-License-Identifier: AGPL-3.0 */}}
+{{/* SPDX-License-Identifier: AGPL-3.0-only */}}
 {{/*
 An ORIGIN, not a URL: scheme + host + optional port, no path, no trailing slash. The
 container refuses a malformed value at start-up anyway; failing at install time says

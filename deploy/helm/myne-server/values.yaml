@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: AGPL-3.0
+# SPDX-License-Identifier: AGPL-3.0-only
 #
 # myne-server Helm values.
 #
@@ -6,7 +6,7 @@
 # those moves an obligation onto you that the Compose bundle carries for you.
 #
 # Every `MYNE_*` name this chart sets in templates/ is a documented member of the
-# server's environment roster (the operations repository/bundle/bundle.env.example). Adding one that
+# server's environment roster (the operator-side bundle). Adding one that
 # is not on that roster fails `scripts/check-server-env-roster.mjs` in the myne
 # repo, so the chart cannot quietly grow a knob the server does not read.
 
@@ -16,7 +16,7 @@ fullnameOverride: ""
 image:
   repository: ghcr.io/myne-md/myne-server
   # DIGEST, not a tag, and deliberately so. This is the reproducible multi-arch
-  # manifest list (linux/amd64 + linux/arm64) that the operations repository/bundle and the user
+  # manifest list (linux/amd64 + linux/arm64) that the operator-side bundle and the user
   # guide pin, so a chart install resolves to bytes somebody published on purpose.
   #
   # The TAG path is the weaker one today: the tagged builds in the registry
@@ -61,7 +61,7 @@ storage:
   existingClaim: ""
 
 # Server policy knobs. These are the same knobs as the Compose bundle's .env, with
-# the same defaults; see the operations repository/bundle/bundle.env.example for what each one
+# the same defaults; see the operator-side bundle for what each one
 # obliges you to do, and docs/self-host-policy.md in the myne repo for the
 # normative half.
 config:

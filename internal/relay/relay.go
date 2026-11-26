@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Package relay is the sealed-invite postbox (myne-md/myne#711,
 // decisions/protocol/0599). The owner's authenticated session posts an invite

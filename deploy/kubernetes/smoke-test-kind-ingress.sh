@@ -1,5 +1,5 @@
 #!/usr/bin/env sh
-# SPDX-License-Identifier: AGPL-3.0
+# SPDX-License-Identifier: AGPL-3.0-only
 #
 # smoke-test-kind-ingress.sh — the INGRESS path, which `smoke-test-kind.sh` deliberately does
 # not cover (it uses a Service and a port-forward, so the Ingress object was never exercised).

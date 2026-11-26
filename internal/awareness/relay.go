@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Package awareness is the live-awareness relay (epic live-collab, sub-feature
 // 3): a RAM-only, device-agnostic fan-out of opaque frames from a publisher to

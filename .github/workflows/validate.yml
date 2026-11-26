@@ -1,0 +1,50 @@
+name: validate
+
+on:
+  push:
+    branches: [develop]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Check out the public test vectors
+        uses: actions/checkout@v6
+        with:
+          repository: myne-md/myne-test-vectors
+          path: vectors
+          ref: develop
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 1.26.11
+          cache: false
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "gofmt needed:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      - name: go test
+        run: go test ./... -count=1
+
+      - name: byte-level vector gate
+        env:
+          MYNE_TEST_VECTORS_DIR: ${{ github.workspace }}/vectors
+        run: go test ./... -run Vector -count=1 -v

@@ -1,4 +1,4 @@
-<!-- SPDX-License-Identifier: AGPL-3.0 -->
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
 # `myne-server` Helm chart
 
 Runs Myne's zero-knowledge sync server on Kubernetes. The server stores and relays
@@ -181,7 +181,7 @@ The default is a **digest**, not a tag, and three measured facts are why:
 
 **The chart's version tracks the server image, not the app.** They are the same number today only
 because v0.11.3 publishes both: **v0.10.0 (2026-10-14) shipped no server image**, recorded as skipped
-in `the operations repository/runbooks/release-checklist.md`, and the chart stayed at `0.9.0` through that cycle. Bump the chart's `version`, its `appVersion`, `image.digest` and the user guide's
+in `the operations runbooks`, and the chart stayed at `0.9.0` through that cycle. Bump the chart's `version`, its `appVersion`, `image.digest` and the user guide's
 `--version` together, in the cycle that publishes a new server image; the checklist's phase-10 rows
 exist so that is one tick rather than four edits from memory.
 
@@ -213,6 +213,6 @@ still refused.
 
 ## Licence
 
-AGPL-3.0. The server is AGPL like the rest of the application code; the specification
+AGPL-3.0-only. The server is AGPL like the rest of the application code; the specification
 documents it implements are published under a permissive content licence so independent
 implementations can reuse the protocol.

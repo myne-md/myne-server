@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Package ids holds the server's load-bearing identifier types. They are kept
 // distinct on purpose (ledger SYNC-2): account_number_hash is the account /

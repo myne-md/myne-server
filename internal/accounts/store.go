@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Package accounts persists per-account OPERATOR ENFORCEMENT policy (MYND-506):
 // freeze state and per-account quota / device-cap overrides, plus reserved billing

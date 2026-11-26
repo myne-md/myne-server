@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: AGPL-3.0
+# SPDX-License-Identifier: AGPL-3.0-only
 #
 # myne-server container image (MYND-437).
 #

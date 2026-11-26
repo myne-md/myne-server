@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0
+// SPDX-License-Identifier: AGPL-3.0-only
 // The person-selector authorization (myne-md/myne#911 task 7).
 //
 // What these tests exist for, stated as the failure: a session that is not bound

@@ -1,5 +1,5 @@
 #!/usr/bin/env sh
-# SPDX-License-Identifier: AGPL-3.0
+# SPDX-License-Identifier: AGPL-3.0-only
 #
 # smoke-test-kind.sh — install the myne-server chart on a REAL cluster (kind) and assert
 # the deployment actually runs. `helm lint` and `helm template` prove the manifests render;

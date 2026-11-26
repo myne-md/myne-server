@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: AGPL-3.0
+# SPDX-License-Identifier: AGPL-3.0-only
 #
 # myne-web Helm values. See README.md before installing: this chart needs a sync
 # server, a public domain and a TLS terminator, and the sync server needs to be told

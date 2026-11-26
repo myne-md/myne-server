@@ -1,4 +1,4 @@
-{{/* SPDX-License-Identifier: AGPL-3.0 */}}
+{{/* SPDX-License-Identifier: AGPL-3.0-only */}}
 {{- if .Values.serviceMonitor.enabled }}
 {{- if not .Values.metrics.enabled }}
 {{- fail "serviceMonitor.enabled requires metrics.enabled: there is no metrics listener to scrape" }}

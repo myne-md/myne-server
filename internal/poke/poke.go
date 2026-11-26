@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Package poke is the change-notification layer (MYND-423). Polling (the pull
 // endpoint) remains the fallback the server always serves; clients keep an SSE poke

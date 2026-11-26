@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Package adminapi is the operator console's admin API (MYND-506). It is served over
 // a LOCAL Unix domain socket — never a TCP port or the public edge — with access

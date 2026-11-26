@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Package panel is the operator console's BROWSER surface (myne-md/myne#787): a
 // read-only web page rendering the same live enforcement state as the admin API,

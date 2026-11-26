@@ -1,4 +1,4 @@
-<!-- SPDX-License-Identifier: AGPL-3.0 -->
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
 # Running Myne on Kubernetes
 
 Two charts, one server each:
@@ -91,8 +91,8 @@ it scans this directory.
 
 Charts are published to `oci://ghcr.io/myne-md/charts` — a **public** package, like the
 images, from a private source repository. The procedure is
-`the operations repository/runbooks/server-kubernetes.md`.
+`the operations runbooks`.
 
 ## Licence
 
-AGPL-3.0, matching the server and the web client they deploy.
+AGPL-3.0-only, matching the server and the web client they deploy.

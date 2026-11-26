@@ -10,7 +10,7 @@ Myne is a multi-repo project under [github.com/myne-md](https://github.com/myne-
 
 ## Status
 
-**Active, pre-alpha.** No longer a scaffold: the server runs, stores and relays the vault, and ships as a container image and a Helm chart. It is a Go program (`go 1.26`), one binary at `cmd/myne-server`, and it is the implementation behind the main repo's normative [`server-protocol.md`](https://github.com/myne-md/myne/blob/develop/docs/spec/server-protocol.md).
+**Active, pre-alpha.** No longer a scaffold: the server runs, stores and relays the vault, and builds as a container image and ships Helm charts. It is a Go program (`go 1.26`), one binary at `cmd/myne-server`, and it is the implementation behind the main repo's normative [`server-protocol.md`](https://github.com/myne-md/myne/blob/develop/docs/spec/server-protocol.md).
 
 What exists today:
 
@@ -18,8 +18,8 @@ What exists today:
 - `internal/` — the implementation, one package per concern: `httpapi` (routing, config, CORS, no-IP logging, metrics, health and readiness), `store` (the `mem` and `fs` backends), `accounts` / `auth` / `authapi` (account numbers, SCRAM, device approval), `syncapi` (blob push and pull, the vault head, cursors, retention and reclamation), `attachments` (the attachment half of the same surface), `awareness` (live-collaboration frames and their fan-out) and `poke` (the SSE poke channel), `b2bpersist` / `membership` / `grouppkg` / `profiles` / `relay` / `headid` (the B2B surface: invites, membership, group packages, per-person private profiles, the invite relay, signed-head author ids), `adminapi` / `panel` / `console` (the operator surfaces), `backup` (restic-backed backup and restore), `gcquota` (quota accounting and retirement reclamation), and `ids` / `authpersist`.
 - `deploy/` — a Helm chart for the server and one for the web client, plus Kubernetes manifests.
 - `Dockerfile` — a reproducible, minimal, non-root image. The shipped artefact is the image, and its digest is the verification unit (both bases pinned by `@sha256`).
-- `LICENSE` (AGPL-3.0), `AGENTS.md` (architectural notes and the non-negotiables below), `the CI configuration` (CI), `lefthook.yml` (the commit-hook baseline), and `KNOWN-GAPS-711.md` (the B2B surface's known gaps, recorded where they ship).
-- `scripts/` — `repro-gate.sh`, the GitHub triage tooling, and the fetch tool.
+- `LICENSE` (AGPL-3.0-only), `AGENTS.md` (architectural notes and the non-negotiables below), `.github/workflows/validate.yml` (CI), `lefthook.yml` (the commit-hook baseline), and `KNOWN-GAPS-711.md` (the B2B surface's known gaps, recorded where they ship).
+- `scripts/` — `repro-gate.sh` and the fetch tool.
 - `go test ./...` is the suite, with a test file beside every package.
 
 The wire surface today: `/auth/*` (register, SCRAM init and final, verifier, device approve and revoke), `/sync/*` (blob push and pull, poke), `/attachments/*`, `/b2b/*` (invites, membership, retirement, profiles, group packages), and `/admin/*` behind `MYNE_ADMIN_SOCKET`. Route names and the wire contract are normative in the main repo's [`server-protocol.md`](https://github.com/myne-md/myne/blob/develop/docs/spec/server-protocol.md) and [`sync-protocol.md`](https://github.com/myne-md/myne/blob/develop/docs/spec/sync-protocol.md).
@@ -80,7 +80,7 @@ Four of these need a sentence rather than a default:
 **The `why` is not here.** What each knob obliges an operator to do, and what it costs, is
 normative and lives in `docs/self-host-policy.md` in the `myne` repo (sections 3 and 4); this
 file is the AGPL implementation and does not restate a CC-BY contract. The annotated,
-per-knob copy an operator actually edits is `the operations repository/bundle/bundle.env.example`, and the two
+per-knob copy an operator actually edits is `the operator-side bundle`, and the two
 are compared on every commit by `scripts/check-server-env-roster.mjs` in the `myne` repo, so
 this table cannot drift from the server silently.
 
@@ -96,4 +96,4 @@ The hooks run on commit: whitespace check, EOF-newline check, and a secret-patte
 
 ## License
 
-AGPL-3.0 — see [`LICENSE`](LICENSE). This matches the application-code license of the wider Myne project; the specification documents in the main repo are published under a permissive content license so independent implementations can reuse the protocol.
+AGPL-3.0-only — see [`LICENSE`](LICENSE). This matches the application-code license of the wider Myne project; the specification documents in the main repo are published under a permissive content license so independent implementations can reuse the protocol.

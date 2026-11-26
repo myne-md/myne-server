@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Package backup drives a bundled restic binary to take encrypted, off-box,
 // retention-bounded snapshots of the fs store (MYND-505). The server holds no

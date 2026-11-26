@@ -1,8 +1,8 @@
-<!-- SPDX-License-Identifier: AGPL-3.0 -->
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
 # `myne-web` Helm chart
 
 Serves Myne's browser client from an address you control. It is the same client as
-`app.example.com`, and the same bundle; what changes is **who hands the page its code on
+the hosted web client, and the same bundle; what changes is **who hands the page its code on
 every visit**, which is the code-delivery trust boundary (threat model A15/TB11). A
 browser verifies no signature over page resources and keeps no copy to compare, so an
 instance you run removes an outside operator from the path **for your own use** and not

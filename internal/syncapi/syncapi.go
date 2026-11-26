@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Package syncapi is the core sync loop: the authenticated push and pull endpoints
 // (MYND-421). push uploads changed blobs each under a CAS base-version, then

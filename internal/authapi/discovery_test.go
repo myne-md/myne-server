@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0
+// SPDX-License-Identifier: AGPL-3.0-only
 // Vault discovery (myne-md/myne#911 task 7).
 //
 // The claim these tests pin is small and load-bearing: the answer is the

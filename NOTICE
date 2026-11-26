@@ -1,6 +1,8 @@
 Third-party notices — myne-server
 =================================
 
+Copyright (C) 2026 Myne contributors.
+
 The shipped artefact is the OCI image built by `Dockerfile`, whose digest is the
 verification unit (SYNC-28). Three answers about what it redistributes, and two
 of them are not the obvious ones.
@@ -28,10 +30,10 @@ pin-by-digest discipline), and both are REDISTRIBUTED inside the shipped image.
 They have no row in the Go module graph, so nothing else in this repository
 would have mentioned them.
 
-restic 0.19.1  ·  BSD 2-Clause License
+restic 0.20.0  ·  BSD 2-Clause License
   Author: Copyright (c) 2014, Alexander Neumann <alexander@bumpern.de>
   Source: https://github.com/restic/restic
-  Text:   the upstream `/LICENSE` for v0.19.1, reproduced below
+  Text:   the upstream `/LICENSE` for v0.20.0, reproduced below
 
 
 BSD 2-Clause License
@@ -61,10 +63,10 @@ OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 
-rclone 1.74.4  ·  MIT License
+rclone 1.76.0  ·  MIT License
   Author: Copyright (C) 2012 by Nick Craig-Wood
   Source: https://github.com/rclone/rclone
-  Text:   the upstream `/COPYING` for v1.74.4, reproduced below
+  Text:   the upstream `/COPYING` for v1.76.0, reproduced below
 
 
 Copyright (C) 2012 by Nick Craig-Wood http://www.craig-wood.com/nick/
